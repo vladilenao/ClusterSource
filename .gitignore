@@ -25,3 +25,10 @@ htmlcov/
 # Lint / type check
 .mypy_cache/
 .ruff_cache/
+
+# Runtime data (tick stores, SQLite, Parquet)
+data/
+*.log
+
+# Local secrets / machine-specific config
+config.local.yaml

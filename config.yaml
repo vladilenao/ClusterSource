@@ -1,0 +1,35 @@
+# T-Investments API token (required)
+TOKEN: "your-token-here"
+
+# Directory where all market data is stored (centralized, outside the repo)
+data_dir: "/Users/vladilenaosipova/PycharmProjects/Data/ClusterSource"
+
+# Producer-Consumer batch settings
+batch:
+  flush_interval_sec: 5        # Consumer flush every N seconds
+  batch_size: 1000             # ... or when N ticks accumulate
+
+# Archiver schedule (UTC)
+archiver:
+  run_hour_utc: 0              # run at 00:00 UTC
+  run_minute_utc: 5            # ... 05 minutes
+
+# History completeness window (days)
+history_check_days: 14
+
+# List of instruments to monitor
+tickers:
+  - id: "SBER"
+    type: "share"               # Обычная акция
+    tick_size: 0.01             # Шаг цены для правильного округления в кластерах
+    lot_size: 1                 # Минимальный шаг объема (размер лота)
+
+  - id: "SRZ6"
+    type: "futures_contract"    # Конкретный фьючерсный контракт (Декабрь 2026)
+    tick_size: 1.0              # У фьючерса Сбера шаг цены равен 1 рублю
+    lot_size: 1
+
+  - id: "Si"
+    type: "continuous_futures"  # Сквозной (склеенный) фьючерс на Доллар/Рубль
+    tick_size: 1.0              # Шаг цены для Si равен 1 рублю
+    lot_size: 1
