@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
-from cluster_source.collector import DataCollector, StreamHandle, Tick, _to_dto
+from cluster_source.collector import DataCollector, InstrumentNotFound, StreamHandle, Tick, _to_dto
 from cluster_source.config import AppConfig, Instrument, InstrumentType
 from cluster_source.database import MarketDataRepository
 
@@ -128,3 +128,21 @@ async def test_consumer_flushes_batch_and_drains(share_config: AppConfig) -> Non
     collector._running = False
     await collector._consumer()
     assert repo.count_hot() == 5
+
+
+async def test_not_found_instrument_stops_without_retry(share_config: AppConfig) -> None:
+    repo = MarketDataRepository(share_config.storage_root, share_config.instruments[0])
+    collector = DataCollector(share_config, share_config.instruments[0], repo)
+
+    calls = 0
+
+    async def not_found_factory(_instr: Instrument) -> StreamHandle:
+        nonlocal calls
+        calls += 1
+        raise InstrumentNotFound(f"Тикер не найден: {_instr.id}")
+
+    collector._stream_factory = not_found_factory
+    await collector.run()
+    assert calls == 1
+    assert not collector._running
+    assert repo.count_hot() == 0

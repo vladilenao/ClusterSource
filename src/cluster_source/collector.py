@@ -30,6 +30,14 @@ MAX_RETRY_DELAY = 60.0
 RETRY_BASE = 2.0
 
 
+class InstrumentNotFound(RuntimeError):
+    """Инструмент не найден у провайдера (тикер не существует).
+
+    Коллектор останавливается без повторов, в отличие от временных ошибок
+    стрима или резолюции FIGI.
+    """
+
+
 @dataclass(frozen=True)
 class StreamHandle:
     """Открытый стрим плюс его callback завершения.
@@ -233,6 +241,13 @@ class DataCollector:
             try:
                 handle = await self._stream_factory(self._instrument)
             except asyncio.CancelledError:
+                break
+            except InstrumentNotFound as exc:
+                logger.warning(
+                    "Инструмент %s не найден — запуск коллектора отменён: %s",
+                    self._instrument.id,
+                    exc,
+                )
                 break
             except Exception as exc:  # pragma: no cover - resilience
                 delay = max(delay, RETRY_BASE)

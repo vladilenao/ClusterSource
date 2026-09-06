@@ -5,7 +5,7 @@ Python 3.11+ project; src-layout package `cluster_source`. Realtime T-Investment
 ## Commands (run from repo root)
 
 - Install: `pip install -e ".[dev]"` (dev includes SDK extra; the SDK `t-tech-investments` may be unavailable on PyPI in some networks — base install works without it).
-- Test: `pytest -q` (asyncio auto-mode; 28 tests).
+- Test: `pytest -q` (asyncio auto-mode; 30 tests).
 - Lint/format: `ruff check . && ruff format .`
 - Typecheck: `mypy src/` (strict, python 3.13).
 - Run: `cluster-source` or `.venv/bin/python -m cluster_source.main`.
@@ -35,6 +35,7 @@ Run order after changes: `ruff check` → `mypy src/` → `pytest -q`.
 - Mypy strict: row dicts are typed as `dict[str, object]`; conversion helpers `_as_float`/`_as_int` in database.py exist for this.
 - The trade_id gap log line marks a day "COMPROMISED" → autoload must re-download it. Keep that marker string intact. Note: the public trade stream of `t-tech-investments` v1.49 has **no** `trade_id` field — `_to_dto` then synthesizes a non-numeric id, which safely skips the numeric gap check. History-archive CSVs also have no trade id; `_history_rows` synthesizes `s{ts}_{idx}`.
 - History backfill (`autoload.py`) primary source = the official history-data service: `GET https://invest-public-api.tbank.ru/history-trades/YYYY-MM-DD?instrumentId={TICKER_CLASS}` (Bearer auth) → gzip CSV `TRADE_TS,TICKER_CC,DIRECTION,PRICE,QUANTITY,TRADE_SOURCE,INSTRUMENT_UID`, UTC. Archives refresh nightly, exclude the current day, 404 = no market that day, rate limit ~30 files/min/IP. Archive class codes: shares `TQBR`/`SPBXM`, futures `SPBFUT` (API `classCode` from find_instrument does NOT match the convention for shares). Continuous futures map each day to the contract active that day (`_nearest_future`). Only the current day falls back to `GetLastTrades` (current-session trades), routes days older than 7 to Parquet via `_target_for_day`. Resolution prefers SDK `InstrumentsService` (gRPC) because REST `FindInstrument` intermittently 404s; REST kept only as SDK-less fallback. The legacy tbank.ru archive (HTTP 404, gone) must NOT be reintroduced.
+- A non-existent ticker raises `InstrumentNotFound` from `_resolve_stream_figi` (main.py); `DataCollector.run()` logs a single warning and stops without retrying (only transient errors get exponential backoff). Ticker resolution is done once per stream attempt inside the injected factory.
 - `tests/` use `datetime.UTC` alias; keep footnotes clean for ruff UP017.
 
 ## Files

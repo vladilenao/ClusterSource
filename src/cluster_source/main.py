@@ -18,7 +18,12 @@ from typing import Any
 
 from cluster_source import archiver as archiver_mod
 from cluster_source import autoload
-from cluster_source.collector import DataCollector, StreamFactory, StreamHandle
+from cluster_source.collector import (
+    DataCollector,
+    InstrumentNotFound,
+    StreamFactory,
+    StreamHandle,
+)
 from cluster_source.config import AppConfig, Instrument, InstrumentType
 from cluster_source.database import MarketDataRepository
 
@@ -86,7 +91,7 @@ async def _resolve_stream_figi(client: Any, instrument: Instrument) -> str:
         if instrument.is_continuous:
             eligible = [f for f in futures.instruments if f.ticker.startswith(instrument.id)]
             if not eligible:
-                raise RuntimeError(
+                raise InstrumentNotFound(
                     f"Не найден активный фьючерсный контракт "
                     f"для непрерывного инструмента {instrument.id}"
                 )
@@ -100,7 +105,7 @@ async def _resolve_stream_figi(client: Any, instrument: Instrument) -> str:
             return str(active.figi)
         matches = [f for f in futures.instruments if f.ticker == instrument.id]
         if not matches:
-            raise RuntimeError(f"Фьючерсный контракт не найден: {instrument.id}")
+            raise InstrumentNotFound(f"Фьючерсный контракт не найден: {instrument.id}")
         return str(matches[0].figi)
 
     share = await instruments_service.find_instrument(
@@ -108,10 +113,17 @@ async def _resolve_stream_figi(client: Any, instrument: Instrument) -> str:
         instrument_kind=_SdkInstrumentType.INSTRUMENT_TYPE_SHARE,
     )
     instruments = getattr(share, "instruments", None) or []
-    for item in instruments:
-        if item.ticker == instrument.id:
-            return str(item.figi)
-    raise RuntimeError(f"Тикер не найден: {instrument.id}")
+    ticker_matches = [item for item in instruments if item.ticker == instrument.id]
+    if not ticker_matches:
+        raise InstrumentNotFound(f"Тикер не найден: {instrument.id}")
+    # Один и тот же тикер может встречаться на нескольких площадках
+    # (например, "T" -> AT&T и TQBR "Т-Технологии"); для спот-акций
+    # подходит только бумага основной секции МосБиржи.
+    for preferred in ("TQBR", "SPBXM"):
+        for item in ticker_matches:
+            if getattr(item, "class_code", "") == preferred:
+                return str(item.figi)
+    return str(ticker_matches[0].figi)
 
 
 def make_stream_factory(config: AppConfig) -> StreamFactory:

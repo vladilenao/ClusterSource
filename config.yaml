@@ -19,17 +19,230 @@ history_check_days: 14
 
 # List of instruments to monitor
 tickers:
+  # --- Акции базы индекса РТС/IMOEX (обыкновенные, секции TQBR) ---
+  - id: "ALRS"
+    type: "share"               # Алроса
+    tick_size: 0.01
+    lot_size: 10
+  - id: "AFKS"
+    type: "share"               # АФК Система
+    tick_size: 0.001
+    lot_size: 100
+  - id: "AFLT"
+    type: "share"               # Аэрофлот
+    tick_size: 0.01
+    lot_size: 10
+  - id: "VTBR"
+    type: "share"               # Банк ВТБ
+    tick_size: 0.005
+    lot_size: 1
+  - id: "BSPB"
+    type: "share"               # Банк Санкт-Петербург
+    tick_size: 0.01
+    lot_size: 10
+  - id: "GAZP"
+    type: "share"               # Газпром
+    tick_size: 0.01
+    lot_size: 10
+  - id: "DOMRF"
+    type: "share"               # Дом.РФ
+    tick_size: 0.1
+    lot_size: 1
+  - id: "IRAO"
+    type: "share"               # Интер РАО
+    tick_size: 0.0005
+    lot_size: 100
+  - id: "LKOH"
+    type: "share"               # Лукойл
+    tick_size: 0.5
+    lot_size: 1
+  - id: "MAGN"
+    type: "share"               # ММК
+    tick_size: 0.005
+    lot_size: 10
+  - id: "MDMG"
+    type: "share"               # Мать и дитя
+    tick_size: 0.1
+    lot_size: 1
+  - id: "MTLR"
+    type: "share"               # Мечел
+    tick_size: 0.01
+    lot_size: 1
+  - id: "MOEX"
+    type: "share"               # Московская биржа
+    tick_size: 0.01
+    lot_size: 10
+  - id: "MSNG"
+    type: "share"               # Мосэнерго
+    tick_size: 0.0005
+    lot_size: 1000
+  - id: "CBOM"
+    type: "share"               # МКБ
+    tick_size: 0.001
+    lot_size: 100
+  - id: "MTSS"
+    type: "share"               # МТС
+    tick_size: 0.05
+    lot_size: 10
+  - id: "NVTK"
+    type: "share"               # Новатэк
+    tick_size: 0.1
+    lot_size: 1
+  - id: "NLMK"
+    type: "share"               # НЛМК
+    tick_size: 0.02
+    lot_size: 10
+  - id: "GMKN"
+    type: "share"               # Норильский никель
+    tick_size: 0.02
+    lot_size: 10
+  - id: "PIKK"
+    type: "share"               # ПИК
+    tick_size: 0.1
+    lot_size: 1
+  - id: "PLZL"
+    type: "share"               # Полюс
+    tick_size: 0.2
+    lot_size: 1
+  - id: "RENI"
+    type: "share"               # Ренессанс Страхование
+    tick_size: 0.02
+    lot_size: 10
+  - id: "ROSN"
+    type: "share"               # Роснефть
+    tick_size: 0.05
+    lot_size: 1
+  - id: "RTKM"
+    type: "share"               # Ростелеком
+    tick_size: 0.01
+    lot_size: 10
+  - id: "RUAL"
+    type: "share"               # Русал
+    tick_size: 0.005
+    lot_size: 10
   - id: "SBER"
-    type: "share"               # Обычная акция
-    tick_size: 0.01             # Шаг цены для правильного округления в кластерах
-    lot_size: 1                 # Минимальный шаг объема (размер лота)
-
-  - id: "SRZ6"
-    type: "futures_contract"    # Конкретный фьючерсный контракт (Декабрь 2026)
-    tick_size: 1.0              # У фьючерса Сбера шаг цены равен 1 рублю
+    type: "share"               # Сбер
+    tick_size: 0.01
+    lot_size: 1
+  - id: "CHMF"
+    type: "share"               # Северсталь
+    tick_size: 0.2
+    lot_size: 1
+  - id: "SELG"
+    type: "share"               # Селигдар
+    tick_size: 0.01
+    lot_size: 10
+  - id: "SVCB"
+    type: "share"               # Совкомбанк
+    tick_size: 0.005
+    lot_size: 100
+  - id: "FLOT"
+    type: "share"               # Совкомфлот
+    tick_size: 0.01
+    lot_size: 10
+  - id: "SNGS"
+    type: "share"               # Сургутнефтегаз
+    tick_size: 0.005
+    lot_size: 100
+  - id: "TATN"
+    type: "share"               # Татнефть
+    tick_size: 0.1
+    lot_size: 1
+  - id: "T"
+    type: "share"               # Т-Технологии (бывший TCSG)
+    tick_size: 0.02
+    lot_size: 1
+  - id: "TRNFP"
+    type: "share"               # Транснефть (преф)
+    tick_size: 0.2
+    lot_size: 1
+  - id: "PHOR"
+    type: "share"               # ФосАгро
+    tick_size: 1
+    lot_size: 1
+  - id: "CNRU"
+    type: "share"               # Циан
+    tick_size: 0.2
+    lot_size: 1
+  - id: "UGLD"
+    type: "share"               # БТС-Золото (бывший ЮГК)
+    tick_size: 0.0001
+    lot_size: 1000
+  - id: "YDEX"
+    type: "share"               # Яндекс
+    tick_size: 0.5
+    lot_size: 1
+  - id: "ENPG"
+    type: "share"               # Эн+ Групп
+    tick_size: 0.05
+    lot_size: 1
+  - id: "HEAD"
+    type: "share"               # Хэдхантер
+    tick_size: 1
+    lot_size: 1
+  - id: "OZON"
+    type: "share"               # Озон
+    tick_size: 0.5
+    lot_size: 1
+  - id: "POSI"
+    type: "share"               # Позитив
+    tick_size: 0.2
+    lot_size: 1
+  - id: "VKCO"
+    type: "share"               # ВК (бывший Mail.ru)
+    tick_size: 0.05
+    lot_size: 1
+  - id: "X5"
+    type: "share"               # Корпоративный Центр Икс 5 (бывший FIVE)
+    tick_size: 0.5
     lot_size: 1
 
+  # --- Непрерывные фьючерсы (тикер = префикс SECID, резолв по expiration) ---
+  - id: "RI"
+    type: "continuous_futures"  # Фьючерс на индекс РТС (рисковый, цена в пунктах)
+    tick_size: 10.0
+    lot_size: 1
+  - id: "RM"
+    type: "continuous_futures"  # Мини-фьючерс на индекс РТС
+    tick_size: 0.5
+    lot_size: 1
+  - id: "BR"
+    type: "continuous_futures"  # Нефть марки Brent
+    tick_size: 0.01
+    lot_size: 10
+  - id: "NG"
+    type: "continuous_futures"  # Природный газ
+    tick_size: 0.001
+    lot_size: 100
+  - id: "GD"
+    type: "continuous_futures"  # Золото (цена в долларах за тройскую унцию)
+    tick_size: 0.1
+    lot_size: 1
+  - id: "ED"
+    type: "continuous_futures"  # Евро/Доллар
+    tick_size: 0.0001
+    lot_size: 1000
   - id: "Si"
-    type: "continuous_futures"  # Сквозной (склеенный) фьючерс на Доллар/Рубль
-    tick_size: 1.0              # Шаг цены для Si равен 1 рублю
+    type: "continuous_futures"  # Доллар США/Рубль
+    tick_size: 1.0
+    lot_size: 1000
+  - id: "MX"
+    type: "continuous_futures"  # Фьючерс на индекс Московской Биржи
+    tick_size: 25.0
     lot_size: 1
+  - id: "CR"
+    type: "continuous_futures"  # Китайский юань/Рубль
+    tick_size: 0.001
+    lot_size: 1000
+  - id: "Eu"
+    type: "continuous_futures"  # Евро/Рубль
+    tick_size: 1.0
+    lot_size: 1000
+  - id: "GL"
+    type: "continuous_futures"  # Золото в рублях
+    tick_size: 0.1
+    lot_size: 1
+  - id: "SV"
+    type: "continuous_futures"  # Серебро
+    tick_size: 0.01
+    lot_size: 10

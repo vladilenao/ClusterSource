@@ -51,6 +51,11 @@ LAST_TRADES_URL = f"{REST_BASE}/MarketDataService/GetLastTrades"
 HISTORY_TRADES_URL = "https://invest-public-api.tbank.ru/history-trades"
 MAX_BACKFILL_CONCURRENCY = 4
 
+#: Шлюз архива истории ограничивает загрузку ~30 файлами в минуту на IP.
+#: Держим темп чуть ниже (28/мин), чтобы не упираться в 429.
+ARCHIVE_MAX_PER_MIN = 28
+ARCHIVE_ATTEMPTS = 3
+
 #: Идентификаторы «тикер/класс», которые принимает архив истории для каждого
 #: типа инструмента. Используются как фолбэк, когда код класса API не совпадает
 #: (для акций конвенция архива отличается от ``classCode`` в find_instrument).
@@ -68,6 +73,29 @@ class _FuturesMeta:
     ticker: str
     class_code: str
     expiration: date
+
+
+class _RateGate:
+    """Глобальный ограничитель темпа: не чаще одного прохода в ``interval``.
+
+    Шлюз ``history-trades`` (~30 файлов/мин на IP) не переживает всплесков:
+    при честном неделимом интервале между запросами он успевает батчить
+    по 2 секунды, и число запросов в минуту гарантированно не превысит
+    60 / interval. Сериализует ВСЕ конкурентные backfill-задачи.
+    """
+
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
+        self._lock = asyncio.Lock()
+        self._last = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            delay = self._last + self._interval - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last = asyncio.get_running_loop().time()
 
 
 try:
@@ -179,6 +207,7 @@ async def backfill_day(
     figi: str | None = None,
     archive_keys: list[str] | None = None,
     market_data: Any | None = None,
+    gate: _RateGate | None = None,
 ) -> bool:
     """Догружает один отсутствующий день.
 
@@ -207,7 +236,7 @@ async def backfill_day(
             day_str,
         )
         return False
-    return await _backfill_from_archive(session, config, instrument, repo, day, archive_keys)
+    return await _backfill_from_archive(session, config, instrument, repo, day, archive_keys, gate)
 
 
 async def _backfill_from_archive(
@@ -217,42 +246,59 @@ async def _backfill_from_archive(
     repo: MarketDataRepository,
     day: datetime,
     archive_keys: list[str],
+    gate: _RateGate | None = None,
 ) -> bool:
     """Скачивает официальный дневной архив сделок (gzip-CSV) и сохраняет его."""
+    if gate is None:
+        gate = _RateGate(60.0 / ARCHIVE_MAX_PER_MIN)
     day_str = day.strftime("%Y-%m-%d")
     headers = {"Authorization": f"Bearer {config.token}", "accept": "application/octet-stream"}
 
     content: bytes | None = None
+    exhausted = False
     for key in archive_keys:
         url = f"{HISTORY_TRADES_URL}/{day_str}?instrumentId={key}"
         logger.info("Загрузка архива истории %s для %s (%s)", key, instrument.id, day_str)
-        try:
-            async with session.get(
-                url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)
-            ) as resp:
-                if resp.status == 404:
-                    continue
-                if resp.status == 429:  # ~30 загрузок в минуту на IP
-                    await asyncio.sleep(10)
-                    resp2 = await session.get(
-                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)
-                    )
-                    resp = resp2
-                    if resp.status == 429:
+        for attempt in range(ARCHIVE_ATTEMPTS):
+            await gate.wait()
+            try:
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)
+                ) as resp:
+                    if resp.status == 404:
+                        break
+                    if resp.status == 429:  # ~30 загрузок в минуту на IP
+                        retry_after = float(resp.headers.get("Retry-After", 60) or 60)
                         logger.warning(
-                            "Архив истории ограничил лимит запросов для %s за %s",
+                            "Архив истории ограничил лимит для %s за %s: "
+                            "повтор через %.0f c (попытка %d/%d)",
                             instrument.id,
                             day_str,
+                            retry_after,
+                            attempt + 1,
+                            ARCHIVE_ATTEMPTS,
                         )
-                        return True
-                resp.raise_for_status()
-                content = await resp.read()
-                break
-        except aiohttp.ClientError as exc:
-            logger.error("Ошибка загрузки архива истории для %s: %s", instrument.id, exc)
-            return False
-
+                        if attempt + 1 >= ARCHIVE_ATTEMPTS:
+                            exhausted = True
+                            break
+                        await asyncio.sleep(retry_after)
+                        continue
+                    resp.raise_for_status()
+                    content = await resp.read()
+                    break
+            except aiohttp.ClientError as exc:
+                logger.error("Ошибка загрузки архива истории для %s: %s", instrument.id, exc)
+                return False
+        if content is not None:
+            break
     if content is None:
+        if exhausted:
+            logger.warning(
+                "Архив истории недоступен для %s за %s: лимит запросов исчерпан",
+                instrument.id,
+                day_str,
+            )
+            return False
         logger.info(
             "Архива истории нет для %s за %s (в этот день не было торгов)",
             instrument.id,
@@ -497,6 +543,7 @@ async def run_backfill(
     как duck-typed протокол-объекты.
     """
     semaphore = asyncio.Semaphore(MAX_BACKFILL_CONCURRENCY)
+    gate = _RateGate(60.0 / ARCHIVE_MAX_PER_MIN)
     has_futures = any(
         instrument.type in (InstrumentType.FUTURES_CONTRACT, InstrumentType.CONTINUOUS_FUTURES)
         for instrument in config.instruments
@@ -512,7 +559,7 @@ async def run_backfill(
     ) -> None:
         async with semaphore:
             await backfill_day(
-                session, config, instrument, repo, day, figi, archive_keys, market_data
+                session, config, instrument, repo, day, figi, archive_keys, market_data, gate
             )
 
     async with aiohttp.ClientSession(
