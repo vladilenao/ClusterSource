@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cluster-source.local/schemas/config.schema.json",
+  "title": "ClusterSource config.yaml",
+  "description": "Схема файла config.yaml / config.local.yaml, разбираемого AppConfig.from_yaml(). Неизвестные ключи игнорируются кодом. Код не выполняет валидацию по этой схеме.",
+  "type": "object",
+  "properties": {
+    "TOKEN": {
+      "type": "string",
+      "description": "Токен T-Investments API. Имеет приоритет над 'token'. Значение 'your-token-here' считается заглушкой.",
+      "default": ""
+    },
+    "token": {
+      "type": "string",
+      "description": "Альтернативное имя ключа TOKEN; используется, только если TOKEN отсутствует."
+    },
+    "data_dir": {
+      "type": "string",
+      "description": "Корневой каталог данных. Хранилище — {data_dir}/history. Относительный путь — от рабочего каталога процесса.",
+      "default": "data"
+    },
+    "batch": {
+      "type": "object",
+      "description": "Параметры консьюмера DataCollector.",
+      "properties": {
+        "flush_interval_sec": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 5.0,
+          "description": "Период пакетной записи, секунды: тики попадают в SQLite не реже раза за интервал."
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000,
+          "description": "Размер буфера, при котором запись выполняется немедленно."
+        }
+      }
+    },
+    "archiver": {
+      "type": "object",
+      "description": "Время ежесуточного обслуживания хранилища (догрузка + архивация), UTC.",
+      "properties": {
+        "run_hour_utc": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 23,
+          "default": 0
+        },
+        "run_minute_utc": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 59,
+          "default": 5
+        }
+      }
+    },
+    "history_check_days": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 14,
+      "description": "Окно в днях (включая сегодняшний) для догрузки отсутствующих и перекачки отмеченных дней."
+    },
+    "tickers": {
+      "type": "array",
+      "default": [],
+      "description": "Инструменты для сбора.",
+      "items": {
+        "$ref": "#/$defs/instrument"
+      }
+    }
+  },
+  "$defs": {
+    "instrument": {
+      "type": "object",
+      "required": [
+        "id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Тикер акции или фьючерсного контракта; для continuous_futures — код базового актива (с учётом регистра), контракты имеют вид {id}{код месяца}{год}.",
+          "examples": [
+            "SBER",
+            "SiZ6",
+            "Si"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "share",
+            "futures_contract",
+            "continuous_futures"
+          ],
+          "description": "Тип инструмента (InstrumentType)."
+        },
+        "tick_size": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 0.01,
+          "description": "Шаг цены для округления в footprint."
+        },
+        "lot_size": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Размер лота. Справочное поле (L-09)."
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "TOKEN": "t.xxxxxxxx",
+      "data_dir": "data",
+      "batch": {
+        "flush_interval_sec": 5,
+        "batch_size": 1000
+      },
+      "history_check_days": 14,
+      "tickers": [
+        {
+          "id": "SBER",
+          "type": "share",
+          "tick_size": 0.01,
+          "lot_size": 1
+        },
+        {
+          "id": "Si",
+          "type": "continuous_futures",
+          "tick_size": 1.0,
+          "lot_size": 1000
+        }
+      ],
+      "archiver": {
+        "run_hour_utc": 0,
+        "run_minute_utc": 5
+      }
+    }
+  ]
+}

@@ -1,0 +1,239 @@
+asyncapi: 3.0.0
+info:
+  title: T-Investments MarketDataStream — подписка на сделки (ClusterSource)
+  version: "1.0.0"
+  description: |
+    Двунаправленный gRPC-стрим
+    `tinkoff.public.invest.api.contract.v1.MarketDataStreamService/MarketDataStream`
+    в объёме, используемом ClusterSource (`main.create_stream`,
+    `collector.DataCollector.subscribe`).
+
+    Клиент (ClusterSource) отправляет один `MarketDataRequest` с
+    `subscribe_trades_request` на каждый инструмент (одно соединение на
+    инструмент) и затем получает поток `MarketDataResponse`. Обрабатываются
+    только ответы с полем `trade`; остальные (`subscribe_trades_response`,
+    `ping`) пропускаются.
+
+    Имена полей — имена полей protobuf (snake_case), как их видит SDK
+    `t-tech-investments`. Протокол `grpc` не входит в список официальных
+    биндингов AsyncAPI и указан как пользовательское значение.
+
+    Расширение `x-tick-field` у полей `Trade` указывает поле
+    `cluster_source.collector.Tick`, в которое отображается значение.
+servers:
+  production:
+    host: invest-public-api.tbank.ru:443
+    protocol: grpc
+    description: Боевой контур Invest API (TLS).
+    security:
+      - $ref: "#/components/securitySchemes/bearerToken"
+
+channels:
+  marketDataStream:
+    address: tinkoff.public.invest.api.contract.v1.MarketDataStreamService/MarketDataStream
+    description: Двунаправленный стрим рыночных данных.
+    servers:
+      - $ref: "#/servers/production"
+    messages:
+      subscribeTradesRequest:
+        $ref: "#/components/messages/SubscribeTradesRequest"
+      tradeEvent:
+        $ref: "#/components/messages/TradeEvent"
+      subscribeTradesResponse:
+        $ref: "#/components/messages/SubscribeTradesResponse"
+      ping:
+        $ref: "#/components/messages/Ping"
+
+operations:
+  subscribeTrades:
+    action: send
+    title: Подписка на сделки инструмента
+    description: |
+      Отправляется один раз после открытия стрима. Инструмент задаётся FIGI,
+      полученным `main._resolve_stream_figi` (для `continuous_futures` — FIGI
+      контракта `config.nearest_contract`: шаблон `{id}{месяц}{год}`,
+      ближайшая экспирация не раньше сегодняшнего дня). Открытие стрима
+      отмечает текущий день `stream_gap` для перекачки из архива.
+    channel:
+      $ref: "#/channels/marketDataStream"
+    messages:
+      - $ref: "#/channels/marketDataStream/messages/subscribeTradesRequest"
+  receiveMarketData:
+    action: receive
+    title: Получение событий стрима
+    description: |
+      `trade` → `Tick` → `asyncio.Queue`. `subscribe_trades_response` и
+      `ping` игнорируются (ping служит точкой проверки запроса
+      переподключения). Ошибка или закрытие стрима → переподключение с
+      экспоненциальной задержкой 2 → 60 с.
+    channel:
+      $ref: "#/channels/marketDataStream"
+    messages:
+      - $ref: "#/channels/marketDataStream/messages/tradeEvent"
+      - $ref: "#/channels/marketDataStream/messages/subscribeTradesResponse"
+      - $ref: "#/channels/marketDataStream/messages/ping"
+
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: Токен T-Investments (`TOKEN`), передаётся SDK в метаданных gRPC `authorization`.
+
+  messages:
+    SubscribeTradesRequest:
+      name: MarketDataRequest.subscribe_trades_request
+      title: Запрос подписки на сделки
+      contentType: application/x-protobuf
+      payload:
+        $ref: "#/components/schemas/MarketDataRequest"
+      examples:
+        - name: subscribeSber
+          payload:
+            subscribe_trades_request:
+              subscription_action: SUBSCRIPTION_ACTION_SUBSCRIBE
+              instruments:
+                - instrument_id: BBG004730N88
+
+    TradeEvent:
+      name: MarketDataResponse.trade
+      title: Сделка
+      contentType: application/x-protobuf
+      payload:
+        $ref: "#/components/schemas/MarketDataResponseTrade"
+      examples:
+        - name: sberBuy
+          payload:
+            trade:
+              figi: BBG004730N88
+              direction: TRADE_DIRECTION_BUY
+              price: { units: 279, nano: 600000000 }
+              quantity: 800
+              time: "2026-09-04T10:00:00.123456Z"
+              instrument_uid: e6123145-9665-43e0-8413-cd61b8aa9b13
+              trade_source: TRADE_SOURCE_EXCHANGE
+              ticker: SBER
+              class_code: TQBR
+
+    SubscribeTradesResponse:
+      name: MarketDataResponse.subscribe_trades_response
+      title: Подтверждение подписки (игнорируется)
+      contentType: application/x-protobuf
+      payload:
+        type: object
+        properties:
+          subscribe_trades_response:
+            type: object
+            properties:
+              tracking_id: { type: string }
+              trade_subscriptions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    figi: { type: string }
+                    instrument_uid: { type: string }
+                    subscription_status: { type: string, examples: [SUBSCRIPTION_STATUS_SUCCESS] }
+                    ticker: { type: string }
+                    class_code: { type: string }
+
+    Ping:
+      name: MarketDataResponse.ping
+      title: Ping сервера (игнорируется)
+      contentType: application/x-protobuf
+      payload:
+        type: object
+        properties:
+          ping:
+            type: object
+            properties:
+              time: { type: string, format: date-time }
+
+  schemas:
+    MarketDataRequest:
+      type: object
+      required: [subscribe_trades_request]
+      properties:
+        subscribe_trades_request:
+          type: object
+          required: [subscription_action, instruments]
+          properties:
+            subscription_action:
+              type: string
+              enum: [SUBSCRIPTION_ACTION_SUBSCRIBE, SUBSCRIPTION_ACTION_UNSUBSCRIBE]
+              description: ClusterSource отправляет только SUBSCRIBE; отписка — закрытием стрима (`stream.stop()`).
+            instruments:
+              type: array
+              minItems: 1
+              maxItems: 1
+              description: ClusterSource подписывает ровно один инструмент на стрим.
+              items:
+                type: object
+                required: [instrument_id]
+                properties:
+                  instrument_id:
+                    type: string
+                    description: FIGI инструмента (поле `figi` устарело и не используется).
+            trade_source:
+              type: string
+              enum: [TRADE_SOURCE_UNSPECIFIED, TRADE_SOURCE_EXCHANGE, TRADE_SOURCE_DEALER, TRADE_SOURCE_ALL]
+              description: Не задаётся ClusterSource (значение по умолчанию UNSPECIFIED).
+            with_open_interest:
+              type: boolean
+              description: Не задаётся ClusterSource (false).
+
+    MarketDataResponseTrade:
+      type: object
+      required: [trade]
+      properties:
+        trade:
+          $ref: "#/components/schemas/Trade"
+
+    Quotation:
+      type: object
+      required: [units, nano]
+      properties:
+        units: { type: integer, format: int64 }
+        nano: { type: integer, format: int32 }
+
+    Trade:
+      type: object
+      description: Маппинг на Tick — docs/05-realtime-collection.md, раздел 5.4.
+      properties:
+        figi:
+          type: string
+          x-tick-field: null
+        direction:
+          type: string
+          enum: [TRADE_DIRECTION_UNSPECIFIED, TRADE_DIRECTION_BUY, TRADE_DIRECTION_SELL]
+          description: "BUY → BUY; SELL → SELL; UNSPECIFIED → UNKNOWN."
+          x-tick-field: direction
+        price:
+          allOf:
+            - $ref: "#/components/schemas/Quotation"
+          description: "units + nano / 1e9."
+          x-tick-field: price
+        quantity:
+          type: integer
+          format: int64
+          description: Количество в лотах.
+          x-tick-field: volume
+        time:
+          type: string
+          format: date-time
+          description: Время сделки, UTC.
+          x-tick-field: timestamp
+        instrument_uid:
+          type: string
+          x-tick-field: null
+        trade_source:
+          type: string
+          enum: [TRADE_SOURCE_UNSPECIFIED, TRADE_SOURCE_EXCHANGE, TRADE_SOURCE_DEALER, TRADE_SOURCE_ALL]
+          x-tick-field: null
+        ticker:
+          type: string
+          description: Не используется; Tick.ticker = Instrument.storage_name.
+          x-tick-field: null
+        class_code:
+          type: string
+          x-tick-field: null

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cluster-source.local/schemas/history-trade-record.schema.json",
+  "title": "HistoryTradeRecord",
+  "description": "Одна строка CSV из архива GET /history-trades/{date} после распаковки gzip, представленная как объект 'заголовок -> значение'. Все значения в CSV — строки. Заголовок файла: TRADE_TS,TICKER_CC,DIRECTION,PRICE,QUANTITY,TRADE_SOURCE,INSTRUMENT_UID. ClusterSource использует TRADE_TS, DIRECTION, PRICE, QUANTITY.",
+  "type": "object",
+  "required": [
+    "TRADE_TS",
+    "TICKER_CC",
+    "DIRECTION",
+    "PRICE",
+    "QUANTITY"
+  ],
+  "properties": {
+    "TRADE_TS": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Время сделки, UTC, RFC 3339; дробная часть секунд может отсутствовать. Разбирается с format='ISO8601'. -> Tick.timestamp.",
+      "examples": [
+        "2026-09-04T03:59:35.341871Z"
+      ]
+    },
+    "TICKER_CC": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9]+_[A-Z0-9]+$",
+      "description": "Тикер и код класса через '_', совпадает с параметром instrumentId запроса. Не сохраняется.",
+      "examples": [
+        "SBER_TQBR",
+        "SiZ6_SPBFUT"
+      ]
+    },
+    "DIRECTION": {
+      "type": "string",
+      "enum": [
+        "BUY",
+        "SELL"
+      ],
+      "description": "Направление сделки. -> Tick.direction через config.parse_direction; иное значение или отсутствие колонки -> UNKNOWN."
+    },
+    "PRICE": {
+      "type": "string",
+      "pattern": "^-?\\d+(\\.\\d+)?$",
+      "description": "Цена, десятичное число. -> Tick.price (float).",
+      "examples": [
+        "279.6"
+      ]
+    },
+    "QUANTITY": {
+      "type": "string",
+      "pattern": "^\\d+$",
+      "description": "Количество в лотах. -> Tick.volume (int).",
+      "examples": [
+        "800"
+      ]
+    },
+    "TRADE_SOURCE": {
+      "type": "string",
+      "description": "Источник сделки. Не сохраняется.",
+      "examples": [
+        "EXCHANGE"
+      ]
+    },
+    "INSTRUMENT_UID": {
+      "type": "string",
+      "description": "UID инструмента T-Investments. Не сохраняется.",
+      "examples": [
+        "e6123145-9665-43e0-8413-cd61b8aa9b13"
+      ]
+    }
+  }
+}

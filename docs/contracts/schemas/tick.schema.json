@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cluster-source.local/schemas/tick.schema.json",
+  "title": "Tick",
+  "description": "Одна обезличенная сделка в представлении ClusterSource. Одна и та же структура используется в DTO collector.Tick, в словарях для MarketDataRepository.insert_ticks, в строке таблицы SQLite ticks_hot_store и в строке Parquet-файла дня.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ticker",
+    "timestamp",
+    "price",
+    "volume",
+    "direction",
+    "trade_id"
+  ],
+  "properties": {
+    "ticker": {
+      "type": "string",
+      "description": "Ключ хранения Instrument.storage_name: тикер для share/futures_contract, '{id}_CONTINUOUS' для continuous_futures.",
+      "minLength": 1,
+      "examples": [
+        "SBER",
+        "SiZ6",
+        "Si_CONTINUOUS"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Время сделки в UTC. В SQLite хранится как isoformat(timespec='microseconds') со смещением +00:00; строки, записанные до унификации, могут быть без дробной части. В Parquet — timestamp с tz=UTC.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(\\+00:00|Z)$",
+      "examples": [
+        "2026-09-04T10:00:00.123456+00:00",
+        "2026-09-04T10:00:00+00:00"
+      ]
+    },
+    "price": {
+      "type": "number",
+      "description": "Цена сделки без округления до шага цены (валюта или пункты инструмента).",
+      "examples": [
+        279.6,
+        96512.0
+      ]
+    },
+    "volume": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Количество в лотах.",
+      "examples": [
+        800
+      ]
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "BUY",
+        "SELL",
+        "UNKNOWN"
+      ],
+      "description": "Направление агрессора (config.parse_direction). UNKNOWN — нет агрессора (аукцион) или провайдер не указал направление; такие сделки не входят ни в buy_volume, ни в sell_volume."
+    },
+    "trade_id": {
+      "type": "string",
+      "description": "Идентификатор сделки. Числовой — от легаси SDK; синтетический 's{YYYYmmddHHMMSSffffff}' — из стрима t-tech-investments; 's{YYYYmmddHHMMSSffffff}_{idx}' — из архива history-trades; пустая строка допустима для GetLastTrades. Уникальность не гарантируется.",
+      "anyOf": [
+        {
+          "pattern": "^\\d+$"
+        },
+        {
+          "pattern": "^s\\d{20}$"
+        },
+        {
+          "pattern": "^s\\d{20}_\\d+$"
+        },
+        {
+          "const": ""
+        }
+      ],
+      "examples": [
+        "123456789",
+        "s20260904100000123456",
+        "s20260904035935341871_0"
+      ]
+    }
+  }
+}

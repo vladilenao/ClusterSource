@@ -1,0 +1,380 @@
+openapi: 3.1.0
+info:
+  title: T-Investments HTTP API — подмножество, используемое ClusterSource
+  version: "1.0.0"
+  description: |
+    Описывает только те HTTP-методы и поля, которые использует ClusterSource
+    (`autoload.py`). Полный контракт принадлежит T-Investments.
+
+    * `getHistoryTrades` — основной источник истории за прошедшие дни.
+    * `findInstrument`, `listFutures`, `getLastTrades` — REST-шлюз (grpc-gateway)
+      над protobuf-контрактом `tinkoff.public.invest.api.contract.v1`.
+      ClusterSource вызывает их только при отсутствии SDK; при наличии SDK
+      те же сообщения передаются по gRPC (`invest-public-api.tbank.ru:443`).
+
+    Имена полей REST-шлюза: в ответах — lowerCamelCase (`classCode`,
+    `expirationDate`); в запросах шлюз принимает и snake_case, и
+    lowerCamelCase. Значения int64 в JSON передаются строками.
+servers:
+  - url: https://invest-public-api.tbank.ru
+    description: Сервис архивов истории сделок
+  - url: https://invest-public-api.tinkoff.ru/rest
+    description: REST-шлюз Invest API (фолбэк ClusterSource без SDK)
+security:
+  - bearerAuth: []
+tags:
+  - name: history
+    description: Архивы обезличенных сделок
+  - name: instruments
+    description: Справочник инструментов
+  - name: marketdata
+    description: Рыночные данные
+
+paths:
+  /history-trades/{date}:
+    servers:
+      - url: https://invest-public-api.tbank.ru
+    get:
+      tags: [history]
+      operationId: getHistoryTrades
+      summary: Архив обезличенных сделок инструмента за один день
+      description: |
+        Возвращает gzip-сжатый CSV со всеми сделками инструмента за
+        календарный день UTC. Архивы обновляются ночью и не включают
+        текущий день. Ограничение — около 30 файлов в минуту на IP.
+        ClusterSource выдерживает ≤ 28 запросов/мин и определяет gzip по
+        сигнатуре `1f 8b`.
+      parameters:
+        - name: date
+          in: path
+          required: true
+          description: День UTC.
+          schema:
+            type: string
+            format: date
+            examples: ["2026-09-04"]
+        - name: instrumentId
+          in: query
+          required: true
+          description: |
+            Ключ архива `{TICKER}_{CLASS_CODE}`. Классы: акции — `TQBR`,
+            `SPBXM`; фьючерсы — `SPBFUT`.
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9]+_[A-Z0-9]+$'
+            examples: ["SBER_TQBR", "SiZ6_SPBFUT"]
+        - name: accept
+          in: header
+          required: false
+          schema:
+            type: string
+            const: application/octet-stream
+      responses:
+        "200":
+          description: |
+            Gzip-архив CSV (UTF-8, допускается BOM). Первая строка —
+            заголовок `TRADE_TS,TICKER_CC,DIRECTION,PRICE,QUANTITY,TRADE_SOURCE,INSTRUMENT_UID`;
+            каждая следующая строка соответствует схеме
+            `../schemas/history-trade-record.schema.json`.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentEncoding: gzip
+                contentMediaType: text/csv
+              x-row-schema:
+                $ref: "../schemas/history-trade-record.schema.json"
+              example: |
+                TRADE_TS,TICKER_CC,DIRECTION,PRICE,QUANTITY,TRADE_SOURCE,INSTRUMENT_UID
+                2026-09-04T03:59:35.341871Z,SBER_TQBR,BUY,279.6,800,EXCHANGE,e6123145-9665-43e0-8413-cd61b8aa9b13
+        "401":
+          description: Токен отсутствует или недействителен.
+        "404":
+          description: |
+            Архива нет: в этот день не было торгов, архив ещё не опубликован
+            либо ключ `instrumentId` не существует. ClusterSource пробует
+            следующий ключ-кандидат; после всех — итог NO_DATA.
+        "429":
+          description: Превышен лимит запросов.
+          headers:
+            Retry-After:
+              description: Пауза до повтора, секунды. ClusterSource по умолчанию ждёт 60 с, до 3 попыток.
+              schema:
+                type: integer
+
+  /tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument:
+    servers:
+      - url: https://invest-public-api.tinkoff.ru/rest
+    post:
+      tags: [instruments]
+      operationId: findInstrument
+      summary: Поиск инструмента по строке
+      description: |
+        Используется только для акций. ClusterSource выбирает элемент с
+        `ticker == query`, среди совпадений — приоритет `classCode` TQBR,
+        затем SPBXM. Без точного совпадения или при ошибке FIGI не определён.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FindInstrumentRequest"
+            example:
+              query: SBER
+              instrument_kind: 2
+      responses:
+        "200":
+          description: Найденные инструменты.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FindInstrumentResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /tinkoff.public.invest.api.contract.v1.InstrumentsService/Futures:
+    servers:
+      - url: https://invest-public-api.tinkoff.ru/rest
+    post:
+      tags: [instruments]
+      operationId: listFutures
+      summary: Список фьючерсов
+      description: |
+        Справочник для выбора контракта непрерывного фьючерса, кода класса
+        и FIGI. ClusterSource запрашивает статус ALL, чтобы получить и
+        истёкшие контракты (для прошедших дней).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InstrumentsRequest"
+            example:
+              instrument_status: 2
+      responses:
+        "200":
+          description: Список фьючерсов.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FuturesResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /tinkoff.public.invest.api.contract.v1.MarketDataService/GetLastTrades:
+    servers:
+      - url: https://invest-public-api.tinkoff.ru/rest
+    post:
+      tags: [marketdata]
+      operationId: getLastTrades
+      summary: Последние обезличенные сделки
+      description: |
+        Используется для текущего дня. ClusterSource не передаёт `from`/`to`,
+        поэтому окно выборки определяет сервер; день отмечается
+        `partial_backfill` и позже перекачивается из архива.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetLastTradesRequest"
+            example:
+              instrument_id: BBG004730N88
+      responses:
+        "200":
+          description: Сделки.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetLastTradesResponse"
+        "404":
+          description: Метод недоступен; ClusterSource пропускает день без ошибки.
+        default:
+          $ref: "#/components/responses/Error"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Токен T-Investments API из ключа `TOKEN` конфигурации.
+
+  responses:
+    Error:
+      description: Ошибка REST-шлюза.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GatewayError"
+
+  schemas:
+    InstrumentType:
+      description: Тип инструмента. ClusterSource передаёт только 2 (акции).
+      oneOf:
+        - type: integer
+          enum: [2]
+          description: "2 — INSTRUMENT_TYPE_SHARE"
+        - type: string
+          enum: [INSTRUMENT_TYPE_SHARE]
+
+    InstrumentStatus:
+      oneOf:
+        - type: integer
+          enum: [1, 2]
+          description: "1 — INSTRUMENT_STATUS_BASE (доступные для торговли), 2 — INSTRUMENT_STATUS_ALL (все, включая истёкшие)"
+        - type: string
+          enum: [INSTRUMENT_STATUS_BASE, INSTRUMENT_STATUS_ALL]
+
+    Quotation:
+      type: object
+      description: Десятичное число. Значение = units + nano / 1e9.
+      required: [units, nano]
+      properties:
+        units:
+          type: string
+          pattern: '^-?\d+$'
+          description: Целая часть (int64 как строка).
+        nano:
+          type: integer
+          format: int32
+          minimum: -999999999
+          maximum: 999999999
+          description: Дробная часть в миллиардных долях.
+      example:
+        units: "312"
+        nano: 500000000
+
+    TradeDirection:
+      type: string
+      enum: [TRADE_DIRECTION_UNSPECIFIED, TRADE_DIRECTION_BUY, TRADE_DIRECTION_SELL]
+      description: "Маппинг ClusterSource: BUY → BUY, SELL → SELL, UNSPECIFIED → UNKNOWN."
+
+    FindInstrumentRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: Строка поиска; ClusterSource передаёт `Instrument.id`.
+        instrument_kind:
+          $ref: "#/components/schemas/InstrumentType"
+
+    InstrumentShort:
+      type: object
+      properties:
+        figi:
+          type: string
+          description: Используется ClusterSource.
+        ticker:
+          type: string
+          description: Используется ClusterSource (точное совпадение с `query`).
+        classCode:
+          type: string
+        uid:
+          type: string
+        name:
+          type: string
+
+    FindInstrumentResponse:
+      type: object
+      properties:
+        instruments:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstrumentShort"
+
+    InstrumentsRequest:
+      type: object
+      properties:
+        instrument_status:
+          $ref: "#/components/schemas/InstrumentStatus"
+
+    Future:
+      type: object
+      description: Фьючерс; перечислены поля, которые читает ClusterSource.
+      properties:
+        figi:
+          type: string
+        ticker:
+          type: string
+          description: Ключ справочника `_FuturesMeta.ticker`.
+          examples: ["SiZ6"]
+        classCode:
+          type: string
+          description: "`_FuturesMeta.class_code`; при отсутствии — `SPBFUT`."
+          examples: ["SPBFUT"]
+        expirationDate:
+          type: string
+          format: date-time
+          description: "`_FuturesMeta.expiration` (берётся дата)."
+          examples: ["2026-12-17T00:00:00Z"]
+
+    FuturesResponse:
+      type: object
+      properties:
+        instruments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Future"
+
+    GetLastTradesRequest:
+      type: object
+      required: [instrument_id]
+      properties:
+        instrument_id:
+          type: string
+          description: FIGI или UID инструмента.
+        from:
+          type: string
+          format: date-time
+          description: Не передаётся ClusterSource.
+        to:
+          type: string
+          format: date-time
+          description: Не передаётся ClusterSource.
+
+    Trade:
+      type: object
+      description: Обезличенная сделка. Маппинг на Tick — docs/06-history-backfill.md, раздел 6.9.
+      properties:
+        figi:
+          type: string
+        direction:
+          $ref: "#/components/schemas/TradeDirection"
+        price:
+          $ref: "#/components/schemas/Quotation"
+        quantity:
+          type: string
+          pattern: '^\d+$'
+          description: Количество в лотах (int64 как строка).
+        time:
+          type: string
+          format: date-time
+        instrumentUid:
+          type: string
+        tradeSource:
+          type: string
+          enum: [TRADE_SOURCE_UNSPECIFIED, TRADE_SOURCE_EXCHANGE, TRADE_SOURCE_DEALER, TRADE_SOURCE_ALL]
+        ticker:
+          type: string
+        classCode:
+          type: string
+
+    GetLastTradesResponse:
+      type: object
+      properties:
+        trades:
+          type: array
+          items:
+            $ref: "#/components/schemas/Trade"
+
+    GatewayError:
+      type: object
+      properties:
+        code:
+          type: integer
+          description: Код gRPC-статуса.
+        message:
+          type: string
+        description:
+          type: string

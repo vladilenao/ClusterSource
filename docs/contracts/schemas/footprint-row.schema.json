@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cluster-source.local/schemas/footprint-row.schema.json",
+  "title": "FootprintRow",
+  "description": "Строка DataFrame, возвращаемого reader.get_cluster_data(): одна ячейка 'интервал времени x уровень цены'. При сериализации DataFrame в JSON (orient='records', date_format='iso') строки соответствуют этой схеме.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "timestamp",
+    "price",
+    "buy_volume",
+    "sell_volume",
+    "delta"
+  ],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Левая граница интервала timeframe, UTC.",
+      "examples": [
+        "2026-10-12T07:00:00+00:00"
+      ]
+    },
+    "price": {
+      "type": "number",
+      "description": "Цена, округлённая до tick_size инструмента: round(price / tick_size) * tick_size.",
+      "examples": [
+        96512.0
+      ]
+    },
+    "buy_volume": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Сумма volume сделок с direction = BUY в ячейке (UNKNOWN не учитывается)."
+    },
+    "sell_volume": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Сумма volume сделок с direction = SELL в ячейке (UNKNOWN не учитывается)."
+    },
+    "delta": {
+      "type": "integer",
+      "description": "buy_volume - sell_volume."
+    }
+  },
+  "examples": [
+    {
+      "timestamp": "2026-10-12T07:00:00+00:00",
+      "price": 96512.0,
+      "buy_volume": 40,
+      "sell_volume": 15,
+      "delta": 25
+    }
+  ]
+}
