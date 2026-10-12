@@ -5,9 +5,10 @@
 * Задача 1 (Producer): слушает gRPC-стрим рыночных данных T-Investments,
   преобразует входящие protobuf-объекты в простые DTO/словари и кладёт их
   в :class:`asyncio.Queue`.
-* Задача 2 (Consumer): каждые ``flush_interval_sec`` или накопленный
-  ``batch_size`` тиков опустошает очередь и выполняет пакетную запись через
-  инжектированный репозиторий.
+* Задача 2 (Consumer): каждые ``flush_interval_sec`` или при накоплении
+  ``batch_size`` тиков выполняет пакетную запись через инжектированный
+  репозиторий. Консьюмер же сохраняет отметки «день неполный», которые
+  продюсер копит в памяти.
 
 gRPC-стрим никогда не пишется напрямую в базу данных.
 """
@@ -21,13 +22,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from cluster_source.config import AppConfig, Instrument
+from cluster_source.config import AppConfig, Instrument, parse_direction
 from cluster_source.database import MarketDataRepository
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRY_DELAY = 60.0
 RETRY_BASE = 2.0
+#: Стрим, проживший дольше, считается стабильным: задержка переподключения сбрасывается.
+STABLE_STREAM_SEC = 60.0
+CONSUMER_DRAIN_TIMEOUT = 30.0
+
+#: Причины отметки дня для перекачки из официального архива.
+REFRESH_COMPROMISED = "compromised"
+REFRESH_STREAM_GAP = "stream_gap"
 
 
 class InstrumentNotFound(RuntimeError):
@@ -64,7 +72,7 @@ class Tick:
     timestamp: datetime
     price: float
     volume: int
-    direction: str  # BUY / SELL
+    direction: str  # BUY / SELL / UNKNOWN
     trade_id: str
 
 
@@ -100,8 +108,7 @@ def _to_dto(
     else:
         price = float(price_raw)
     volume = int(getattr(trade, "quantity", 0))
-    direction_raw = str(getattr(trade, "direction", ""))
-    direction = "BUY" if direction_raw in ("1", "BUY", "TRADE_DIRECTION_BUY") else "SELL"
+    direction = parse_direction(getattr(trade, "direction", ""))
     trade_id = str(getattr(trade, "trade_id", "") or getattr(trade, "tradeId", "") or "")
     if not trade_id:
         # Публичный стрим сделок t-tech-investments не содержит
@@ -114,7 +121,7 @@ def _to_dto(
         timestamp=timestamp,
         price=price,
         volume=volume,
-        direction=direction,
+        direction=direction.value,
         trade_id=trade_id,
     )
 
@@ -137,34 +144,48 @@ class DataCollector:
         self._stream_factory = stream_factory
         self._running = False
         self._tasks: list[asyncio.Task[Any]] = []
+        #: Дни, которые нужно перекачать: {YYYY-MM-DD: причина}. Пишет в БД консьюмер.
+        self._pending_marks: dict[str, str] = {}
+        self._reconnect_requested = False
 
     async def subscribe(self, stream: AsyncIterator[Any]) -> None:
         """Запускает «неубиваемый» цикл продюсера на данном стриме.
 
         Отслеживает непрерывность trade_id; при пропуске день помечается,
-        чтобы ночной архиватор/автозагрузчик мог перекачать его.
+        чтобы автозагрузчик перекачал его. Ошибки стрима пробрасываются в
+        :meth:`run`, который управляет переподключением.
         """
         prev_id_stack: list[str] = []
 
-        try:
-            async for item in stream:
-                # duck-typing потребитель стрим-итератора
-                if not self._running:
-                    return
-                # t-tech-investments отдаёт обёртки MarketDataResponse;
-                # распаковываем саму сделку и пропускаем ping/subscription-фреймы.
-                payload: Any = item
-                if hasattr(item, "trade"):
-                    if item.trade is None:
-                        continue
-                    payload = item.trade
-                tick = _to_dto(payload, self._instrument)
-                self._flag_gap(tick, prev_id_stack)
-                await self._queue.put(tick)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # pragma: no cover - resilience
-            logger.error("Ошибка потока продюсера: %s", exc)
+        async for item in stream:
+            # duck-typing потребитель стрим-итератора
+            if not self._running or self._reconnect_requested:
+                return
+            # t-tech-investments отдаёт обёртки MarketDataResponse;
+            # распаковываем саму сделку и пропускаем ping/subscription-фреймы.
+            payload: Any = item
+            if hasattr(item, "trade"):
+                if item.trade is None:
+                    continue
+                payload = item.trade
+            tick = _to_dto(payload, self._instrument)
+            self._flag_gap(tick, prev_id_stack)
+            await self._queue.put(tick)
+
+    @property
+    def instrument(self) -> Instrument:
+        return self._instrument
+
+    def request_reconnect(self) -> None:
+        """Просит переоткрыть стрим (с новой резолюцией инструмента).
+
+        Срабатывает на следующем кадре стрима (сделка или ping сервера).
+        Нужен непрерывным фьючерсам: после экспирации активный контракт меняется.
+        """
+        self._reconnect_requested = True
+
+    def _mark_day(self, day: str, reason: str) -> None:
+        self._pending_marks.setdefault(day, reason)
 
     def _flag_gap(self, tick: Tick, prev_ids: list[str]) -> None:
         if not tick.trade_id or not prev_ids:
@@ -187,50 +208,80 @@ class DataCollector:
                 cur,
                 day,
             )
+            self._mark_day(day, REFRESH_COMPROMISED)
         prev_ids.append(tick.trade_id)
 
     async def _consumer(self) -> None:
+        """Пишет тики пакетами: при ``batch_size`` тиков или раз в ``flush_interval_sec``.
+
+        Работает, пока коллектор запущен или в очереди есть тики, поэтому при
+        остановке очередь дописывается полностью.
+        """
         buffer: list[Tick] = []
         interval = self._config.batch.flush_interval_sec
         batch_size = self._config.batch.batch_size
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + interval
 
         while self._running or not self._queue.empty():
+            timeout = deadline - loop.time()
             try:
-                tick = await asyncio.wait_for(self._queue.get(), timeout=interval)
-                buffer.append(tick)
-            except TimeoutError:
+                if timeout > 0:
+                    buffer.append(await asyncio.wait_for(self._queue.get(), timeout=timeout))
+                else:
+                    buffer.append(self._queue.get_nowait())
+            except (TimeoutError, asyncio.QueueEmpty):
                 pass
 
-            should_flush = len(buffer) >= batch_size
-            if buffer and (should_flush or self._queue.empty()):
-                try:
-                    await asyncio.to_thread(
-                        self._repo.insert_ticks,
-                        [_tick_to_dict(t) for t in buffer],
-                    )
-                except Exception as exc:  # pragma: no cover - resilience
-                    logger.error("Ошибка флаша консьюмера: %s", exc)
+            now = loop.time()
+            if len(buffer) >= batch_size or now >= deadline:
+                await self._flush(buffer)
                 buffer.clear()
+                deadline = now + interval
 
+        await self._flush(buffer)
+
+    async def _flush(self, buffer: list[Tick]) -> None:
         if buffer:
             try:
                 await asyncio.to_thread(
                     self._repo.insert_ticks,
                     [_tick_to_dict(t) for t in buffer],
                 )
-            except Exception as exc:
-                logger.error("Ошибка финального флаша консьюмера: %s", exc)
+            except Exception as exc:  # pragma: no cover - resilience
+                logger.error("Ошибка флаша консьюмера: %s", exc)
+        if self._pending_marks:
+            marks, self._pending_marks = self._pending_marks, {}
+            try:
+                for reason in set(marks.values()):
+                    days = [day for day, r in marks.items() if r == reason]
+                    await asyncio.to_thread(self._repo.mark_days_for_refresh, days, reason)
+            except Exception as exc:  # pragma: no cover - resilience
+                logger.error("Ошибка сохранения отметок дней: %s", exc)
+                for day, reason in marks.items():
+                    self._pending_marks.setdefault(day, reason)
 
     async def run(self) -> None:
         """Запускает пару продюсер/консьюмер и держит стрим живым.
 
-        При обрыве соединения переподключается с экспоненциальной задержкой
-        (2 с .. 60 с). При завершении (``_running`` переведён в False) консьюмер
-        опустошает всю очередь, чтобы не потерять ни одного тика.
+        Переподключается с экспоненциальной задержкой 2 → 4 → … → 60 с; задержка
+        сбрасывается, если стрим проработал не меньше ``STABLE_STREAM_SEC``. При
+        остановке или отмене задачи консьюмер дописывает всю очередь (не дольше
+        ``CONSUMER_DRAIN_TIMEOUT``), после чего отмена пробрасывается дальше.
         """
         self._running = True
         consumer_task = asyncio.create_task(self._consumer())
+        try:
+            await self._stream_loop()
+        finally:
+            self._running = False
+            try:
+                await asyncio.wait_for(consumer_task, timeout=CONSUMER_DRAIN_TIMEOUT)
+            except TimeoutError:
+                consumer_task.cancel()
 
+    async def _stream_loop(self) -> None:
+        loop = asyncio.get_running_loop()
         delay = 0.0
         while self._running:
             if self._stream_factory is None:
@@ -238,19 +289,18 @@ class DataCollector:
                 await asyncio.sleep(RETRY_BASE)
                 continue
 
+            self._reconnect_requested = False
             try:
                 handle = await self._stream_factory(self._instrument)
-            except asyncio.CancelledError:
-                break
             except InstrumentNotFound as exc:
                 logger.warning(
                     "Инструмент %s не найден — запуск коллектора отменён: %s",
                     self._instrument.id,
                     exc,
                 )
-                break
+                return
             except Exception as exc:  # pragma: no cover - resilience
-                delay = max(delay, RETRY_BASE)
+                delay = _next_delay(delay)
                 logger.error(
                     "Не удалось создать стрим для %s: %s; повтор через %.1f с",
                     self._instrument.id,
@@ -258,43 +308,41 @@ class DataCollector:
                     delay,
                 )
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, MAX_RETRY_DELAY)
                 continue
 
-            delay = 0.0
+            # Сделки до открытия стрима (начало дня, время переподключения)
+            # не получены: день перекачивается из архива, когда тот появится.
+            self._mark_day(datetime.now(UTC).strftime("%Y-%m-%d"), REFRESH_STREAM_GAP)
             logger.info(
                 "Коллектор запущен для %s (ключ хранения %s)",
                 self._instrument.id,
                 self._instrument.storage_name,
             )
+            started = loop.time()
             try:
                 await self.subscribe(handle.stream)
-            except asyncio.CancelledError:
-                await self._teardown(handle)
-                break
-            except Exception as exc:  # disconnect / stream error
-                logger.warning(
-                    "Поток прерван для %s: %s. Переподключение с экспоненциальной задержкой",
-                    self._instrument.id,
-                    exc,
+                reason = (
+                    "переподключение по запросу"
+                    if self._reconnect_requested
+                    else "стрим закрыт сервером"
                 )
+            except Exception as exc:  # disconnect / stream error
+                reason = f"ошибка стрима: {exc}"
+            finally:
                 await self._teardown(handle)
-                await asyncio.sleep(delay)
-                delay = max(delay, RETRY_BASE)
-                delay = min(delay * 2, MAX_RETRY_DELAY)
-                continue
 
-            # Стрим закрыт штатно (например, ночью) — переподключаемся.
-            await self._teardown(handle)
-            await asyncio.sleep(RETRY_BASE)
-            delay = RETRY_BASE
-
-        # Корректное завершение: даём консьюмеру сбросить все оставшиеся тики.
-        self._running = False
-        try:
-            await asyncio.wait_for(consumer_task, timeout=30)
-        except TimeoutError:
-            consumer_task.cancel()
+            if not self._running:
+                return
+            if loop.time() - started >= STABLE_STREAM_SEC:
+                delay = 0.0
+            delay = _next_delay(delay)
+            logger.warning(
+                "Поток прерван для %s (%s); переподключение через %.1f с",
+                self._instrument.id,
+                reason,
+                delay,
+            )
+            await asyncio.sleep(delay)
 
     @staticmethod
     async def _teardown(handle: StreamHandle) -> None:
@@ -307,6 +355,11 @@ class DataCollector:
     async def shutdown(self) -> None:
         """Сигнализирует циклу о остановке и освобождает ресурсы стрима."""
         self._running = False
+
+
+def _next_delay(delay: float) -> float:
+    """Следующая задержка переподключения: 2, 4, 8, … не более ``MAX_RETRY_DELAY``."""
+    return min(max(delay * 2, RETRY_BASE), MAX_RETRY_DELAY)
 
 
 def _tick_to_dict(tick: Tick) -> dict[str, object]:

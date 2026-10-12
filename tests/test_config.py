@@ -48,3 +48,42 @@ def test_token_override(tmp_path: Path) -> None:
     path.write_text('TOKEN: "ignored"\ntickers: []\n', encoding="utf-8")
     cfg = AppConfig.from_yaml(path, token="env-token")
     assert cfg.token == "env-token"
+
+
+def test_is_contract_ticker_requires_month_and_year() -> None:
+    from cluster_source.config import Instrument
+
+    si = Instrument(id="Si", type=InstrumentType.CONTINUOUS_FUTURES, tick_size=1.0, lot_size=1)
+    assert si.is_contract_ticker("SiZ6")
+    assert si.is_contract_ticker("SiH27")
+    assert not si.is_contract_ticker("SiZ")
+    assert not si.is_contract_ticker("SILV")
+    assert not si.is_contract_ticker("SRZ6")
+
+
+def test_nearest_contract_filters_underlying_and_expiry() -> None:
+    from datetime import date
+
+    from cluster_source.config import FuturesMeta, Instrument, nearest_contract
+
+    si = Instrument(id="Si", type=InstrumentType.CONTINUOUS_FUTURES, tick_size=1.0, lot_size=1)
+    futures = [
+        FuturesMeta("SiU6", "SPBFUT", date(2026, 9, 18)),
+        FuturesMeta("SiZ6", "SPBFUT", date(2026, 12, 17)),
+        FuturesMeta("SRU6", "SPBFUT", date(2026, 9, 1)),
+    ]
+    assert nearest_contract(si, futures, date(2026, 8, 1)).ticker == "SiU6"  # type: ignore[union-attr]
+    assert nearest_contract(si, futures, date(2026, 9, 18)).ticker == "SiU6"  # type: ignore[union-attr]
+    assert nearest_contract(si, futures, date(2026, 9, 19)).ticker == "SiZ6"  # type: ignore[union-attr]
+    assert nearest_contract(si, futures, date(2027, 1, 1)) is None
+
+
+def test_parse_direction() -> None:
+    from cluster_source.config import Direction, parse_direction
+
+    assert parse_direction(1) == Direction.BUY
+    assert parse_direction("trade_direction_sell") == Direction.SELL
+    assert parse_direction("2") == Direction.SELL
+    assert parse_direction(0) == Direction.UNKNOWN
+    assert parse_direction("") == Direction.UNKNOWN
+    assert parse_direction(None) == Direction.UNKNOWN

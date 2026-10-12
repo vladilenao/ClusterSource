@@ -222,3 +222,82 @@ def test_continuous_futures_rounding(share_config: AppConfig) -> None:
         end_time=now + timedelta(minutes=5),
     )
     assert sorted(result["price"].unique().tolist()) == [91.0]
+
+
+def test_empty_interval_returns_empty_frame(share_config: AppConfig) -> None:
+    """KI-14: нет данных — пустой DataFrame с колонками результата, без исключения."""
+    repo = _build_repo(share_config)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    result = get_cluster_data(share_config, repo, "SBER", start, start + timedelta(days=1))
+    assert result.empty
+    assert list(result.columns) == ["timestamp", "price", "buy_volume", "sell_volume", "delta"]
+
+
+def test_identical_trades_are_not_collapsed(share_config: AppConfig) -> None:
+    """Две реальные сделки с одинаковыми полями (одна микросекунда) учитываются обе."""
+    repo = _build_repo(share_config)
+    now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+    row = {
+        "ticker": "SBER",
+        "timestamp": now,
+        "price": 100.0,
+        "volume": 1,
+        "direction": "BUY",
+        "trade_id": "s20260101120000000000",
+    }
+    repo.insert_ticks([row, dict(row)])
+    result = get_cluster_data(
+        share_config, repo, "SBER", now - timedelta(minutes=5), now + timedelta(minutes=5)
+    )
+    assert result["buy_volume"].sum() == 2
+
+
+def test_cold_end_day_included_and_bounds_respected(share_config: AppConfig) -> None:
+    """KI-05: Parquet-день end_time читается, строки вне интервала не учитываются."""
+    repo = _build_repo(share_config)
+    d1 = datetime(2026, 9, 3, tzinfo=UTC)
+
+    def frame(ts: datetime, volume: int) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "ticker": ["SBER"],
+                "timestamp": [ts],
+                "price": [100.0],
+                "volume": [volume],
+                "direction": ["BUY"],
+                "trade_id": [str(volume)],
+            }
+        )
+
+    repo.write_parquet("2026-09-03", frame(d1 + timedelta(hours=8), 1))  # до start
+    repo.write_parquet("2026-09-04", frame(d1 + timedelta(days=1, hours=9), 10))
+    result = get_cluster_data(
+        share_config,
+        repo,
+        "SBER",
+        start_time=d1 + timedelta(hours=12),
+        end_time=d1 + timedelta(days=1, hours=12),
+        timeframe="1h",
+    )
+    assert result["buy_volume"].sum() == 10
+
+
+def test_unknown_direction_excluded_from_sides(share_config: AppConfig) -> None:
+    repo = _build_repo(share_config)
+    now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+    repo.insert_ticks(
+        [
+            {
+                "ticker": "SBER",
+                "timestamp": now,
+                "price": 100.0,
+                "volume": 7,
+                "direction": "UNKNOWN",
+                "trade_id": "1",
+            }
+        ]
+    )
+    result = get_cluster_data(
+        share_config, repo, "SBER", now - timedelta(minutes=5), now + timedelta(minutes=5)
+    )
+    assert result["buy_volume"].sum() == 0 and result["sell_volume"].sum() == 0

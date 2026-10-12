@@ -19,14 +19,11 @@ from cluster_source.database import MarketDataRepository
 
 logger = logging.getLogger(__name__)
 
+RESULT_COLUMNS = ["timestamp", "price", "buy_volume", "sell_volume", "delta"]
+
 
 def _round_price(series: pd.Series, tick_size: float) -> pd.Series:
     return (series / tick_size).round().astype(float) * tick_size
-
-
-def _sqlite_only(repo: MarketDataRepository) -> bool:
-    """True, когда у репозитория вообще нет холодного хранилища."""
-    return not repo._storage_dir.exists() or not any(repo._storage_dir.glob("*.parquet"))
 
 
 def get_cluster_data(
@@ -39,8 +36,10 @@ def get_cluster_data(
 ) -> pd.DataFrame:
     """Возвращает footprint-данные для ``ticker`` за [``start_time``, ``end_time``).
 
-    Автоматически объединяет SQLite (свежие) и Parquet (историю). Цены
-    округляются до ``tick_size`` инструмента перед группировкой.
+    Автоматически объединяет SQLite (свежие) и Parquet (историю): за день,
+    у которого есть Parquet-файл, берётся Parquet, иначе SQLite. Цены
+    округляются до ``tick_size`` инструмента перед группировкой. Без сделок в
+    интервале возвращается пустой DataFrame с колонками результата.
     """
     instrument = next(
         (i for i in config.instruments if i.storage_name == ticker),
@@ -60,22 +59,22 @@ def get_cluster_data(
         frames.append(repo.read_parquet(start_time, end_time))
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Ошибка чтения Parquet для %s: %s", ticker, exc)
-    frames.append(repo.read_ticks(start_time, end_time, ticker=ticker))
 
-    df = pd.concat([f for f in frames if f is not None and not f.empty], ignore_index=True)
-    if df.empty:
-        return pd.DataFrame(columns=["price", "buy_volume", "sell_volume", "delta"])
+    # После архивации день живёт и в горячем SQLite (окно 7 дней), и в Parquet.
+    # Источник выбирается по дню целиком: Parquet — архивная копия SQLite
+    # либо перекачанный официальный архив, поэтому у него приоритет. Так
+    # сделки не учитываются дважды, а одинаковые сделки не схлопываются.
+    hot = repo.read_ticks(start_time, end_time, ticker=ticker)
+    if not hot.empty:
+        cold_days = repo.parquet_days_available()
+        hot = hot[~hot["timestamp"].dt.strftime("%Y-%m-%d").isin(cold_days)]
+    frames.append(hot)
 
-    # Один и тот же день живёт и в горячем SQLite (окно 7 дней), и, после
-    # архивации, в холодном Parquet — идентичные строки. Удаляем точные дубли,
-    # чтобы дни, догруженные из архива, не учитывались дважды, пока находятся
-    # в горячем окне.
-    dup_cols = ["ticker", "timestamp", "price", "volume", "direction", "trade_id"]
-    df = df.drop_duplicates(subset=[c for c in dup_cols if c in df.columns], keep="last")
-
+    non_empty = [f for f in frames if not f.empty]
+    if not non_empty:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+    df = pd.concat(non_empty, ignore_index=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    if df["timestamp"].dt.tz is None:
-        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
 
     df["price"] = _round_price(df["price"].astype(float), tick_size)
     df["volume"] = df["volume"].astype(int)
@@ -94,4 +93,4 @@ def get_cluster_data(
     )
     result["delta"] = result["buy_volume"] - result["sell_volume"]
     result = result.sort_values(["timestamp", "price"]).reset_index(drop=True)
-    return result
+    return result[RESULT_COLUMNS]

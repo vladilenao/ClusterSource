@@ -1,7 +1,8 @@
 """Точка входа в приложение.
 
 Связывает через явную Dependency Injection конфигурацию, репозитории,
-автозагрузчик, ночной архиватор и реальновременные коллекторы. Обрабатывает
+автозагрузчик, архиватор (при старте и ежесуточно по расписанию) и
+реальновременные коллекторы. Обрабатывает
 SIGINT/SIGTERM для корректного завершения: стриминг останавливается, консьюмер
 сбрасывает все накопленные тики в SQLite, дескрипторы БД закрываются, и только
 потом процесс завершается.
@@ -13,6 +14,8 @@ import asyncio
 import logging
 import signal
 import sys
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +27,7 @@ from cluster_source.collector import (
     StreamFactory,
     StreamHandle,
 )
-from cluster_source.config import AppConfig, Instrument, InstrumentType
+from cluster_source.config import AppConfig, Instrument, InstrumentType, nearest_contract
 from cluster_source.database import MarketDataRepository
 
 logger = logging.getLogger("cluster_source")
@@ -89,20 +92,20 @@ async def _resolve_stream_figi(client: Any, instrument: Instrument) -> str:
             instrument_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_BASE
         )
         if instrument.is_continuous:
-            eligible = [f for f in futures.instruments if f.ticker.startswith(instrument.id)]
-            if not eligible:
+            metas = autoload.futures_from_sdk(futures.instruments)
+            active = nearest_contract(instrument, metas.values(), datetime.now(UTC).date())
+            if active is None:
                 raise InstrumentNotFound(
                     f"Не найден активный фьючерсный контракт "
                     f"для непрерывного инструмента {instrument.id}"
                 )
-            active = min(eligible, key=lambda f: f.expiration_date)
             logger.info(
                 "Непрерывный %s -> активный контракт %s (истекает %s)",
                 instrument.id,
                 active.ticker,
-                active.expiration_date,
+                active.expiration,
             )
-            return str(active.figi)
+            return active.figi
         matches = [f for f in futures.instruments if f.ticker == instrument.id]
         if not matches:
             raise InstrumentNotFound(f"Фьючерсный контракт не найден: {instrument.id}")
@@ -146,16 +149,21 @@ async def create_stream(config: AppConfig, instrument: Instrument) -> StreamHand
 
     client = AsyncClient(config.token)
     services = await client.__aenter__()
-    figi = await _resolve_stream_figi(services, instrument)
-    stream = services.create_market_data_stream()
-    stream.subscribe(
-        MarketDataRequest(
-            subscribe_trades_request=SubscribeTradesRequest(
-                subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
-                instruments=[TradeInstrument(instrument_id=figi)],
+    try:
+        figi = await _resolve_stream_figi(services, instrument)
+        stream = services.create_market_data_stream()
+        stream.subscribe(
+            MarketDataRequest(
+                subscribe_trades_request=SubscribeTradesRequest(
+                    subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
+                    instruments=[TradeInstrument(instrument_id=figi)],
+                )
             )
         )
-    )
+    except BaseException:
+        # Иначе при каждом повторе открытия стрима утекал бы gRPC-канал.
+        await client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+        raise
 
     async def teardown() -> None:
         try:
@@ -166,11 +174,12 @@ async def create_stream(config: AppConfig, instrument: Instrument) -> StreamHand
     return StreamHandle(stream=stream, teardown=teardown)
 
 
-async def amain(config: AppConfig) -> int:
-    repos: dict[str, MarketDataRepository] = {}
-    for instrument in config.instruments:
-        repos[instrument.storage_name] = MarketDataRepository(config.storage_root, instrument)
+async def run_maintenance(config: AppConfig, repos: dict[str, MarketDataRepository]) -> None:
+    """Обслуживание хранилища: догрузка/перекачка дней, затем архивация и очистка.
 
+    Выполняется при старте и ежесуточно по расписанию ``config.archiver``.
+    Ошибки этапов логируются и не прерывают работу коллекторов.
+    """
     logger.info(
         "Проверка автозагрузки/догрузки истории (последние %d дней)",
         config.history_check_days,
@@ -187,7 +196,8 @@ async def amain(config: AppConfig) -> int:
                 instruments=services.instruments,
                 kind_share=_SdkInstrumentType.INSTRUMENT_TYPE_SHARE,
                 kind_futures=_SdkInstrumentType.INSTRUMENT_TYPE_FUTURES,
-                futures_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_BASE,
+                # Истёкшие контракты нужны для прошедших дней непрерывных фьючерсов.
+                futures_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_ALL,
             )
         else:
             await autoload.run_backfill(config, repos)
@@ -202,6 +212,29 @@ async def amain(config: AppConfig) -> int:
         await archiver_mod.run_archiver(config, repos)
     except Exception as exc:  # noqa: BLE001
         logger.error("Ошибка сверки архиватора: %s", exc)
+
+
+async def run_scheduler(config: AppConfig, job: Callable[[], Awaitable[None]]) -> None:
+    """Бесконечно запускает ``job`` ежесуточно в ``run_hour_utc:run_minute_utc`` UTC."""
+    while True:
+        delay = archiver_mod.seconds_until_next_run(datetime.now(UTC), config.archiver)
+        logger.info(
+            "Следующее ночное обслуживание через %.0f с (%02d:%02d UTC)",
+            delay,
+            config.archiver.run_hour_utc,
+            config.archiver.run_minute_utc,
+        )
+        await asyncio.sleep(delay)
+        logger.info("Ночное обслуживание: старт")
+        await job()
+
+
+async def amain(config: AppConfig) -> int:
+    repos: dict[str, MarketDataRepository] = {}
+    for instrument in config.instruments:
+        repos[instrument.storage_name] = MarketDataRepository(config.storage_root, instrument)
+
+    await run_maintenance(config, repos)
 
     collectors: list[DataCollector] = []
     stream_factory = make_stream_factory(config)
@@ -233,13 +266,23 @@ async def amain(config: AppConfig) -> int:
 
     collector_tasks = [asyncio.create_task(c.run()) for c in collectors]
 
+    async def nightly() -> None:
+        await run_maintenance(config, repos)
+        # Активный контракт непрерывного фьючерса мог смениться (экспирация).
+        for collector in collectors:
+            if collector.instrument.is_continuous:
+                collector.request_reconnect()
+
+    scheduler_task = asyncio.create_task(run_scheduler(config, nightly))
+
     try:
         await stop_event.wait()
     finally:
         logger.info("Запрошено корректное завершение; сбрасываем накопленные тики в SQLite")
+        scheduler_task.cancel()
         for task in collector_tasks:
             task.cancel()
-        await asyncio.gather(*collector_tasks, return_exceptions=True)
+        await asyncio.gather(scheduler_task, *collector_tasks, return_exceptions=True)
         for collector in collectors:
             await collector.shutdown()
         logger.info("Все коллекторы опустошены; соединения с БД закрыты")

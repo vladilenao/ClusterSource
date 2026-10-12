@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,6 +78,15 @@ class MarketDataRepository:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ticks_ticker_ts ON ticks_hot_store (ticker, timestamp)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS days_to_refresh (
+                day        TEXT PRIMARY KEY,
+                reason     TEXT NOT NULL,
+                marked_at  TEXT NOT NULL
+            )
+            """
+        )
 
     # ------------------------------------------------------------------ #
     # Запись в горячее хранилище (SQLite) — батчами
@@ -93,35 +102,58 @@ class MarketDataRepository:
         with self.session() as conn:
             conn.execute("BEGIN TRANSACTION;")
             try:
-                conn.executemany(
-                    """
-                    INSERT INTO ticks_hot_store
-                        (ticker, timestamp, price, volume, direction, trade_id)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            r["ticker"],
-                            self._iso(r["timestamp"]),
-                            self._as_float(r["price"]),
-                            self._as_int(r["volume"]),
-                            r["direction"],
-                            str(r["trade_id"]),
-                        )
-                        for r in rows
-                    ],
-                )
+                self._insert_rows(conn, rows)
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
+
+    def replace_hot_day(self, day: str, rows: Sequence[dict[str, object]]) -> None:
+        """Атомарно заменяет все строки дня ``day`` (UTC) этого инструмента на ``rows``.
+
+        Удаление и вставка выполняются в одной транзакции, поэтому читатель
+        никогда не видит день пустым или задвоенным.
+        """
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                conn.execute(
+                    "DELETE FROM ticks_hot_store WHERE ticker = ? AND substr(timestamp, 1, 10) = ?",
+                    (self.instrument.storage_name, day),
+                )
+                self._insert_rows(conn, rows)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _insert_rows(self, conn: sqlite3.Connection, rows: Sequence[dict[str, object]]) -> None:
+        conn.executemany(
+            """
+            INSERT INTO ticks_hot_store
+                (ticker, timestamp, price, volume, direction, trade_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    r["ticker"],
+                    self._iso(r["timestamp"]),
+                    self._as_float(r["price"]),
+                    self._as_int(r["volume"]),
+                    r["direction"],
+                    str(r["trade_id"]),
+                )
+                for r in rows
+            ],
+        )
 
     @staticmethod
     def _iso(value: object) -> str:
         if isinstance(value, datetime):
             if value.tzinfo is None:
                 value = value.replace(tzinfo=UTC)
-            return value.isoformat()
+            # Всегда с микросекундами: единый формат строк в SQLite.
+            return value.astimezone(UTC).isoformat(timespec="microseconds")
         return str(value)
 
     @staticmethod
@@ -153,7 +185,8 @@ class MarketDataRepository:
                 params=(ticker, self._iso(start), self._iso(end)),
             )
         if not df.empty:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            # Строки, записанные до унификации формата, бывают без дробной части.
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601")
         return df
 
     def hot_rows_for_day(self, day: datetime) -> pd.DataFrame:
@@ -195,6 +228,33 @@ class MarketDataRepository:
             return {row[0] for row in cur.fetchall()}
 
     # ------------------------------------------------------------------ #
+    # Отметки «день требует перекачки из официального архива»
+    # ------------------------------------------------------------------ #
+    def mark_days_for_refresh(self, days: Iterable[str], reason: str) -> None:
+        """Отмечает дни (``YYYY-MM-DD``, UTC) как неполные; повторная отметка не меняет причину."""
+        marked_at = datetime.now(UTC).isoformat()
+        params = [(day, reason, marked_at) for day in days]
+        if not params:
+            return
+        with self.session() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO days_to_refresh (day, reason, marked_at) VALUES (?, ?, ?)",
+                params,
+            )
+            conn.commit()
+
+    def days_to_refresh(self) -> dict[str, str]:
+        """Возвращает отмеченные дни: ``{YYYY-MM-DD: причина}``."""
+        with self.session() as conn:
+            cur = conn.execute("SELECT day, reason FROM days_to_refresh")
+            return {str(day): str(reason) for day, reason in cur.fetchall()}
+
+    def clear_refresh_mark(self, day: str) -> None:
+        with self.session() as conn:
+            conn.execute("DELETE FROM days_to_refresh WHERE day = ?", (day,))
+            conn.commit()
+
+    # ------------------------------------------------------------------ #
     # Запись в холодное хранилище (Parquet)
     # ------------------------------------------------------------------ #
     def write_parquet(self, day: str, df: pd.DataFrame) -> Path:
@@ -234,24 +294,30 @@ class MarketDataRepository:
         return {p.stem for p in self._storage_dir.glob("*.parquet")}
 
     def read_parquet(self, start: datetime, end: datetime) -> pd.DataFrame:
-        """Читает Parquet-файлы холодного хранилища, пересекающие [start, end)."""
-        start, end = self._utc_midnight(start), self._utc_midnight(end)
+        """Читает тики холодного хранилища с ``timestamp`` в [start, end) (UTC).
+
+        Открываются только файлы дней, пересекающих интервал; строки
+        фильтруются по точному времени.
+        """
+        start, end = self._as_utc(start), self._as_utc(end)
+        first_day = self._utc_midnight(start)
         frames: list[pd.DataFrame] = []
         for path in sorted(self._storage_dir.glob("*.parquet")):
             file_day = self._parse_date(path.stem)
             if file_day is None:
                 continue
-            if start <= file_day < end:
+            if first_day <= file_day < end:
                 try:
                     frames.append(pd.read_parquet(path))
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.warning("Ошибка чтения %s: %s", path, exc)
+        frames = [f for f in frames if not f.empty]
         if not frames:
             return pd.DataFrame()
         df = pd.concat(frames, ignore_index=True)
-        if not df.empty:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        return df
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        mask = (df["timestamp"] >= pd.Timestamp(start)) & (df["timestamp"] < pd.Timestamp(end))
+        return df.loc[mask].reset_index(drop=True)
 
     def parquet_day_path(self, day: str) -> Path | None:
         day_str = pd.Timestamp(day).strftime("%Y-%m-%d")
@@ -266,11 +332,14 @@ class MarketDataRepository:
         return self.hot_days_available() | self.parquet_days_available()
 
     @staticmethod
-    def _utc_midnight(value: datetime) -> datetime:
+    def _as_utc(value: datetime) -> datetime:
         if value.tzinfo is None:
             value = value.replace(tzinfo=UTC)
-        value = value.astimezone(UTC)
-        return value.replace(hour=0, minute=0, second=0, microsecond=0)
+        return value.astimezone(UTC)
+
+    @classmethod
+    def _utc_midnight(cls, value: datetime) -> datetime:
+        return cls._as_utc(value).replace(hour=0, minute=0, second=0, microsecond=0)
 
     @staticmethod
     def _parse_date(value: str) -> datetime | None:

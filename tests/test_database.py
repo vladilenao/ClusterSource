@@ -190,3 +190,68 @@ def test_available_days_union(share_config: AppConfig) -> None:
     days = repo.available_days()
     assert hot_day.strftime("%Y-%m-%d") in days
     assert cold_day.strftime("%Y-%m-%d") in days
+
+
+def _row(ts: datetime, tid: str) -> dict:
+    return {
+        "ticker": "SBER",
+        "timestamp": ts,
+        "price": 1.0,
+        "volume": 1,
+        "direction": "BUY",
+        "trade_id": tid,
+    }
+
+
+def test_replace_hot_day_only_touches_that_day(share_repo: MarketDataRepository) -> None:
+    day = datetime(2026, 9, 3, tzinfo=UTC)
+    share_repo.insert_ticks(
+        [_row(day + timedelta(hours=1), "old"), _row(day + timedelta(days=1, hours=1), "next")]
+    )
+    share_repo.replace_hot_day("2026-09-03", [_row(day + timedelta(hours=2), "new")])
+    df = share_repo.read_ticks(day, day + timedelta(days=2))
+    assert sorted(df["trade_id"]) == ["new", "next"]
+
+
+def test_refresh_marks_roundtrip(share_repo: MarketDataRepository) -> None:
+    share_repo.mark_days_for_refresh(["2026-09-03"], "compromised")
+    share_repo.mark_days_for_refresh(["2026-09-03", "2026-09-04"], "stream_gap")
+    assert share_repo.days_to_refresh() == {
+        "2026-09-03": "compromised",  # первая причина сохраняется
+        "2026-09-04": "stream_gap",
+    }
+    share_repo.clear_refresh_mark("2026-09-03")
+    assert share_repo.days_to_refresh() == {"2026-09-04": "stream_gap"}
+
+
+def test_read_parquet_filters_by_exact_time(share_repo: MarketDataRepository) -> None:
+    """KI-05: день end_time читается, строки вне [start, end) отбрасываются."""
+    d1 = datetime(2026, 9, 3, tzinfo=UTC)
+    d2 = d1 + timedelta(days=1)
+    share_repo.write_parquet(
+        "2026-09-03",
+        pd.DataFrame([_row(d1 + timedelta(hours=8), "early"), _row(d1 + timedelta(hours=14), "a")]),
+    )
+    share_repo.write_parquet(
+        "2026-09-04",
+        pd.DataFrame([_row(d2 + timedelta(hours=9), "b"), _row(d2 + timedelta(hours=15), "late")]),
+    )
+    df = share_repo.read_parquet(d1 + timedelta(hours=12), d2 + timedelta(hours=12))
+    assert sorted(df["trade_id"]) == ["a", "b"]
+    same_day = share_repo.read_parquet(d2 + timedelta(hours=8), d2 + timedelta(hours=10))
+    assert same_day["trade_id"].tolist() == ["b"]
+
+
+def test_read_ticks_mixed_timestamp_formats(share_repo: MarketDataRepository) -> None:
+    """Строки с микросекундами и без них (старые данные) читаются вместе."""
+    base = datetime(2026, 10, 11, 6, 59, 19, tzinfo=UTC)
+    share_repo.insert_ticks([_row(base, "a"), _row(base + timedelta(microseconds=5), "b")])
+    with share_repo.session() as conn:  # имитируем строку старого формата без дробной части
+        conn.execute(
+            "UPDATE ticks_hot_store SET timestamp = ? WHERE trade_id = 'a'",
+            ("2026-10-11T06:59:19+00:00",),
+        )
+        conn.commit()
+    df = share_repo.hot_rows_for_day(base)
+    assert len(df) == 2
+    assert df["timestamp"].dt.tz is not None

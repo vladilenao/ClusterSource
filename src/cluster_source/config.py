@@ -2,11 +2,41 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import date
 from enum import StrEnum
 from pathlib import Path
 
 import yaml
+
+#: Буквенные коды месяцев экспирации фьючерсов MOEX (F = январь … Z = декабрь).
+FUTURES_MONTH_CODES = "FGHJKMNQUVXZ"
+
+
+class Direction(StrEnum):
+    """Направление агрессора сделки в хранилище."""
+
+    BUY = "BUY"
+    SELL = "SELL"
+    #: Сделка без агрессора (аукцион, UNSPECIFIED у провайдера). Не входит
+    #: ни в buy_volume, ни в sell_volume footprint.
+    UNKNOWN = "UNKNOWN"
+
+
+_BUY_VALUES = frozenset({"1", "BUY", "TRADE_DIRECTION_BUY"})
+_SELL_VALUES = frozenset({"2", "SELL", "TRADE_DIRECTION_SELL"})
+
+
+def parse_direction(raw: object) -> Direction:
+    """Приводит направление из любого источника (SDK enum, REST, CSV) к :class:`Direction`."""
+    value = str(raw if raw is not None else "").strip().upper()
+    if value in _BUY_VALUES:
+        return Direction.BUY
+    if value in _SELL_VALUES:
+        return Direction.SELL
+    return Direction.UNKNOWN
 
 
 class InstrumentType(StrEnum):
@@ -38,6 +68,42 @@ class Instrument:
         if self.is_continuous:
             return f"{self.id}_CONTINUOUS"
         return self.id
+
+    def is_contract_ticker(self, ticker: str) -> bool:
+        """True, если ``ticker`` — контракт этого непрерывного фьючерса.
+
+        Контракт MOEX — ``{id}{код месяца}{год}``, например ``SiZ6`` для ``Si``.
+        Простой префикс недостаточен: он путает базовые активы с общим началом.
+        """
+        pattern = rf"{re.escape(self.id)}[{FUTURES_MONTH_CODES}]\d{{1,2}}"
+        return re.fullmatch(pattern, ticker) is not None
+
+
+@dataclass(frozen=True)
+class FuturesMeta:
+    """Минимальный дескриптор фьючерсного контракта из справочника провайдера."""
+
+    ticker: str
+    class_code: str
+    expiration: date
+    figi: str = ""
+
+
+def nearest_contract(
+    instrument: Instrument, futures: Iterable[FuturesMeta], day: date
+) -> FuturesMeta | None:
+    """Контракт непрерывного фьючерса, активный в ``day``.
+
+    Активным считается контракт этого базового актива с ближайшей
+    экспирацией в ``day`` или позже. ``None``, если такого контракта нет.
+    Одно правило используется и для стрима, и для догрузки истории.
+    """
+    eligible = [
+        m for m in futures if instrument.is_contract_ticker(m.ticker) and m.expiration >= day
+    ]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda m: m.expiration)
 
 
 @dataclass(frozen=True)
