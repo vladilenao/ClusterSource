@@ -87,6 +87,14 @@ class MarketDataRepository:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key    TEXT PRIMARY KEY,
+                value  TEXT NOT NULL
+            )
+            """
+        )
 
     # ------------------------------------------------------------------ #
     # Запись в горячее хранилище (SQLite) — батчами
@@ -230,15 +238,21 @@ class MarketDataRepository:
     # ------------------------------------------------------------------ #
     # Отметки «день требует перекачки из официального архива»
     # ------------------------------------------------------------------ #
-    def mark_days_for_refresh(self, days: Iterable[str], reason: str) -> None:
-        """Отмечает дни (``YYYY-MM-DD``, UTC) как неполные; повторная отметка не меняет причину."""
+    def mark_days_for_refresh(
+        self, days: Iterable[str], reason: str, *, override: bool = False
+    ) -> None:
+        """Отмечает дни (``YYYY-MM-DD``, UTC) как неполные.
+
+        Повторная отметка не меняет причину, если не задан ``override``.
+        """
         marked_at = datetime.now(UTC).isoformat()
         params = [(day, reason, marked_at) for day in days]
         if not params:
             return
+        verb = "INSERT OR REPLACE" if override else "INSERT OR IGNORE"
         with self.session() as conn:
             conn.executemany(
-                "INSERT OR IGNORE INTO days_to_refresh (day, reason, marked_at) VALUES (?, ?, ?)",
+                f"{verb} INTO days_to_refresh (day, reason, marked_at) VALUES (?, ?, ?)",
                 params,
             )
             conn.commit()
@@ -252,6 +266,19 @@ class MarketDataRepository:
     def clear_refresh_mark(self, day: str) -> None:
         with self.session() as conn:
             conn.execute("DELETE FROM days_to_refresh WHERE day = ?", (day,))
+            conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # Служебные флаги (однократные операции обслуживания)
+    # ------------------------------------------------------------------ #
+    def get_meta(self, key: str) -> str | None:
+        with self.session() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            return None if row is None else str(row[0])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.session() as conn:
+            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
             conn.commit()
 
     # ------------------------------------------------------------------ #
@@ -323,6 +350,18 @@ class MarketDataRepository:
         day_str = pd.Timestamp(day).strftime("%Y-%m-%d")
         path = self._storage_dir / f"{day_str}.parquet"
         return path if path.exists() else None
+
+    def delete_day(self, day: str) -> None:
+        """Удаляет день целиком из обоих хранилищ (строки SQLite и Parquet-файл).
+
+        Нужен, когда официальный архив подтвердил, что биржевых сделок за день
+        не было, а в хранилище лежат только отброшенные (дилерские) сделки.
+        """
+        self.replace_hot_day(day, [])
+        path = self.parquet_day_path(day)
+        if path is not None:
+            path.unlink()
+            logger.info("Удалён Parquet %s", path)
 
     # ------------------------------------------------------------------ #
     # Обнаружение / состояние

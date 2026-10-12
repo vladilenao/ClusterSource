@@ -5,7 +5,7 @@ Python 3.11+ project; src-layout package `cluster_source`. Realtime T-Investment
 ## Commands (run from repo root)
 
 - Install: `pip install -e ".[dev]"` (dev includes SDK extra; the SDK `t-tech-investments` may be unavailable on PyPI in some networks — base install works without it).
-- Test: `pytest -q` (asyncio auto-mode; 59 tests).
+- Test: `pytest -q` (asyncio auto-mode; 82 tests).
 - Lint/format: `ruff check . && ruff format .`
 - Typecheck: `mypy src/` (strict, python 3.13).
 - Run: `cluster-source` or `.venv/bin/python -m cluster_source.main`.
@@ -20,12 +20,15 @@ Run order after changes: `ruff check` → `mypy src/` → `pytest -q`.
 - **WAL mode required.** `session()` sets `PRAGMA journal_mode=WAL` — the bot reads while the collector writes. Never drop it.
 - **Graceful shutdown.** `amain` cancels the scheduler and collectors; `DataCollector.run` drains the queue in `finally` on any exit (including cancellation during reconnect backoff), then re-raises.
 - **Docs.** Human-readable docs live in `docs/` (see `docs/README.md`; contracts in `docs/contracts/`). When behaviour changes, update the matching doc per the table in `docs/11-development.md`.
+- **Specs first.** Every behaviour change starts with a spec in `docs/specs/` (format and registry in `docs/specs/README.md`; no openspec). Implementing code carries `# SPEC-NNNN G-N` at the guarantee, the covering test names the same id; a spec is "Готово" only when every acceptance criterion has a test.
+- **Data guarantees (SPEC-0001).** ClusterSource owns data correctness end-to-end: (G-1) no signal while the data window or instrument is `DEGRADED`/`GAP`; (G-2) every signal gets `SIGNAL_CONFIRMED`/`SIGNAL_REVOKED` within 20 min (unverifiable ⇒ revoked); (G-3) thresholds/baselines use `FINAL` days only. Only exchange trades are stored — dealer trades are filtered at the source (SPEC-0002).
+- **Temporary ISS collector.** `scripts/iss_raw_dump.py` runs under launchd (`local.clustersource.iss-raw-dump`) and writes raw MOEX tape to `{data_dir}/history/_iss_raw/` (SPEC-0003 stage 1). Do not stop it or delete that directory: free ISS serves only the current day.
 
 ## Storage model
 
 - `data/history/{storage}/{YYYY-MM-DD}.parquet` — cold store (snappy).
 - `data/history/_sqlite/{storage}.sqlite3` — hot store, WAL.
-- `days_to_refresh` table (per-instrument SQLite) — days to replace from the official archive: `stream_gap` (stream opened), `compromised` (trade_id gap), `partial_backfill` (today from GetLastTrades). Cleared on successful re-download, or on 404 when the day has no data; kept on 404 while data exists (archive not yet published).
+- `days_to_refresh` table (per-instrument SQLite) — days to replace from the official archive: `stream_gap` (stream opened), `compromised` (trade_id gap), `partial_backfill` (today from GetLastTrades), `dealer_cleanup` (one-off SPEC-0002 re-download of every stored past day; not limited by the `history_check_days` window, processed by the background `main.run_dealer_cleanup` pass under `maintenance_lock`). Cleared on successful re-download, or on 404 when the day has no data; kept on 404 while data exists (archive not yet published).
 - Continuous futures (`type: continuous_futures`) store under `{ID}_CONTINUOUS`, not the ticker. Active contract = `config.nearest_contract` (ticker `{ID}{month code}{year}`, nearest expiry ≥ day) — the single rule for both the stream and backfill; never match by bare prefix. Backfill fetches futures with `INSTRUMENT_STATUS_ALL` (expired contracts needed for past days).
 - Maintenance (`main.run_maintenance` = backfill → archiver) runs at startup and daily at `archiver.run_hour_utc:run_minute_utc` (00:05 UTC) via `main.run_scheduler`; afterwards continuous-futures collectors get `request_reconnect()` to re-resolve the contract.
 - Retention: hot store keeps the last 7 calendar days. Archiver writes every past day that has hot rows but no Parquet, validates the file exists and is non-empty, **then** purges hot rows older than the cutoff — and skips the purge entirely if any of those days lacks a Parquet file. Purge cutoff is the whole-day boundary (midnight of today-7) — aligned with `_target_for_day` so backfilled days routed to SQLite are not purged on the same run. Do not purge before validation.

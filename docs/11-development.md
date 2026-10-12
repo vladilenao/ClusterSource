@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 | Линтер | `ruff check .` | правила `E, F, I, W, UP`, длина строки 100 |
 | Форматирование | `ruff format .` | |
 | Типизация | `mypy src/` | `strict`, `python_version = 3.13` |
-| Тесты | `pytest -q` | `asyncio_mode = auto`, 59 тестов |
+| Тесты | `pytest -q` | `asyncio_mode = auto`, 82 теста |
 
 Порядок проверки после изменений: `ruff check` → `mypy src/` → `pytest -q`.
 
@@ -25,6 +25,7 @@ pip install -e ".[dev]"
 | `tests/test_collector.py` | `_to_dto`, Producer/Consumer, пакетная запись по интервалу, дренаж при отмене, отметки дней, экспоненциальная задержка, переподключение по запросу, `InstrumentNotFound` |
 | `tests/test_autoload.py` | Разбор CSV (`history-trades` и легаси), ключи архива и выбор контракта, FIGI на сегодня, выбор акции, `GetLastTrades`, `missing_days`, `refresh_days`, перекачка и судьба отметок |
 | `tests/test_archiver.py` | Перенос дней в Parquet, архивация всех прошедших дней, отмена очистки без Parquet, расписание |
+| `tests/test_exchange_only.py` | SPEC-0002: разбор источника сделки, подписка `TRADE_SOURCE_EXCHANGE`, фильтр стрима/архива/`GetLastTrades`, чистка `dealer_cleanup`, удаление дня без биржевых сделок |
 | `tests/test_reader.py` | Footprint, выбор источника по дню, точные границы интервала, пустой интервал, одинаковые сделки, `UNKNOWN`, округление |
 
 Тесты не требуют SDK и сети: внешние сервисы заменяются duck-typed
@@ -45,8 +46,13 @@ pip install -e ".[dev]"
 
 ## 11.4. Синхронизация документации с кодом
 
+Любое изменение поведения начинается со спецификации в
+[specs/](specs/README.md). Реализация гарантии помечается в коде комментарием
+`# SPEC-NNNN G-N`, тест — тем же идентификатором в docstring.
+
 | Изменение в коде | Обновить |
 |------------------|----------|
+| Новое или изменённое поведение | спецификация в [specs/](specs/README.md): статус, приёмка, журнал решений |
 | Ключ `config.yaml` или значение по умолчанию | [04-configuration.md](04-configuration.md), `contracts/schemas/config.schema.json` |
 | Колонка SQLite/Parquet, формат `trade_id` | [03-data-model.md](03-data-model.md), `contracts/schemas/tick.schema.json` |
 | Колонки результата `get_cluster_data` | [08-footprint-reader.md](08-footprint-reader.md), `contracts/schemas/footprint-row.schema.json` |

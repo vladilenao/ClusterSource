@@ -80,9 +80,12 @@ classDiagram
         +read_parquet(start, end) DataFrame
         +parquet_days_available() set~str~
         +available_days() set~str~
-        +mark_days_for_refresh(days, reason)
+        +mark_days_for_refresh(days, reason, override)
         +days_to_refresh() dict
         +clear_refresh_mark(day)
+        +get_meta(key) str | None
+        +set_meta(key, value)
+        +delete_day(day)
     }
     AppConfig *-- BatchConfig
     AppConfig *-- ArchiverConfig
@@ -161,8 +164,13 @@ CREATE INDEX IF NOT EXISTS idx_ticks_ticker_ts ON ticks_hot_store (ticker, times
 
 CREATE TABLE IF NOT EXISTS days_to_refresh (
     day        TEXT PRIMARY KEY,   -- YYYY-MM-DD, UTC
-    reason     TEXT NOT NULL,      -- stream_gap | compromised | partial_backfill
+    reason     TEXT NOT NULL,      -- stream_gap | compromised | partial_backfill | dealer_cleanup
     marked_at  TEXT NOT NULL       -- ISO 8601, UTC
+);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key    TEXT PRIMARY KEY,       -- например spec0002_dealer_cleanup_scheduled
+    value  TEXT NOT NULL
 );
 ```
 
@@ -173,7 +181,14 @@ CREATE TABLE IF NOT EXISTS days_to_refresh (
 
 `days_to_refresh` — отметки неполных дней для перекачки из архива
 ([6.3](06-history-backfill.md#63-отметки-для-перекачки)). Повторная отметка
-дня не меняет первую причину (`INSERT OR IGNORE`).
+дня не меняет первую причину (`INSERT OR IGNORE`), кроме `override=True`
+(`INSERT OR REPLACE`, используется чисткой `dealer_cleanup`).
+
+`meta` — служебные флаги однократных операций обслуживания.
+
+В хранилище только биржевые сделки
+([SPEC-0002](specs/0002-exchange-only-trades.md)): источник сделки
+проверяется до записи и отдельной колонкой не хранится.
 
 | PRAGMA | Значение | Зачем |
 |--------|----------|-------|

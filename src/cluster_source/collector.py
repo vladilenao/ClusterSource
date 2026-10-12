@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from cluster_source.config import AppConfig, Instrument, parse_direction
+from cluster_source.config import AppConfig, Instrument, is_exchange_trade, parse_direction
 from cluster_source.database import MarketDataRepository
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,9 @@ CONSUMER_DRAIN_TIMEOUT = 30.0
 #: Причины отметки дня для перекачки из официального архива.
 REFRESH_COMPROMISED = "compromised"
 REFRESH_STREAM_GAP = "stream_gap"
+
+#: Отброшенная дилерская сделка логируется первой и далее каждой N-й.
+DEALER_LOG_EVERY = 1000
 
 
 class InstrumentNotFound(RuntimeError):
@@ -147,6 +150,7 @@ class DataCollector:
         #: Дни, которые нужно перекачать: {YYYY-MM-DD: причина}. Пишет в БД консьюмер.
         self._pending_marks: dict[str, str] = {}
         self._reconnect_requested = False
+        self._dealer_dropped = 0
 
     async def subscribe(self, stream: AsyncIterator[Any]) -> None:
         """Запускает «неубиваемый» цикл продюсера на данном стриме.
@@ -168,6 +172,9 @@ class DataCollector:
                 if item.trade is None:
                     continue
                 payload = item.trade
+            if not is_exchange_trade(getattr(payload, "trade_source", None)):
+                self._drop_non_exchange(payload)
+                continue
             tick = _to_dto(payload, self._instrument)
             self._flag_gap(tick, prev_id_stack)
             await self._queue.put(tick)
@@ -175,6 +182,23 @@ class DataCollector:
     @property
     def instrument(self) -> Instrument:
         return self._instrument
+
+    @property
+    def dealer_trades_dropped(self) -> int:
+        """Сколько небиржевых сделок пришло вопреки фильтру подписки и было отброшено."""
+        return self._dealer_dropped
+
+    def _drop_non_exchange(self, payload: Any) -> None:
+        # SPEC-0002 G-3: небиржевая сделка не сохраняется, а учитывается как аномалия.
+        self._dealer_dropped += 1
+        if self._dealer_dropped == 1 or self._dealer_dropped % DEALER_LOG_EVERY == 0:
+            logger.warning(
+                "DEALER_TRADE_DROPPED по %s: источник %s, время %s (всего отброшено %d)",
+                self._instrument.id,
+                getattr(payload, "trade_source", None),
+                getattr(payload, "time", None),
+                self._dealer_dropped,
+            )
 
     def request_reconnect(self) -> None:
         """Просит переоткрыть стрим (с новой резолюцией инструмента).

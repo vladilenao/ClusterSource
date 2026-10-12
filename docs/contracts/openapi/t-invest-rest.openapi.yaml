@@ -332,6 +332,12 @@ components:
           type: string
           format: date-time
           description: Не передаётся ClusterSource.
+        trade_source:
+          type: string
+          enum: [TRADE_SOURCE_UNSPECIFIED, TRADE_SOURCE_EXCHANGE, TRADE_SOURCE_DEALER, TRADE_SOURCE_ALL]
+          description: >-
+            REST-фолбэк ClusterSource передаёт TRADE_SOURCE_EXCHANGE (SPEC-0002 G-2);
+            по умолчанию у сервера TRADE_SOURCE_ALL. Обёртка SDK 1.49 параметр не принимает.
 
     Trade:
       type: object
@@ -355,6 +361,7 @@ components:
         tradeSource:
           type: string
           enum: [TRADE_SOURCE_UNSPECIFIED, TRADE_SOURCE_EXCHANGE, TRADE_SOURCE_DEALER, TRADE_SOURCE_ALL]
+          description: Только отбор — явное небиржевое значение отбрасывает сделку (SPEC-0002).
         ticker:
           type: string
         classCode:

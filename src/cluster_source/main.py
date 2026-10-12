@@ -53,6 +53,7 @@ try:  # pragma: no cover - depends on environment
         SubscribeTradesRequest,
         SubscriptionAction,
         TradeInstrument,
+        TradeSourceType,
     )
 
     _has_sdk = True
@@ -64,7 +65,13 @@ except ImportError:  # pragma: no cover
     SubscriptionAction = None  # type: ignore[misc,assignment]
     SubscribeTradesRequest = None  # type: ignore[misc,assignment]
     TradeInstrument = None  # type: ignore[misc,assignment]
+    TradeSourceType = None  # type: ignore[misc,assignment]
     _has_sdk = False
+
+#: Пауза между проходами чистки от дилерских сделок, если остались необработанные дни.
+CLEANUP_RETRY_SEC = 1800.0
+#: Не больше стольких проходов чистки за запуск (~сутки); остаток — при следующем запуске.
+CLEANUP_MAX_PASSES = 48
 
 
 def setup_logging() -> None:
@@ -138,6 +145,21 @@ def make_stream_factory(config: AppConfig) -> StreamFactory:
     return factory
 
 
+def build_trades_subscription(figi: str) -> Any:
+    """Запрос подписки стрима на сделки инструмента ``figi``.
+
+    SPEC-0002 G-2: только биржевые сделки. По умолчанию сервер отдаёт и
+    дилерские (``TRADE_SOURCE_ALL``), поэтому источник задаётся явно.
+    """
+    return MarketDataRequest(
+        subscribe_trades_request=SubscribeTradesRequest(
+            subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
+            instruments=[TradeInstrument(instrument_id=figi)],
+            trade_source=TradeSourceType.TRADE_SOURCE_EXCHANGE,
+        )
+    )
+
+
 async def create_stream(config: AppConfig, instrument: Instrument) -> StreamHandle:
     """Открывает gRPC-стрим сделок для ``instrument``.
 
@@ -152,14 +174,7 @@ async def create_stream(config: AppConfig, instrument: Instrument) -> StreamHand
     try:
         figi = await _resolve_stream_figi(services, instrument)
         stream = services.create_market_data_stream()
-        stream.subscribe(
-            MarketDataRequest(
-                subscribe_trades_request=SubscribeTradesRequest(
-                    subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
-                    instruments=[TradeInstrument(instrument_id=figi)],
-                )
-            )
-        )
+        stream.subscribe(build_trades_subscription(figi))
     except BaseException:
         # Иначе при каждом повторе открытия стрима утекал бы gRPC-канал.
         await client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
@@ -174,7 +189,37 @@ async def create_stream(config: AppConfig, instrument: Instrument) -> StreamHand
     return StreamHandle(stream=stream, teardown=teardown)
 
 
-async def run_maintenance(config: AppConfig, repos: dict[str, MarketDataRepository]) -> None:
+async def _run_backfill(
+    config: AppConfig, repos: dict[str, MarketDataRepository], **kwargs: Any
+) -> None:
+    """Запускает ``autoload.run_backfill`` с сервисами SDK, если он установлен."""
+    if not _has_sdk:
+        await autoload.run_backfill(config, repos, **kwargs)
+        return
+    sdk_client = AsyncClient(config.token)
+    services = await sdk_client.__aenter__()
+    try:
+        await autoload.run_backfill(
+            config,
+            repos,
+            market_data=services.market_data,
+            instruments=services.instruments,
+            kind_share=_SdkInstrumentType.INSTRUMENT_TYPE_SHARE,
+            kind_futures=_SdkInstrumentType.INSTRUMENT_TYPE_FUTURES,
+            # Истёкшие контракты нужны для прошедших дней непрерывных фьючерсов.
+            futures_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_ALL,
+            **kwargs,
+        )
+    finally:
+        await sdk_client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+
+
+async def run_maintenance(
+    config: AppConfig,
+    repos: dict[str, MarketDataRepository],
+    *,
+    gate: Any = None,
+) -> None:
     """Обслуживание хранилища: догрузка/перекачка дней, затем архивация и очистка.
 
     Выполняется при старте и ежесуточно по расписанию ``config.archiver``.
@@ -184,34 +229,54 @@ async def run_maintenance(config: AppConfig, repos: dict[str, MarketDataReposito
         "Проверка автозагрузки/догрузки истории (последние %d дней)",
         config.history_check_days,
     )
-    sdk_client: Any = None
     try:
-        if _has_sdk:
-            sdk_client = AsyncClient(config.token)
-            services = await sdk_client.__aenter__()
-            await autoload.run_backfill(
-                config,
-                repos,
-                market_data=services.market_data,
-                instruments=services.instruments,
-                kind_share=_SdkInstrumentType.INSTRUMENT_TYPE_SHARE,
-                kind_futures=_SdkInstrumentType.INSTRUMENT_TYPE_FUTURES,
-                # Истёкшие контракты нужны для прошедших дней непрерывных фьючерсов.
-                futures_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_ALL,
-            )
-        else:
-            await autoload.run_backfill(config, repos)
+        await _run_backfill(config, repos, gate=gate)
     except Exception as exc:  # noqa: BLE001
         logger.error("Ошибка автозагрузки: %s", exc)
-    finally:
-        if sdk_client is not None:
-            await sdk_client.__aexit__(None, None, None)
 
     logger.info("Сверка архиватора")
     try:
         await archiver_mod.run_archiver(config, repos)
     except Exception as exc:  # noqa: BLE001
         logger.error("Ошибка сверки архиватора: %s", exc)
+
+
+async def run_dealer_cleanup(
+    config: AppConfig,
+    repos: dict[str, MarketDataRepository],
+    *,
+    gate: Any,
+    lock: asyncio.Lock,
+) -> None:
+    """Однократная чистка хранилища от дилерских сделок (SPEC-0002 G-4).
+
+    Отмечает все сохранённые дни и перекачивает их из архива с биржевым
+    фильтром. Работает в фоне параллельно с коллекторами: тысячи файлов при
+    лимите архива ~28/мин заняли бы часы. Делит ограничитель темпа с ночным
+    обслуживанием и берёт ``lock`` на каждый день, чтобы не пересекаться с
+    ним (архиватор пишет Parquet тех же дней).
+    """
+    for repo in repos.values():
+        await asyncio.to_thread(autoload.schedule_dealer_cleanup, repo)
+    for attempt in range(1, CLEANUP_MAX_PASSES + 1):
+        pending = 0
+        for repo in repos.values():
+            pending += len(
+                await asyncio.to_thread(autoload.refresh_days, config, repo, cleanup=True)
+            )
+        if not pending:
+            logger.info("Чистка от дилерских сделок завершена")
+            return
+        logger.info("Чистка от дилерских сделок: проход %d, осталось дней %d", attempt, pending)
+        try:
+            await _run_backfill(config, repos, gate=gate, lock=lock, cleanup=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка чистки от дилерских сделок: %s", exc)
+        await asyncio.sleep(CLEANUP_RETRY_SEC)
+    logger.error(
+        "Чистка от дилерских сделок не завершена за %d проходов; продолжится при следующем запуске",
+        CLEANUP_MAX_PASSES,
+    )
 
 
 async def run_scheduler(config: AppConfig, job: Callable[[], Awaitable[None]]) -> None:
@@ -234,7 +299,10 @@ async def amain(config: AppConfig) -> int:
     for instrument in config.instruments:
         repos[instrument.storage_name] = MarketDataRepository(config.storage_root, instrument)
 
-    await run_maintenance(config, repos)
+    archive_gate = autoload.archive_gate()
+    maintenance_lock = asyncio.Lock()
+    async with maintenance_lock:
+        await run_maintenance(config, repos, gate=archive_gate)
 
     collectors: list[DataCollector] = []
     stream_factory = make_stream_factory(config)
@@ -267,22 +335,27 @@ async def amain(config: AppConfig) -> int:
     collector_tasks = [asyncio.create_task(c.run()) for c in collectors]
 
     async def nightly() -> None:
-        await run_maintenance(config, repos)
+        async with maintenance_lock:
+            await run_maintenance(config, repos, gate=archive_gate)
         # Активный контракт непрерывного фьючерса мог смениться (экспирация).
         for collector in collectors:
             if collector.instrument.is_continuous:
                 collector.request_reconnect()
 
     scheduler_task = asyncio.create_task(run_scheduler(config, nightly))
+    cleanup_task = asyncio.create_task(
+        run_dealer_cleanup(config, repos, gate=archive_gate, lock=maintenance_lock)
+    )
 
     try:
         await stop_event.wait()
     finally:
         logger.info("Запрошено корректное завершение; сбрасываем накопленные тики в SQLite")
         scheduler_task.cancel()
+        cleanup_task.cancel()
         for task in collector_tasks:
             task.cancel()
-        await asyncio.gather(scheduler_task, *collector_tasks, return_exceptions=True)
+        await asyncio.gather(scheduler_task, cleanup_task, *collector_tasks, return_exceptions=True)
         for collector in collectors:
             await collector.shutdown()
         logger.info("Все коллекторы опустошены; соединения с БД закрыты")

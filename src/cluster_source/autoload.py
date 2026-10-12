@@ -10,6 +10,12 @@
   (``partial_backfill``). Отмеченный день заменяется данными официального
   архива целиком, как только архив за этот день опубликован.
 
+Сохраняются только биржевые сделки (SPEC-0002): строки архива с
+``TRADE_SOURCE`` ≠ ``EXCHANGE`` и дилерские сделки ``GetLastTrades``
+отбрасываются. Однократная чистка ранее сохранённых данных — отметки
+``dealer_cleanup`` (:func:`schedule_dealer_cleanup`); они не ограничены окном
+``history_check_days`` и обрабатываются отдельным проходом ``cleanup=True``.
+
 Основной источник истории: официальный сервис истории сделок, один файл на
 инструмент и календарный день с анонимизированными сделками:
 ``GET https://invest-public-api.tbank.ru/history-trades/YYYY-MM-DD?instrumentId={TICKER_CLASS}``
@@ -35,6 +41,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import gzip
 import io
@@ -53,6 +60,7 @@ from cluster_source.config import (
     FuturesMeta,
     Instrument,
     InstrumentType,
+    is_exchange_trade,
     nearest_contract,
     parse_direction,
 )
@@ -75,6 +83,13 @@ ARCHIVE_ATTEMPTS = 3
 #: Причина отметки сегодняшнего дня, догруженного через GetLastTrades.
 REFRESH_PARTIAL_BACKFILL = "partial_backfill"
 
+#: SPEC-0002 G-4: однократная перекачка всех сохранённых дней без дилерских сделок.
+REFRESH_DEALER_CLEANUP = "dealer_cleanup"
+DEALER_CLEANUP_META_KEY = "spec0002_dealer_cleanup_scheduled"
+#: Архив за день гарантированно опубликован через столько суток: 404 по отметке
+#: чистки тогда означает, что биржевых сделок за день не было.
+ARCHIVE_PUBLISHED_AFTER_DAYS = 2
+
 #: Идентификаторы «тикер/класс», которые принимает архив истории для каждого
 #: типа инструмента. Используются как фолбэк, когда код класса API не совпадает
 #: (для акций конвенция архива отличается от ``classCode`` в find_instrument).
@@ -94,6 +109,8 @@ class BackfillResult(StrEnum):
 
     WRITTEN = "written"  # данные получены и записаны
     NO_DATA = "no_data"  # источник ответил, но сделок за день нет (404 / пусто)
+    #: архив опубликован, но все его сделки небиржевые (SPEC-0002)
+    NO_EXCHANGE_TRADES = "no_exchange_trades"
     FAILED = "failed"  # ошибка; день будет обработан при следующем запуске
 
 
@@ -118,6 +135,11 @@ class _RateGate:
             if delay > 0:
                 await asyncio.sleep(delay)
             self._last = asyncio.get_running_loop().time()
+
+
+def archive_gate() -> _RateGate:
+    """Ограничитель темпа архива истории; один на процесс, общий для всех проходов."""
+    return _RateGate(60.0 / ARCHIVE_MAX_PER_MIN)
 
 
 try:
@@ -166,18 +188,27 @@ def missing_days(config: AppConfig, repo: MarketDataRepository) -> list[datetime
     return missing
 
 
-def refresh_days(config: AppConfig, repo: MarketDataRepository) -> list[datetime]:
-    """Отмеченные для перекачки прошедшие дни внутри окна ``history_check_days``.
+def refresh_days(
+    config: AppConfig, repo: MarketDataRepository, *, cleanup: bool = False
+) -> list[datetime]:
+    """Отмеченные для перекачки прошедшие дни.
 
-    Сегодняшний день не возвращается: его архив ещё не опубликован. Отметки
-    старше окна снимаются с предупреждением.
+    Сегодняшний день не возвращается: его архив ещё не опубликован.
+
+    * ``cleanup=False`` — все отметки, кроме ``dealer_cleanup``, внутри окна
+      ``history_check_days``; отметки старше окна снимаются с предупреждением.
+    * ``cleanup=True`` — только отметки ``dealer_cleanup`` без ограничения
+      окном (SPEC-0002 G-4), от новых дней к старым.
     """
     today = _utc_today()
     window_start = (today - timedelta(days=config.history_check_days - 1)).strftime("%Y-%m-%d")
     today_str = today.strftime("%Y-%m-%d")
     days: list[datetime] = []
-    for day_str, reason in sorted(repo.days_to_refresh().items()):
-        if day_str < window_start:
+    for day_str, reason in sorted(repo.days_to_refresh().items(), reverse=cleanup):
+        is_cleanup = reason == REFRESH_DEALER_CLEANUP
+        if is_cleanup != cleanup or day_str >= today_str:
+            continue
+        if not cleanup and day_str < window_start:
             logger.warning(
                 "Отметка перекачки %s за %s (%s) вышла за окно %d дней — снята без перекачки",
                 repo.instrument.storage_name,
@@ -186,9 +217,32 @@ def refresh_days(config: AppConfig, repo: MarketDataRepository) -> list[datetime
                 config.history_check_days,
             )
             repo.clear_refresh_mark(day_str)
-        elif day_str < today_str:
-            days.append(datetime.fromisoformat(day_str).replace(tzinfo=UTC))
+            continue
+        days.append(datetime.fromisoformat(day_str).replace(tzinfo=UTC))
     return days
+
+
+def schedule_dealer_cleanup(repo: MarketDataRepository) -> int:
+    """Однократно отмечает все сохранённые прошедшие дни для перекачки без дилерских сделок.
+
+    SPEC-0002 G-4: до введения фильтра в хранилище попадали дилерские сделки.
+    Сегодняшний день не отмечается — коллектор уже отметил его ``stream_gap``
+    при открытии стрима, и ночное обслуживание перекачает его из архива.
+    Повторный вызов ничего не делает (флаг в ``meta``). Возвращает число
+    отмеченных дней.
+    """
+    if repo.get_meta(DEALER_CLEANUP_META_KEY) is not None:
+        return 0
+    today_str = _utc_today().strftime("%Y-%m-%d")
+    days = sorted(d for d in repo.available_days() if d < today_str)
+    repo.mark_days_for_refresh(days, REFRESH_DEALER_CLEANUP, override=True)
+    repo.set_meta(DEALER_CLEANUP_META_KEY, datetime.now(UTC).isoformat())
+    logger.info(
+        "Чистка от дилерских сделок: %s — отмечено %d дней для перекачки",
+        repo.instrument.storage_name,
+        len(days),
+    )
+    return len(days)
 
 
 def _utc_today() -> datetime:
@@ -219,6 +273,7 @@ def _parse_history_csv(content: bytes) -> pd.DataFrame:
     i_vol = col("quantity") if col("quantity") >= 0 else col("volume")
     i_dir = col("direction") if col("direction") >= 0 else -1
     i_tid = col("tradeid") if col("tradeid") >= 0 else col("trade_id")
+    i_src = col("trade_source")
 
     parsed: list[dict[str, object]] = []
     for row in data:
@@ -230,6 +285,7 @@ def _parse_history_csv(content: bytes) -> pd.DataFrame:
                     "volume": int(row[i_vol]) if 0 <= i_vol < len(row) else 0,
                     "direction": row[i_dir] if 0 <= i_dir < len(row) else "",
                     "trade_id": row[i_tid] if 0 <= i_tid < len(row) else "",
+                    "trade_source": row[i_src] if 0 <= i_src < len(row) else "",
                 }
             )
         except (ValueError, IndexError):
@@ -373,6 +429,14 @@ async def _backfill_from_archive(
     if df.empty:
         logger.info("Нет сделок в архиве для %s за %s", instrument.id, day_str)
         return BackfillResult.NO_DATA
+    df, dropped = _exchange_only(df)
+    if dropped:
+        logger.info(
+            "Архив %s за %s: отброшено %d небиржевых сделок", instrument.id, day_str, dropped
+        )
+    if df.empty:
+        logger.info("В архиве %s за %s нет биржевых сделок", instrument.id, day_str)
+        return BackfillResult.NO_EXCHANGE_TRADES
 
     rows = _history_rows(df, instrument)
     rows = [r for r in rows if _as_utc(r["timestamp"]).strftime("%Y-%m-%d") == day_str]
@@ -397,6 +461,8 @@ async def _backfill_current_session(
     raw_trades: list[Any] = []
     if market_data is not None:
         try:
+            # Обёртка SDK 1.49 не принимает trade_source: сервер отдаёт все
+            # сделки, небиржевые отбрасываются по полю сделки в _trades_to_rows.
             resp = await market_data.get_last_trades(instrument_id=figi)
             raw_trades = list(resp.trades or [])
         except Exception as exc:  # noqa: BLE001 - SDK raises typed gRPC errors
@@ -404,7 +470,8 @@ async def _backfill_current_session(
             return BackfillResult.FAILED
     else:
         headers = {"Authorization": f"Bearer {config.token}", "accept": "application/json"}
-        payload = {"instrument_id": figi}
+        # SPEC-0002 G-2: по умолчанию сервер отдаёт и дилерские сделки (TRADE_SOURCE_ALL).
+        payload = {"instrument_id": figi, "trade_source": "TRADE_SOURCE_EXCHANGE"}
         try:
             async with session.post(
                 LAST_TRADES_URL,
@@ -546,11 +613,30 @@ def _as_date(value: Any) -> date | None:
 def _trades_to_rows(raw_trades: list[Any], instrument: Instrument) -> list[dict[str, object]]:
     """Преобразует payloadы GetLastTrades (REST-словари или SDK Trade-объекты) в строки."""
     rows: list[dict[str, object]] = []
+    dropped = 0
     for tr in raw_trades:
+        source = (
+            tr.get("trade_source", tr.get("tradeSource"))
+            if isinstance(tr, dict)
+            else (getattr(tr, "trade_source", None))
+        )
+        if not is_exchange_trade(source):  # SPEC-0002 G-1
+            dropped += 1
+            continue
         row = _trade_to_row(tr, instrument)
         if row is not None:
             rows.append(row)
+    if dropped:
+        logger.info("GetLastTrades %s: отброшено %d небиржевых сделок", instrument.id, dropped)
     return rows
+
+
+def _exchange_only(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Оставляет только биржевые строки архива (SPEC-0002 G-2); возвращает и число отброшенных."""
+    if "trade_source" not in df.columns:
+        return df, 0
+    keep = df["trade_source"].map(is_exchange_trade).astype(bool)
+    return df.loc[keep].reset_index(drop=True), int((~keep).sum())
 
 
 def _trade_to_row(raw: Any, instrument: Instrument) -> dict[str, object] | None:
@@ -607,8 +693,18 @@ async def run_backfill(
     kind_share: Any = None,
     kind_futures: Any = None,
     futures_status: Any = None,
+    *,
+    gate: _RateGate | None = None,
+    lock: asyncio.Lock | None = None,
+    cleanup: bool = False,
 ) -> None:
     """Догружает отсутствующие и перекачивает отмеченные дни всех инструментов, с троттлингом.
+
+    ``cleanup=True`` — отдельный проход чистки (SPEC-0002 G-4): только отметки
+    ``dealer_cleanup``, без догрузки отсутствующих дней. ``gate`` — общий для
+    процесса ограничитель темпа архива (:func:`archive_gate`). ``lock``, если
+    задан, берётся на время обработки каждого дня, чтобы проход не пересекался
+    с ночным обслуживанием, которое держит тот же замок целиком.
 
     Резолюция (FIGI акций, справочник фьючерсов) предпочитает инжектированный
     SDK ``InstrumentsService`` — REST-шлюз ``FindInstrument`` периодически
@@ -622,7 +718,7 @@ async def run_backfill(
     """
     del kind_futures
     semaphore = asyncio.Semaphore(MAX_BACKFILL_CONCURRENCY)
-    gate = _RateGate(60.0 / ARCHIVE_MAX_PER_MIN)
+    rate_gate = gate if gate is not None else archive_gate()
     has_futures = any(i.type != InstrumentType.SHARE for i in config.instruments)
     today = _utc_today()
 
@@ -635,7 +731,7 @@ async def run_backfill(
         replace: bool,
     ) -> None:
         archive_keys = archive_key_candidates(instrument, day, futures)
-        async with semaphore:
+        async with semaphore, lock if lock is not None else contextlib.nullcontext():
             result = await backfill_day(
                 session,
                 config,
@@ -645,11 +741,11 @@ async def run_backfill(
                 figi,
                 archive_keys,
                 market_data,
-                gate,
+                rate_gate,
                 replace=replace,
             )
-        if replace:
-            await asyncio.to_thread(_settle_refresh_mark, repo, day, result)
+            if replace:
+                await asyncio.to_thread(_settle_refresh_mark, repo, day, result)
 
     async with aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(ssl=_ssl_context()),
@@ -678,10 +774,12 @@ async def run_backfill(
         for instrument in config.instruments:
             repo = repos[instrument.storage_name]
             figi = current_figi(instrument, share_figis, futures, today.date())
-            missing = missing_days(config, repo)
+            missing = [] if cleanup else missing_days(config, repo)
             missing_set = {d.strftime("%Y-%m-%d") for d in missing}
             refresh = [
-                d for d in refresh_days(config, repo) if d.strftime("%Y-%m-%d") not in missing_set
+                d
+                for d in refresh_days(config, repo, cleanup=cleanup)
+                if d.strftime("%Y-%m-%d") not in missing_set
             ]
             for day in missing:
                 tasks.append(process(session, instrument, repo, day, figi, replace=False))
@@ -705,15 +803,33 @@ def _settle_refresh_mark(repo: MarketDataRepository, day: datetime, result: Back
     """Решает судьбу отметки после перекачки отмеченного дня.
 
     * ``WRITTEN`` — день заменён архивом, отметка снимается;
+    * ``NO_EXCHANGE_TRADES`` — архив опубликован, биржевых сделок нет: день
+      удаляется из хранилищ (там только небиржевые сделки), отметка снимается;
+    * ``NO_DATA`` по отметке ``dealer_cleanup`` для дня, архив которого точно
+      опубликован, — то же, что ``NO_EXCHANGE_TRADES`` (SPEC-0002 G-4);
     * ``NO_DATA`` при наличии сохранённых данных — архив за день ещё не
       опубликован, отметка остаётся до следующей попытки;
     * ``NO_DATA`` без данных — торгов не было, отметка снимается;
     * ``FAILED`` — отметка остаётся.
     """
     day_str = day.strftime("%Y-%m-%d")
+    reason = repo.days_to_refresh().get(day_str)
+    published = day <= _utc_today() - timedelta(days=ARCHIVE_PUBLISHED_AFTER_DAYS)
+    confirmed_empty = result == BackfillResult.NO_EXCHANGE_TRADES or (
+        result == BackfillResult.NO_DATA and reason == REFRESH_DEALER_CLEANUP and published
+    )
     if result == BackfillResult.WRITTEN:
         repo.clear_refresh_mark(day_str)
         logger.info("День %s %s перекачан из архива", repo.instrument.storage_name, day_str)
+    elif confirmed_empty:
+        if day_str in repo.available_days():
+            repo.delete_day(day_str)
+            logger.warning(
+                "День %s %s удалён: биржевых сделок по архиву нет (в хранилище были небиржевые)",
+                repo.instrument.storage_name,
+                day_str,
+            )
+        repo.clear_refresh_mark(day_str)
     elif result == BackfillResult.NO_DATA and day_str not in repo.available_days():
         repo.clear_refresh_mark(day_str)
 

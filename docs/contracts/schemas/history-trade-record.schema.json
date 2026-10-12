@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cluster-source.local/schemas/history-trade-record.schema.json",
   "title": "HistoryTradeRecord",
-  "description": "Одна строка CSV из архива GET /history-trades/{date} после распаковки gzip, представленная как объект 'заголовок -> значение'. Все значения в CSV — строки. Заголовок файла: TRADE_TS,TICKER_CC,DIRECTION,PRICE,QUANTITY,TRADE_SOURCE,INSTRUMENT_UID. ClusterSource использует TRADE_TS, DIRECTION, PRICE, QUANTITY.",
+  "description": "Одна строка CSV из архива GET /history-trades/{date} после распаковки gzip, представленная как объект 'заголовок -> значение'. Все значения в CSV — строки. Заголовок файла: TRADE_TS,TICKER_CC,DIRECTION,PRICE,QUANTITY,TRADE_SOURCE,INSTRUMENT_UID. ClusterSource использует TRADE_TS, DIRECTION, PRICE, QUANTITY; TRADE_SOURCE — для отбора биржевых сделок (SPEC-0002).",
   "type": "object",
   "required": [
     "TRADE_TS",
@@ -55,9 +55,10 @@
     },
     "TRADE_SOURCE": {
       "type": "string",
-      "description": "Источник сделки. Не сохраняется.",
+      "description": "Источник сделки: EXCHANGE — Мосбиржа, DEALER — внутренний рынок Т-Банка. Строки с явным небиржевым значением отбрасываются при разборе; пусто или колонки нет — строка принимается. Не сохраняется.",
       "examples": [
-        "EXCHANGE"
+        "EXCHANGE",
+        "DEALER"
       ]
     },
     "INSTRUMENT_UID": {

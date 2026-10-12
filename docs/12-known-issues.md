@@ -18,6 +18,7 @@
 | <a id="l-07"></a>L-07 | Консьюмер замечает остановку не позже чем через `flush_interval_sec` | Завершение процесса занимает до `flush_interval_sec` (+ запись) | [5.5](05-realtime-collection.md#55-консьюмер-пакетная-запись) |
 | <a id="l-08"></a>L-08 | Запрос переподключения срабатывает на следующем кадре стрима (сделка или ping сервера) | Смена контракта непрерывного фьючерса после ночного обслуживания — с задержкой до интервала ping | [5.7](05-realtime-collection.md#57-переподключение) |
 | <a id="l-09"></a>L-09 | `Instrument.lot_size` — справочное поле | Объёмы хранятся в лотах, пересчёт в штуки не выполняется | [04](04-configuration.md#43-элемент-tickers) |
+| <a id="l-11"></a>L-11 | Обёртка `get_last_trades` в SDK `t-tech-investments` 1.49 не принимает `trade_source` | Сервер отдаёт все сделки; дилерские отбрасываются по полю сделки. Если поле не заполнено, сегодняшний день может содержать дилерские сделки до ночной перекачки из архива | [6.5](06-history-backfill.md#65-источник-данных-по-дню) |
 | <a id="l-10"></a>L-10 | Строки SQLite, записанные до унификации формата, могут быть без дробной части секунд | Читаются корректно (`format="ISO8601"`); сортировка строк остаётся верной | [3.3.1](03-data-model.md#331-sqlite-горячее-хранилище) |
 
 ## 12.2. Исправленные расхождения
@@ -42,6 +43,7 @@
 | <a id="ki-14"></a>KI-14 | `get_cluster_data` бросал `ValueError` при пустом интервале | Возвращается пустой `DataFrame` с колонками результата | `reader.get_cluster_data` | `test_empty_interval_returns_empty_frame` |
 | <a id="ki-15"></a>KI-15 | Дедупликация по всем полям схлопывала реальные одинаковые сделки | Источник выбирается по дню целиком (Parquet приоритетнее), дедупликации нет | `reader.get_cluster_data` | `test_identical_trades_are_not_collapsed`, `test_hot_and_cold_overlap_not_double_counted` |
 | <a id="ki-16"></a>KI-16 | Смешанные форматы времени в SQLite (с микросекундами и без) роняли чтение; в CSV архива такие строки молча отбрасывались | Запись всегда с микросекундами; чтение и разбор CSV с `format="ISO8601"` | `MarketDataRepository._iso`, `read_ticks`, `autoload._parse_history_csv` | `test_read_ticks_mixed_timestamp_formats`, `test_parse_history_csv_keeps_rows_without_fraction` |
+| <a id="ki-18"></a>KI-18 | Стрим, `GetLastTrades` и архив по умолчанию отдают и дилерские сделки Т-Банка (`TRADE_SOURCE_ALL`); они сохранялись вместе с биржевыми (ночные часы, выходные без торгов на бирже) | Только биржевые сделки: фильтр в запросе и по источнику сделки; ранее сохранённые дни перекачиваются однократной чисткой `dealer_cleanup` ([SPEC-0002](specs/0002-exchange-only-trades.md)) | `main.build_trades_subscription`, `DataCollector.subscribe`, `autoload._exchange_only`, `autoload._trades_to_rows`, `autoload.schedule_dealer_cleanup`, `main.run_dealer_cleanup` | `tests/test_exchange_only.py` |
 | <a id="ki-17"></a>KI-17 | При ошибке резолюции в `create_stream` не закрывался `AsyncClient` (утечка канала на каждый повтор) | Клиент закрывается при любой ошибке подготовки стрима | `main.create_stream` | смоук-тест |
 
 KI-15 – KI-17 обнаружены при проверке исправлений: прогоном на реальном API

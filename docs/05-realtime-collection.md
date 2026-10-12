@@ -18,12 +18,14 @@ sequenceDiagram
     participant R as MarketDataRepository
 
     F->>T: AsyncClient + резолюция FIGI
-    F->>T: subscribe(SubscribeTradesRequest)
+    F->>T: subscribe(SubscribeTradesRequest, trade_source = EXCHANGE)
     F-->>P: StreamHandle(stream, teardown)
     P->>M: сегодня → stream_gap
     loop каждый MarketDataResponse
         T-->>P: MarketDataResponse
-        alt response.trade != None
+        alt trade.trade_source небиржевой (вопреки фильтру)
+            P->>P: отбросить, счётчик, DEALER_TRADE_DROPPED
+        else response.trade != None
             P->>P: _to_dto(trade) → Tick
             P->>M: разрыв trade_id → compromised
             P->>Q: put(tick) (блокируется при заполненной очереди)
@@ -48,7 +50,10 @@ sequenceDiagram
 
 1. Создаёт `AsyncClient(token)` и входит в его контекст.
 2. Определяет FIGI (`_resolve_stream_figi`).
-3. Создаёт `AsyncMarketDataStreamManager` и отправляет подписку на сделки.
+3. Создаёт `AsyncMarketDataStreamManager` и отправляет подписку на сделки
+   (`build_trades_subscription`) с `trade_source = TRADE_SOURCE_EXCHANGE`.
+   Значение по умолчанию у сервера — `TRADE_SOURCE_ALL`, то есть вместе с
+   дилерскими сделками Т-Банка ([SPEC-0002](specs/0002-exchange-only-trades.md)).
 4. Возвращает `StreamHandle`; `teardown` вызывает `stream.stop()` и закрывает
    клиент.
 
@@ -75,7 +80,8 @@ sequenceDiagram
 | Входной объект | Условие | Действие |
 |----------------|---------|----------|
 | любой кадр | коллектор остановлен или запрошено переподключение | выйти из `subscribe` |
-| `MarketDataResponse` | `trade is not None` | `payload = response.trade` → `Tick` |
+| `MarketDataResponse` | `trade is not None`, `trade.trade_source` явно небиржевой (`DEALER`, `ALL`, …) | отбросить; `dealer_trades_dropped += 1`; WARNING `DEALER_TRADE_DROPPED` на первой и каждой 1000-й (SPEC-0002 G-3) |
+| `MarketDataResponse` | `trade is not None`, источник `EXCHANGE` или не указан | `payload = response.trade` → `Tick` |
 | `MarketDataResponse` | `trade is None` (ping, `subscribe_trades_response`, …) | пропустить |
 | Объект без атрибута `trade` | — | считается самой сделкой (легаси SDK, тесты) |
 
@@ -91,7 +97,9 @@ sequenceDiagram
 | `trade_id` | — (поля нет) | `trade_id` / `tradeId` | Если пусто — `s{YYYYmmddHHMMSSffffff}` от `timestamp` |
 
 Поля `Trade.figi`, `instrument_uid`, `trade_source`, `class_code`, `ticker`
-не сохраняются.
+не сохраняются. `trade_source` используется только для отбора (5.3):
+источник разбирает `config.parse_trade_source` — `1`/`EXCHANGE`/`TRADE_SOURCE_EXCHANGE`
+и неуказанный источник принимаются, любое другое явное значение отбрасывается.
 
 Маппинг направления (`parse_direction`, без учёта регистра; для `IntEnum`
 SDK используется числовое значение):

@@ -42,6 +42,10 @@ grpc-gateway над тем же protobuf-контрактом `tinkoff.public.in
 | `TradeDirection` | `TRADE_DIRECTION_SELL` (2) | `SELL` |
 | `TradeDirection` | `TRADE_DIRECTION_UNSPECIFIED` (0) | `UNKNOWN` |
 | `DIRECTION` (CSV I5) | `BUY` / `SELL`; иное или колонки нет | `BUY` / `SELL`; `UNKNOWN` (`parse_direction`) |
+| `TradeSourceType` | `TRADE_SOURCE_EXCHANGE` (1) | сохраняется |
+| `TradeSourceType` | `TRADE_SOURCE_DEALER` (2), `TRADE_SOURCE_ALL` (3), иное явное значение | отбрасывается (`parse_trade_source`, SPEC-0002) |
+| `TradeSourceType` | `TRADE_SOURCE_UNSPECIFIED` (0), поля нет | сохраняется (фильтр стоит в запросе) |
+| `TRADE_SOURCE` (CSV I5) | `EXCHANGE` / `DEALER` | `EXCHANGE` сохраняется, `DEALER` отбрасывается |
 | `Quotation` | `{units: int64, nano: int32}` | `float(units) + nano / 1e9` |
 | `google.protobuf.Timestamp` | SDK → `datetime` (UTC); REST → строка RFC 3339 | `datetime` UTC |
 | int64 в REST JSON | строка, например `"312"` | `int()` / `float()` |
@@ -55,6 +59,7 @@ grpc-gateway над тем же protobuf-контрактом `tinkoff.public.in
 | I5 | `429` + `Retry-After` | Ожидание и до 3 попыток |
 | I5 | Архив публикуется ночью, текущий день недоступен | Для `today` используется I4/I8, день отмечается `partial_backfill` |
 | I6 | Периодически отвечает 404 | Основной путь — I2 через SDK |
+| I1, I4, I5, I8 | По умолчанию `trade_source = TRADE_SOURCE_ALL`: вместе с биржевыми приходят дилерские сделки Т-Банка | I1 и I8 запрашивают `TRADE_SOURCE_EXCHANGE`; I4 (обёртка SDK без параметра) и I5 фильтруются по источнику каждой сделки |
 | I1 | Сервер закрывает стрим или стрим обрывается | Переподключение с экспоненциальной задержкой 2 → 60 с; день отмечается `stream_gap` |
 
 ## 9.5. TLS

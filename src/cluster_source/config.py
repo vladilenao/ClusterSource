@@ -39,6 +39,45 @@ def parse_direction(raw: object) -> Direction:
     return Direction.UNKNOWN
 
 
+class TradeSource(StrEnum):
+    """Источник обезличенной сделки у T-Invest (SPEC-0002)."""
+
+    EXCHANGE = "EXCHANGE"
+    #: Внутренний рынок Т-Банка (дилерские сессии): в хранилище не попадает.
+    DEALER = "DEALER"
+    #: Источник не указан (UNSPECIFIED, нет поля или колонки).
+    UNSPECIFIED = "UNSPECIFIED"
+    #: Любое другое явное значение (например, ``TRADE_SOURCE_ALL``).
+    OTHER = "OTHER"
+
+
+_EXCHANGE_SOURCES = frozenset({"1", "EXCHANGE", "TRADE_SOURCE_EXCHANGE"})
+_DEALER_SOURCES = frozenset({"2", "DEALER", "TRADE_SOURCE_DEALER"})
+_UNSPECIFIED_SOURCES = frozenset({"", "0", "UNSPECIFIED", "TRADE_SOURCE_UNSPECIFIED"})
+
+
+def parse_trade_source(raw: object) -> TradeSource:
+    """Приводит источник сделки (SDK enum, REST, CSV архива) к :class:`TradeSource`."""
+    value = str(raw if raw is not None else "").strip().upper()
+    if value in _EXCHANGE_SOURCES:
+        return TradeSource.EXCHANGE
+    if value in _DEALER_SOURCES:
+        return TradeSource.DEALER
+    if value in _UNSPECIFIED_SOURCES:
+        return TradeSource.UNSPECIFIED
+    return TradeSource.OTHER
+
+
+def is_exchange_trade(raw_source: object) -> bool:
+    """Можно ли сохранить сделку с таким источником.
+
+    SPEC-0002 G-1/G-3: сохраняются только биржевые сделки. Неуказанный
+    источник принимается — биржевой фильтр стоит в самом запросе к
+    источнику (G-2); любое явное небиржевое значение отбрасывается.
+    """
+    return parse_trade_source(raw_source) in (TradeSource.EXCHANGE, TradeSource.UNSPECIFIED)
+
+
 class InstrumentType(StrEnum):
     SHARE = "share"
     FUTURES_CONTRACT = "futures_contract"

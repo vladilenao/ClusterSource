@@ -109,9 +109,10 @@ sequenceDiagram
     end
     A->>C: create_task(run()) для каждого инструмента
     A->>A: create_task(run_scheduler) — ночное обслуживание + переподключение непрерывных фьючерсов
+    A->>A: create_task(run_dealer_cleanup) — однократная чистка от дилерских сделок (SPEC-0002)
     A->>A: ждать stop_event (SIGINT / SIGTERM)
     OS-->>A: SIGINT / SIGTERM
-    A->>A: отменить планировщик
+    A->>A: отменить планировщик и чистку
     A->>C: task.cancel() + gather
     C->>C: teardown стрима, консьюмер дописывает очередь (≤ 30 с)
     A->>C: shutdown()
@@ -135,6 +136,8 @@ sequenceDiagram
 | A8 | Строки SQLite удаляются только для дней, у которых есть проверенный Parquet | `write_parquet` бросает `DataCorruptionError`; перед очисткой `run_once` сверяет дни SQLite раньше `cutoff` с Parquet | `archiver.py` |
 | A9 | Граница очистки совпадает с маршрутизацией догрузки | `_hot_purge_cutoff()` и `_target_for_day()` используют одну границу `today − 7` | `archiver.py`, `autoload.py` |
 | A11 | Одно правило выбора контракта непрерывного фьючерса | `config.nearest_contract` используют и стрим, и догрузка | `config.py`, `main.py`, `autoload.py` |
+| A12 | В хранилище только биржевые сделки | Подписка и REST `GetLastTrades` запрашивают `TRADE_SOURCE_EXCHANGE`; ответы SDK, архива и стрима фильтруются `config.is_exchange_trade` ([SPEC-0002](specs/0002-exchange-only-trades.md)) | `main.py`, `collector.py`, `autoload.py` |
+| A13 | Перекачка дня не пересекается с архивацией | Обслуживание держит `maintenance_lock` весь прогон, фоновая чистка — на каждый день; один `archive_gate()` на процесс | `main.py`, `autoload.py` |
 | A10 | TLS-проверка всегда включена | `_ssl_context()` — `truststore`, фолбэк `certifi`; без `_create_unverified_context` | `autoload.py` |
 
 ## 2.7. Обработка ошибок
