@@ -175,6 +175,8 @@ class DataCollector:
         self._minute: datetime | None = None
         self._minute_total = 0
         self._minute_unknown = 0
+        #: SPEC-0007: ряд открытого интереса из стрима; пишет консьюмер (A2).
+        self._pending_oi: list[tuple[datetime, int]] = []
 
     def on_stream_opened(self) -> None:
         """Стрим (пере)открыт: сделки до этого момента не получены.
@@ -201,6 +203,13 @@ class DataCollector:
         if self._queue.qsize() >= BACKLOG_HIGH:
             self.quality.begin(REASON_BACKLOG, self._now(), self._now())
         await self._queue.put(tick)
+
+    def deliver_open_interest(self, payload: Any) -> None:
+        """Сообщение ОИ из стрима (SPEC-0007): только в память, пишет консьюмер."""
+        moment = getattr(payload, "time", None)
+        if not isinstance(moment, datetime):
+            moment = self._now()
+        self._pending_oi.append((moment, int(getattr(payload, "open_interest", 0))))
 
     # ------------------------------------------------------------------ #
     # Детекторы SPEC-0004 на стороне инструмента
@@ -333,6 +342,13 @@ class DataCollector:
                 first = min(t.timestamp for t in buffer)
                 self.quality.mark(REASON_WRITE_FAILURE, first, max(t.timestamp for t in buffer))
                 self.quality.begin(REASON_WRITE_FAILURE, first, self._now())
+        if self._pending_oi:
+            oi, self._pending_oi = self._pending_oi, []
+            try:
+                await asyncio.to_thread(self._repo.insert_open_interest, oi)
+            except Exception as exc:
+                logger.error("Ошибка записи открытого интереса: %s", exc)
+                self._pending_oi[:0] = oi
         if self._queue.qsize() <= BACKLOG_LOW:
             self.quality.end(REASON_BACKLOG, self._now())
         minutes, events = self.quality.drain()

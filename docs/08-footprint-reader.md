@@ -148,6 +148,17 @@ if state["state"] != "OK" or not bad.empty:
 согласуется с итогами биржи в пределах сделок вне анонимной ленты, но не
 доказан полной лентой ISS.
 
+Открытый интерес фьючерсов ([SPEC-0007](specs/0007-open-interest.md)):
+
+| Функция | Возвращает |
+|---------|------------|
+| `get_open_interest(repo, start, end)` | Ряд ОИ из стрима T-Invest (реальное время, при каждом изменении): `ts`, `value`; 7 дней |
+| `get_oi_flow(iss_repo, secid, start, end, timeframe="1min")` | Поток ОИ по ленте ISS (задержка 15 мин) по барам: `oi_close`, `oi_change`, `opened` / `closed` / `transferred` (контракты), `outside` (изменение ОИ сделками вне анонимной ленты), `trades` |
+| `get_contract(repo, day)` | Тикер активного контракта непрерывного фьючерса за день — `secid` для `get_oi_flow` |
+
+ОИ Мосбиржи считает позиции обеих сторон: `opened = ΔОИ/2` при росте, `closed
+= −ΔОИ/2` при падении, `transferred = количество − |ΔОИ|/2`.
+
 Причины: `stream_gap`, `subscription_failed`, `stream_silence`, `latency`,
 `backlog`, `write_failure`, `unknown_direction`, `contract_roll`,
 `dealer_leak` — см. [5.8](05-realtime-collection.md#58-детекторы-деградации-spec-0004).

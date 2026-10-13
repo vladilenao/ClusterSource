@@ -70,6 +70,8 @@ class HubConnection:
     not_found: list[str] = field(default_factory=list)
     #: Биржевой тикер инструмента ``{storage_name: ticker}`` — для сверки с ISS.
     tickers: dict[str, str] = field(default_factory=dict)
+    #: ``{instrument_uid: storage_name}`` — маршрут сообщений ОИ (в них нет FIGI).
+    uids: dict[str, str] = field(default_factory=dict)
 
 
 ConnectionFactory = Callable[[Sequence[Instrument], bool], Awaitable[HubConnection]]
@@ -262,6 +264,11 @@ class StreamHub:
             trade = getattr(item, "trade", None)
             if trade is not None:
                 await self._route(trade, conn.routes)
+            oi = getattr(item, "open_interest", None)
+            if oi is not None:
+                name = conn.uids.get(str(getattr(oi, "instrument_uid", "")))
+                if name is not None:  # SPEC-0007
+                    self._collectors[name].deliver_open_interest(oi)
 
     def _resolve_route(self, payload: Any, routes: dict[str, str]) -> str | None:
         for key in (getattr(payload, "figi", None), getattr(payload, "instrument_uid", None)):

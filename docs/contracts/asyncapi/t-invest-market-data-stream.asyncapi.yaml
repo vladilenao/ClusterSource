@@ -117,6 +117,19 @@ components:
                   properties:
                     instrument_id: { type: string, description: FIGI }
 
+    OpenInterestEvent:
+      name: MarketDataResponse.open_interest
+      title: Открытый интерес фьючерса (SPEC-0007)
+      contentType: application/x-protobuf
+      payload:
+        type: object
+        properties:
+          instrument_uid: { type: string, description: Только UID — маршрут по нему. }
+          time: { type: string, format: date-time }
+          open_interest:
+            type: integer
+            description: ОИ Мосбиржи — позиции обеих сторон (ΔОИ сделки кратно 2).
+
     TradingStatusEvent:
       name: MarketDataResponse.trading_status
       title: Торговый статус инструмента (SPEC-0004)
@@ -224,7 +237,10 @@ components:
                 Значение по умолчанию у сервера — TRADE_SOURCE_ALL (биржевые и дилерские сделки).
             with_open_interest:
               type: boolean
-              description: Не задаётся ClusterSource (false).
+              const: true
+              description: >-
+                ClusterSource запрашивает ОИ фьючерсов (SPEC-0007): сообщение open_interest
+                приходит при каждом изменении ОИ, с instrument_uid (без FIGI).
 
     MarketDataResponseTrade:
       type: object

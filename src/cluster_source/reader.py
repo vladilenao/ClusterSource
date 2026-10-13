@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from cluster_source.config import AppConfig
-from cluster_source.database import MarketDataRepository
+from cluster_source.database import IssTapeRepository, MarketDataRepository
 
 logger = logging.getLogger(__name__)
 
@@ -195,3 +195,92 @@ def baseline_quality(days: list[tuple[date, str]]) -> str:
     if not days:
         return "empty"
     return "pure" if all(status == "FINAL" for _, status in days) else "mixed"
+
+
+# ---------------------------------------------------------------------- #
+# Открытый интерес (SPEC-0007)
+# ---------------------------------------------------------------------- #
+OI_FLOW_COLUMNS = [
+    "timestamp",
+    "oi_close",
+    "oi_change",
+    "opened",
+    "closed",
+    "transferred",
+    "outside",
+    "trades",
+]
+
+
+def get_open_interest(
+    repo: MarketDataRepository, start_time: datetime, end_time: datetime
+) -> pd.DataFrame:
+    """Ряд открытого интереса из стрима T-Invest (только фьючерсы): ``ts``, ``value``.
+
+    Значение приходит при каждом изменении ОИ. ОИ Мосбиржи считает позиции
+    обеих сторон. Минуты ``DEGRADED`` (SPEC-0004) — и для ОИ недостоверны.
+    Хранится 7 дней; долгая история — :func:`get_oi_flow` по ленте ISS.
+    """
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=UTC)
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=UTC)
+    return repo.read_open_interest(start_time, end_time)
+
+
+def get_contract(repo: MarketDataRepository, day: date) -> str | None:
+    """Тикер активного контракта непрерывного фьючерса за день (записывает сверка)."""
+    return repo.get_meta(f"contract:{day.isoformat()}")
+
+
+def get_oi_flow(
+    iss_repo: IssTapeRepository,
+    secid: str,
+    start_time: datetime,
+    end_time: datetime,
+    timeframe: str = "1min",
+) -> pd.DataFrame:
+    """Поток открытого интереса по ленте ISS (задержка 15 минут), по барам ``timeframe``.
+
+    Для каждой сделки контракта (в порядке заключения) ΔОИ — разница
+    ``OPENPOSITION`` с предыдущей сделкой; ОИ Мосбиржи считает обе стороны,
+    поэтому: ``opened`` = max(ΔОИ, 0)/2, ``closed`` = max(−ΔОИ, 0)/2 (в пределах
+    количества), ``transferred`` = количество − |ΔОИ|/2, ``outside`` — изменение
+    ОИ сделками вне анонимной ленты (|ΔОИ| > 2 × количество). Колонки:
+    ``timestamp`` (начало бара, UTC), ``oi_close``, ``oi_change``, ``opened``,
+    ``closed``, ``transferred``, ``outside``, ``trades``.
+    """
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=UTC)
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=UTC)
+    # Запас назад — чтобы знать ОИ до первой сделки окна.
+    rows = iss_repo.read_oi_trades(secid, start_time - pd.Timedelta(hours=3), end_time)
+    if not rows:
+        return pd.DataFrame(columns=OI_FLOW_COLUMNS)
+    df = pd.DataFrame(rows, columns=["timestamp", "quantity", "oi"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601")
+    df["delta"] = df["oi"].diff()
+    df = df[(df["timestamp"] >= start_time) & df["delta"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=OI_FLOW_COLUMNS)
+    half = (df["delta"].abs() / 2).clip(upper=df["quantity"])
+    df["opened"] = np.where(df["delta"] > 0, half, 0.0)
+    df["closed"] = np.where(df["delta"] < 0, half, 0.0)
+    df["transferred"] = df["quantity"] - half
+    df["outside"] = (df["delta"].abs() / 2 - df["quantity"]).clip(lower=0)
+    bars = (
+        df.groupby(pd.Grouper(key="timestamp", freq=timeframe))
+        .agg(
+            oi_close=("oi", "last"),
+            oi_change=("delta", "sum"),
+            opened=("opened", "sum"),
+            closed=("closed", "sum"),
+            transferred=("transferred", "sum"),
+            outside=("outside", "sum"),
+            trades=("quantity", "size"),
+        )
+        .reset_index()
+    )
+    bars = bars[bars["trades"] > 0].reset_index(drop=True)
+    return bars[OI_FLOW_COLUMNS]

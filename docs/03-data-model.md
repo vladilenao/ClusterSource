@@ -232,6 +232,17 @@ CREATE TABLE IF NOT EXISTS minute_verdicts (
 Курсор сверки — `meta.recon_verified_until` (всё раньше — сверено). Минуты
 без сделок вердикта не имеют.
 
+Открытый интерес из стрима ([SPEC-0007](specs/0007-open-interest.md)) —
+только фьючерсы, при каждом изменении; хранится 7 дней (очищается вместе с
+горячими тиками):
+
+```sql
+CREATE TABLE IF NOT EXISTS open_interest (ts TEXT NOT NULL, value INTEGER NOT NULL);
+```
+
+Активный контракт непрерывного фьючерса за день — `meta['contract:YYYY-MM-DD']`
+(пишет сверка SPEC-0005).
+
 Окончательный статус торгового дня ([SPEC-0006](specs/0006-final-day.md)):
 
 ```sql
@@ -353,6 +364,7 @@ SQLite → Parquet — `hot_rows_for_day` → `write_parquet` без измен�
 | `session` | text | `TRADINGSESSION` (акции) | `0` утренняя, `1` основная, `2` вечерняя |
 | `open_position` | int | `OPENPOSITION` (FORTS) | ОИ после сделки |
 | `off_market` | int | `OFFMARKETDEAL` (FORTS) | `1` — внебиржевая адресная сделка |
+| `recno` | int | `RECNO` (FORTS) | порядок заключения сделок (SPEC-0007); у строк до 2026-10-13 21:5x МСК — пусто, порядок — порядок вставки |
 
 Ключ уникальности `UNIQUE(market, secid, tradeno)`: повторная загрузка и
 импорт сырых файлов не создают дублей.

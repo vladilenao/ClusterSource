@@ -212,6 +212,7 @@ def normalize_trades(
                 "session": _opt_str(get(row, "TRADINGSESSION")),
                 "open_position": _opt_int(get(row, "OPENPOSITION")),
                 "off_market": _opt_int(get(row, "OFFMARKETDEAL")),
+                "recno": _opt_int(get(row, "RECNO")),  # SPEC-0007: порядок сделок FORTS
             }
         )
     return out

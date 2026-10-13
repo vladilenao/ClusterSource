@@ -115,8 +115,10 @@ def setup_logging() -> None:
 
 async def _resolve_stream_figi(
     client: Any, instrument: Instrument, futures: list[Any] | None = None
-) -> tuple[str, str]:
-    """Разрешает FIGI, на который подписывается стрим, и тикер бумаги на бирже.
+) -> tuple[str, str, str]:
+    """Разрешает FIGI, на который подписывается стрим, тикер бумаги на бирже и UID.
+
+    UID нужен для маршрута сообщений открытого интереса (в них нет FIGI, SPEC-0007).
 
     Тикер нужен сверке с лентой ISS (SPEC-0005): у непрерывного фьючерса это
     тикер активного контракта, у остальных — ``id`` инструмента.
@@ -147,11 +149,12 @@ async def _resolve_stream_figi(
                 active.ticker,
                 active.expiration,
             )
-            return active.figi, active.ticker
+            uid = next((str(f.uid) for f in futures if f.figi == active.figi), "")
+            return active.figi, active.ticker, uid
         matches = [f for f in futures if f.ticker == instrument.id]
         if not matches:
             raise InstrumentNotFound(f"Фьючерсный контракт не найден: {instrument.id}")
-        return str(matches[0].figi), instrument.id
+        return str(matches[0].figi), instrument.id, str(getattr(matches[0], "uid", ""))
 
     share = await instruments_service.find_instrument(
         query=instrument.id,
@@ -167,8 +170,8 @@ async def _resolve_stream_figi(
     for preferred in ("TQBR", "SPBXM"):
         for item in ticker_matches:
             if getattr(item, "class_code", "") == preferred:
-                return str(item.figi), instrument.id
-    return str(ticker_matches[0].figi), instrument.id
+                return str(item.figi), instrument.id, str(getattr(item, "uid", ""))
+    return str(ticker_matches[0].figi), instrument.id, str(getattr(ticker_matches[0], "uid", ""))
 
 
 def build_info_subscription(figis: list[str]) -> Any:
@@ -197,14 +200,16 @@ def build_trades_subscription(figis: list[str]) -> Any:
             subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
             instruments=[TradeInstrument(instrument_id=figi) for figi in figis],
             trade_source=TradeSourceType.TRADE_SOURCE_EXCHANGE,
+            # SPEC-0007: ОИ фьючерсов приходит в том же стриме при каждом изменении.
+            with_open_interest=True,
         )
     )
 
 
 async def _resolve_figis(
     services: Any, instruments: list[Instrument]
-) -> tuple[dict[str, str], dict[str, str], list[str]]:
-    """FIGI ``{storage_name: figi}``, биржевые тикеры ``{storage_name: ticker}`` и ненайденные.
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], list[str]]:
+    """FIGI, биржевые тикеры и UID ``{storage_name: …}`` и список ненайденных.
 
     Справочник фьючерсов запрашивается один раз на все инструменты.
     """
@@ -216,17 +221,20 @@ async def _resolve_figis(
         futures = list(response.instruments)
     resolved: dict[str, str] = {}
     tickers: dict[str, str] = {}
+    uids: dict[str, str] = {}
     not_found: list[str] = []
     for instrument in instruments:
         try:
-            figi, ticker = await _resolve_stream_figi(services, instrument, futures)
+            figi, ticker, uid = await _resolve_stream_figi(services, instrument, futures)
         except InstrumentNotFound as exc:
             logger.warning("%s", exc)
             not_found.append(instrument.storage_name)
             continue
         resolved[instrument.storage_name] = figi
         tickers[instrument.storage_name] = ticker
-    return resolved, tickers, not_found
+        if uid:
+            uids[instrument.storage_name] = uid
+    return resolved, tickers, uids, not_found
 
 
 async def _log_stream_limits(services: Any) -> None:
@@ -254,6 +262,7 @@ def make_connection_factory(config: AppConfig) -> ConnectionFactory:
     """
     figis: dict[str, str] = {}
     tickers: dict[str, str] = {}
+    uids: dict[str, str] = {}
     not_found: list[str] = []
     limits_logged = False
 
@@ -270,13 +279,15 @@ def make_connection_factory(config: AppConfig) -> ConnectionFactory:
                 await _log_stream_limits(services)
                 limits_logged = True
             if resolve or not figis:
-                resolved, resolved_tickers, missing = await _resolve_figis(
+                resolved, resolved_tickers, resolved_uids, missing = await _resolve_figis(
                     services, list(instruments)
                 )
                 figis.clear()
                 figis.update(resolved)
                 tickers.clear()
                 tickers.update(resolved_tickers)
+                uids.clear()
+                uids.update(resolved_uids)
                 not_found[:] = missing
             if not figis:
                 raise RuntimeError("ни один инструмент не разрешён в FIGI")
@@ -317,6 +328,7 @@ def make_connection_factory(config: AppConfig) -> ConnectionFactory:
             teardown=teardown,
             not_found=list(not_found),
             tickers=dict(tickers),
+            uids={uid: name for name, uid in uids.items() if name in routes.values()},
         )
 
     return factory

@@ -97,6 +97,10 @@ class MarketDataRepository:
         if "exchange_trade_no" not in columns:
             conn.execute("ALTER TABLE ticks_hot_store ADD COLUMN exchange_trade_no INTEGER")
         conn.execute(
+            "CREATE TABLE IF NOT EXISTS open_interest (ts TEXT NOT NULL, value INTEGER NOT NULL)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_open_interest_ts ON open_interest (ts)")
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS day_verdicts (
                 trade_date   TEXT PRIMARY KEY,
@@ -278,6 +282,8 @@ class MarketDataRepository:
                     (self._iso(cutoff),),
                 )
                 rowcount = cur.rowcount
+                # SPEC-0007: ряд ОИ из стрима хранится столько же, сколько горячие тики.
+                conn.execute("DELETE FROM open_interest WHERE ts < ?", (self._iso(cutoff),))
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -411,6 +417,30 @@ class MarketDataRepository:
             rows, columns=["minute", "status", "stream_n", "iss_n", "repaired", "detail"]
         )
         df["minute"] = pd.to_datetime(df["minute"], utc=True, format="ISO8601")
+        return df
+
+    # ------------------------------------------------------------------ #
+    # Открытый интерес из стрима (SPEC-0007)
+    # ------------------------------------------------------------------ #
+    def insert_open_interest(self, rows: Sequence[tuple[datetime, int]]) -> None:
+        if not rows:
+            return
+        with self.session() as conn:
+            conn.executemany(
+                "INSERT INTO open_interest (ts, value) VALUES (?, ?)",
+                [(self._iso(ts), int(value)) for ts, value in rows],
+            )
+            conn.commit()
+
+    def read_open_interest(self, start: datetime, end: datetime) -> pd.DataFrame:
+        """Ряд ОИ из стрима за [start, end): колонки ``ts`` (UTC), ``value``."""
+        with self.session() as conn:
+            rows = conn.execute(
+                "SELECT ts, value FROM open_interest WHERE ts >= ? AND ts < ? ORDER BY ts",
+                (self._iso(start), self._iso(end)),
+            ).fetchall()
+        df = pd.DataFrame(rows, columns=["ts", "value"])
+        df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
         return df
 
     # ------------------------------------------------------------------ #
@@ -677,6 +707,7 @@ ISS_COLUMNS = (
     "session",
     "open_position",
     "off_market",
+    "recno",
 )
 _ISS_EXPORT_CHUNK = 200_000
 
@@ -731,10 +762,14 @@ class IssTapeRepository:
                 session       TEXT,
                 open_position INTEGER,
                 off_market    INTEGER,
+                recno         INTEGER,
                 UNIQUE (market, secid, tradeno)
             )
             """
         )
+        # SPEC-0007: RECNO — порядок заключения сделок FORTS (миграция старых баз).
+        if "recno" not in {row[1] for row in conn.execute("PRAGMA table_info(iss_trades)")}:
+            conn.execute("ALTER TABLE iss_trades ADD COLUMN recno INTEGER")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_iss_feed ON iss_trades (market, feed_date)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_iss_secid_ts ON iss_trades (market, secid, timestamp)"
@@ -1052,6 +1087,49 @@ class IssTapeRepository:
         return out
 
     # ------------------------------------------------------------------ #
+    # Открытый интерес по ленте FORTS (SPEC-0007)
+    # ------------------------------------------------------------------ #
+    def read_oi_trades(
+        self, secid: str, start: datetime, end: datetime
+    ) -> list[tuple[str, int, int]]:
+        """Сделки контракта FORTS за [start, end) в порядке заключения:
+        ``(время ISO UTC, количество, OPENPOSITION после сделки)``.
+
+        Порядок — ``RECNO``; у строк до появления колонки — порядок вставки
+        (лента читается последовательно). Parquet — порядок строк файла.
+        """
+        out: list[tuple[str, int, int]] = []
+        days = {(start + pd.Timedelta(days=k)).strftime("%Y-%m-%d") for k in range(-1, 2)}
+        for feed_date in sorted(days & self.parquet_feed_dates("forts")):
+            table = pq.read_table(
+                self.parquet_path("forts", feed_date),
+                columns=["timestamp", "quantity", "open_position"],
+                filters=[("secid", "=", secid), ("board", "=", "RFUD")],
+            )
+            for rec in table.to_pylist():
+                ts = rec["timestamp"]
+                if start <= ts < end and rec["open_position"] is not None:
+                    out.append(
+                        (
+                            ts.isoformat(timespec="microseconds"),
+                            int(rec["quantity"]),
+                            int(rec["open_position"]),
+                        )
+                    )
+        with self.session() as conn:
+            out.extend(
+                (str(r[0]), int(r[1]), int(r[2]))
+                for r in conn.execute(
+                    "SELECT timestamp, quantity, open_position FROM iss_trades"
+                    " WHERE market = 'forts' AND secid = ? AND board = 'RFUD'"
+                    " AND timestamp >= ? AND timestamp < ? AND open_position IS NOT NULL"
+                    " ORDER BY COALESCE(recno, rowid)",
+                    (secid, start.isoformat(), end.isoformat()),
+                ).fetchall()
+            )
+        return out
+
+    # ------------------------------------------------------------------ #
     # Дневные итоги биржи и лента торгового дня (SPEC-0006)
     # ------------------------------------------------------------------ #
     def cached_totals(self, market: str, trade_date: str) -> dict[str, tuple[int, float]] | None:
@@ -1164,6 +1242,7 @@ _ISS_ARROW_SCHEMA = pa.schema(
         ("session", pa.string()),
         ("open_position", pa.int64()),
         ("off_market", pa.int64()),
+        ("recno", pa.int64()),
     ]
 )
 
