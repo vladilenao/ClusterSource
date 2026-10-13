@@ -34,7 +34,8 @@ Parquet («холодное», история). Данные потребляе�
 ```
 docs/contracts/
 ├── openapi/
-│   └── t-invest-rest.openapi.yaml          # OpenAPI 3.1: history-trades + REST-фолбэки
+│   ├── t-invest-rest.openapi.yaml          # OpenAPI 3.1: history-trades + REST-фолбэки
+│   └── moex-iss.openapi.yaml               # OpenAPI 3.1: лента сделок и дневные итоги Мосбиржи (ISS)
 ├── asyncapi/
 │   └── t-invest-market-data-stream.asyncapi.yaml  # AsyncAPI 3.0: gRPC MarketDataStream (сделки)
 └── schemas/                                # JSON Schema 2020-12

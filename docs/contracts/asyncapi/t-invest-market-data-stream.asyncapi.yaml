@@ -5,8 +5,8 @@ info:
   description: |
     Двунаправленный gRPC-стрим
     `tinkoff.public.invest.api.contract.v1.MarketDataStreamService/MarketDataStream`
-    в объёме, используемом ClusterSource (`main.create_stream`,
-    `collector.DataCollector.subscribe`).
+    в объёме, используемом ClusterSource (`main.make_connection_factory`,
+    `stream_hub.StreamHub`): одно соединение и одна подписка на все инструменты.
 
     Клиент (ClusterSource) отправляет один `MarketDataRequest` с
     `subscribe_trades_request` на каждый инструмент (одно соединение на
@@ -165,8 +165,11 @@ components:
             instruments:
               type: array
               minItems: 1
-              maxItems: 1
-              description: ClusterSource подписывает ровно один инструмент на стрим.
+              maxItems: 300
+              description: >-
+                ClusterSource подписывает все инструменты одной подпиской в одном
+                соединении (SPEC-0009): лимит T-Invest — 16 соединений (грейды 1–4),
+                до 300 подписок в соединении.
               items:
                 type: object
                 required: [instrument_id]

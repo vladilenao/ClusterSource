@@ -62,10 +62,12 @@ classDiagram
         +direction: str  BUY|SELL|UNKNOWN
         +trade_id: str
     }
-    class StreamHandle {
+    class HubConnection {
         <<frozen dataclass>>
         +stream: AsyncIterator
+        +routes: dict FIGI → storage_name
         +teardown: async callable | None
+        +not_found: list~str~
     }
     class MarketDataRepository {
         +instrument: Instrument
@@ -136,7 +138,12 @@ classDiagram
 {data_dir}/history/                      # AppConfig.storage_root
 ├── _sqlite/
 │   ├── SBER.sqlite3                     # горячее хранилище (+ -wal, -shm)
-│   └── Si_CONTINUOUS.sqlite3
+│   ├── Si_CONTINUOUS.sqlite3
+│   └── _iss.sqlite3                     # лента Мосбиржи текущего дня (SPEC-0003)
+├── _iss/
+│   ├── shares/2026-10-12.parquet        # лента рынка акций, 1 файл = 1 лента ISS (feed_date, МСК)
+│   └── forts/2026-10-12.parquet         # лента FORTS
+├── _iss_raw/                            # сырые файлы временного сборщика этапа 1
 ├── SBER/
 │   ├── 2026-09-03.parquet               # холодное хранилище, 1 файл = 1 день UTC
 │   └── 2026-09-04.parquet
@@ -145,7 +152,8 @@ classDiagram
 ```
 
 Каждый инструмент — отдельный SQLite-файл и отдельный каталог Parquet;
-между инструментами общих файлов нет.
+между инструментами общих файлов нет. Лента Мосбиржи — общая для всего
+рынка (3.7).
 
 ## 3.3. Форматы хранения
 
@@ -262,3 +270,38 @@ SQLite → Parquet — `hot_rows_for_day` → `write_parquet` без измен�
 День считается присутствующим (`available_days`), если есть хотя бы одна
 строка в SQLite с `ticker = storage_name` **или** существует Parquet-файл
 дня. Неполнота дня отслеживается отдельно — отметками `days_to_refresh`.
+
+## 3.7. Лента Мосбиржи (ISS)
+
+Репозиторий `IssTapeRepository(storage_root)` ([SPEC-0003](specs/0003-iss-collection.md)).
+Сделки текущей ленты копятся в `_sqlite/_iss.sqlite3`, после смены дня в ISS
+выгружаются в `_iss/{market}/{feed_date}.parquet` (snappy, частями по
+200 000 строк, с проверкой числа строк) и удаляются из SQLite.
+
+| Колонка | Тип | Источник ISS | Правило |
+|---------|-----|--------------|---------|
+| `market` | text | — | `shares` / `forts` |
+| `feed_date` | text | `SYSTIME` первой сделки ленты | календарная дата МСК начала ленты |
+| `secid` | text | `SECID` | |
+| `board` | text | `BOARDID` (акции) / `BOARDNAME` (FORTS) | `TQBR`, `SMAL`, …; `RFUD` |
+| `tradeno` | int64 | `TRADENO` | биржевой номер; на фондовом рынке общий для всех бумаг, на FORTS не монотонен |
+| `timestamp` | text ISO / `timestamp[us, UTC]` | `TRADETIME` + дата | дата — из `SYSTIME`, если сделка записана вовремя (не раньше чем за час и не позже 5 мин), иначе из `TRADEDATE`; МСК → UTC (`trade_time_utc`) |
+| `trade_date` | text | `TRADE_SESSION_DATE` (иначе `TRADEDATE`) | торговый день: сделки сессии выходного дня относятся к следующему |
+| `price` | real | `PRICE` | |
+| `quantity` | int | `QUANTITY` | |
+| `direction` | text | `BUYSELL` | `B` → `BUY`, `S` → `SELL`, иначе `UNKNOWN` |
+| `period` | text | `PERIOD` (акции) | `S` — аукцион открытия, `N` — основная торговля, … |
+| `session` | text | `TRADINGSESSION` (акции) | `0` утренняя, `1` основная, `2` вечерняя |
+| `open_position` | int | `OPENPOSITION` (FORTS) | ОИ после сделки |
+| `off_market` | int | `OFFMARKETDEAL` (FORTS) | `1` — внебиржевая адресная сделка |
+
+Ключ уникальности `UNIQUE(market, secid, tradeno)`: повторная загрузка и
+импорт сырых файлов не создают дублей.
+
+Служебные таблицы `_iss.sqlite3`:
+
+| Таблица | Назначение |
+|---------|------------|
+| `iss_feed_state` | ленты рынка: первая сделка (`head`), `feed_date`, сохранено строк (`offset`), курсор `last` (`TRADENO` на акциях, `RECNO` на FORTS), `caught_up` |
+| `iss_day_status` | полнота: `kind = feed` (лента догнана до смены дня, G-2) и `kind = trade_date` (сверка с `NUMTRADES`, G-5); `status` — `complete` / `incomplete` / `unverifiable` |
+| `iss_meta` | однократные операции, например `raw_imported:{market}:{date}` |

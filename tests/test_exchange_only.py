@@ -98,10 +98,10 @@ def test_stream_subscription_requests_exchange_trades_only() -> None:
     schemas = pytest.importorskip("t_tech.invest.grpc.schemas")
     from cluster_source.main import build_trades_subscription
 
-    request = build_trades_subscription("BBG004730N88")
+    request = build_trades_subscription(["BBG004730N88", "FUTSI1226000"])
     sub = request.subscribe_trades_request
     assert sub.trade_source == schemas.TradeSourceType.TRADE_SOURCE_EXCHANGE
-    assert sub.instruments[0].instrument_id == "BBG004730N88"
+    assert [i.instrument_id for i in sub.instruments] == ["BBG004730N88", "FUTSI1226000"]
 
 
 # --------------------------------------------------------------------------- #
@@ -294,17 +294,13 @@ async def test_stream_dealer_trade_dropped_and_counted(
         return SimpleNamespace(trade=trade)
 
     collector = DataCollector(share_config, SBER, share_repo)
-    collector._running = True
     with caplog.at_level(logging.WARNING):
-        await collector.subscribe(
-            _ListStream(
-                [
-                    item(SdkTradeSource.TRADE_SOURCE_EXCHANGE),
-                    item(SdkTradeSource.TRADE_SOURCE_DEALER),
-                    item(SdkTradeSource.TRADE_SOURCE_UNSPECIFIED),
-                ]
-            )
-        )
+        for source in (
+            SdkTradeSource.TRADE_SOURCE_EXCHANGE,
+            SdkTradeSource.TRADE_SOURCE_DEALER,
+            SdkTradeSource.TRADE_SOURCE_UNSPECIFIED,
+        ):
+            await collector.deliver(item(source).trade)
     assert collector._queue.qsize() == 2
     assert collector.dealer_trades_dropped == 1
     assert "DEALER_TRADE_DROPPED" in caplog.text

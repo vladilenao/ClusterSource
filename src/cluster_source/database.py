@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import pandas as pd
+import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from cluster_source.config import Instrument
 
@@ -386,3 +388,370 @@ class MarketDataRepository:
             return datetime.fromisoformat(value).replace(tzinfo=UTC)
         except ValueError:
             return None
+
+
+#: Колонки ленты ISS в SQLite и Parquet (SPEC-0003).
+ISS_COLUMNS = (
+    "market",
+    "feed_date",
+    "secid",
+    "board",
+    "tradeno",
+    "timestamp",
+    "trade_date",
+    "price",
+    "quantity",
+    "direction",
+    "period",
+    "session",
+    "open_position",
+    "off_market",
+)
+_ISS_EXPORT_CHUNK = 200_000
+
+
+class IssTapeRepository:
+    """Лента Мосбиржи из ISS (SPEC-0003): весь рынок, по одной ленте на рынок.
+
+    Сделки текущей ленты копятся в SQLite ``_sqlite/_iss.sqlite3`` (таблица
+    ``iss_trades``). Ключ уникальности (``market``, ``secid``, ``tradeno``)
+    исключает дубли при повторной загрузке (SPEC-0003 G-4). После смены дня
+    в ISS лента выгружается в ``_iss/{market}/{feed_date}.parquet``.
+    ``feed_date`` — календарная дата (МСК) первой сделки ленты; торговый день
+    биржи (``TRADE_SESSION_DATE``) хранится отдельно в ``trade_date``: сделки
+    сессии выходного дня относятся к следующему торговому дню.
+    """
+
+    def __init__(self, repo_path: Path) -> None:
+        sqlite_dir = repo_path / "_sqlite"
+        sqlite_dir.mkdir(parents=True, exist_ok=True)
+        self._db_path = sqlite_dir / "_iss.sqlite3"
+        self._parquet_dir = repo_path / "_iss"
+
+    @contextmanager
+    def session(self) -> Iterator[sqlite3.Connection]:
+        """SQLite-подключение в режиме WAL: сверка читает, пока сборщик пишет."""
+        conn = sqlite3.connect(self._db_path, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=15000;")
+            self._ensure_schema(conn)
+            yield conn
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _ensure_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS iss_trades (
+                market        TEXT NOT NULL,
+                feed_date     TEXT NOT NULL,
+                secid         TEXT NOT NULL,
+                board         TEXT NOT NULL,
+                tradeno       INTEGER NOT NULL,
+                timestamp     TEXT NOT NULL,
+                trade_date    TEXT NOT NULL,
+                price         REAL NOT NULL,
+                quantity      INTEGER NOT NULL,
+                direction     TEXT NOT NULL,
+                period        TEXT,
+                session       TEXT,
+                open_position INTEGER,
+                off_market    INTEGER,
+                UNIQUE (market, secid, tradeno)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_iss_feed ON iss_trades (market, feed_date)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS iss_feed_state (
+                market     TEXT PRIMARY KEY,
+                head       TEXT NOT NULL,
+                feed_date  TEXT NOT NULL,
+                offset     INTEGER NOT NULL,  -- сохранено строк ленты
+                last       TEXT,              -- курсор: TRADENO (акции) / RECNO (FORTS)
+                caught_up  INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS iss_day_status (
+                market      TEXT NOT NULL,
+                day         TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                detail      TEXT NOT NULL,
+                checked_at  TEXT NOT NULL,
+                PRIMARY KEY (market, day, kind)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS iss_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Состояние ленты
+    # ------------------------------------------------------------------ #
+    def feed_state(self, market: str) -> dict[str, object] | None:
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT head, feed_date, offset, last, caught_up FROM iss_feed_state"
+                " WHERE market = ?",
+                (market,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "head": row[0],
+            "feed_date": row[1],
+            "offset": int(row[2]),
+            "last": row[3],
+            "caught_up": bool(row[4]),
+        }
+
+    def start_feed(self, market: str, head: str, feed_date: str) -> None:
+        """Начинает новую ленту рынка с нулевого курсора."""
+        with self.session() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO iss_feed_state"
+                " (market, head, feed_date, offset, last, caught_up) VALUES (?, ?, ?, 0, NULL, 0)",
+                (market, head, feed_date),
+            )
+            conn.commit()
+
+    def set_caught_up(self, market: str, caught_up: bool) -> None:
+        with self.session() as conn:
+            conn.execute(
+                "UPDATE iss_feed_state SET caught_up = ? WHERE market = ?",
+                (int(caught_up), market),
+            )
+            conn.commit()
+
+    def append_page(
+        self, market: str, rows: Sequence[dict[str, object]], offset: int, last: str
+    ) -> int:
+        """Сохраняет страницу ленты и курсор в одной транзакции; возвращает число новых строк."""
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                inserted = self._insert_iss_rows(conn, rows)
+                conn.execute(
+                    "UPDATE iss_feed_state SET offset = ?, last = ?, caught_up = 0"
+                    " WHERE market = ?",
+                    (offset, last, market),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return inserted
+
+    def stage_rows(self, rows: Sequence[dict[str, object]]) -> int:
+        """Добавляет строки ленты без дублей; возвращает число новых строк."""
+        if not rows:
+            return 0
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                inserted = self._insert_iss_rows(conn, rows)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return inserted
+
+    @staticmethod
+    def _insert_iss_rows(conn: sqlite3.Connection, rows: Sequence[dict[str, object]]) -> int:
+        if not rows:
+            return 0
+        placeholders = ", ".join("?" for _ in ISS_COLUMNS)
+        before = conn.total_changes
+        conn.executemany(
+            f"INSERT OR IGNORE INTO iss_trades ({', '.join(ISS_COLUMNS)}) VALUES ({placeholders})",
+            [tuple(row.get(col) for col in ISS_COLUMNS) for row in rows],
+        )
+        return conn.total_changes - before
+
+    # ------------------------------------------------------------------ #
+    # Выгрузка дня в Parquet
+    # ------------------------------------------------------------------ #
+    def staged_feed_dates(self, market: str) -> set[str]:
+        with self.session() as conn:
+            cur = conn.execute(
+                "SELECT DISTINCT feed_date FROM iss_trades WHERE market = ?", (market,)
+            )
+            return {str(r[0]) for r in cur.fetchall()}
+
+    def parquet_path(self, market: str, feed_date: str) -> Path:
+        return self._parquet_dir / market / f"{feed_date}.parquet"
+
+    def parquet_feed_dates(self, market: str) -> set[str]:
+        directory = self._parquet_dir / market
+        if not directory.exists():
+            return set()
+        return {p.stem for p in directory.glob("*.parquet")}
+
+    def finalize_feed_day(self, market: str, feed_date: str) -> Path | None:
+        """Выгружает ленту дня из SQLite в Parquet и удаляет её из SQLite.
+
+        Уже существующий Parquet дня сначала возвращается в SQLite, поэтому
+        повторная выгрузка (например, после импорта сырых файлов) объединяет
+        данные без дублей. Файл пишется частями во временный путь и подменяет
+        старый только после проверки числа строк; иначе
+        :class:`DataCorruptionError`, строки в SQLite остаются.
+        """
+        path = self.parquet_path(market, feed_date)
+        if path.exists():
+            for batch in pq.ParquetFile(path).iter_batches(batch_size=_ISS_EXPORT_CHUNK):
+                self.stage_rows(self._rows_from_arrow(batch.to_pylist()))
+        with self.session() as conn:
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM iss_trades WHERE market = ? AND feed_date = ?",
+                    (market, feed_date),
+                ).fetchone()[0]
+            )
+            if total == 0:
+                return None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".parquet.tmp")
+            cur = conn.execute(
+                f"SELECT {', '.join(ISS_COLUMNS)} FROM iss_trades"
+                " WHERE market = ? AND feed_date = ? ORDER BY rowid",
+                (market, feed_date),
+            )
+            with pq.ParquetWriter(tmp, _ISS_ARROW_SCHEMA, compression="snappy") as writer:
+                while chunk := cur.fetchmany(_ISS_EXPORT_CHUNK):
+                    writer.write_table(_iss_arrow_table(chunk))
+            written = pq.read_metadata(tmp).num_rows
+            if written != total:
+                tmp.unlink(missing_ok=True)
+                raise DataCorruptionError(
+                    f"Лента ISS {market} {feed_date}: записано {written} строк из {total}"
+                )
+            tmp.replace(path)
+            conn.execute(
+                "DELETE FROM iss_trades WHERE market = ? AND feed_date = ?", (market, feed_date)
+            )
+            conn.commit()
+        logger.info("Лента ISS %s за %s выгружена в %s (%d строк)", market, feed_date, path, total)
+        return path
+
+    @staticmethod
+    def _rows_from_arrow(records: list[dict[str, Any]]) -> list[dict[str, object]]:
+        for rec in records:
+            ts = rec["timestamp"]
+            rec["timestamp"] = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+        return cast(list[dict[str, object]], records)
+
+    # ------------------------------------------------------------------ #
+    # Чтение для проверки полноты
+    # ------------------------------------------------------------------ #
+    def _parquet_paths_since(self, market: str, since: str) -> list[Path]:
+        return [
+            self.parquet_path(market, d)
+            for d in sorted(self.parquet_feed_dates(market))
+            if d >= since
+        ]
+
+    def trade_dates(self, market: str, since: str) -> set[str]:
+        """Торговые дни (``TRADEDATE``) в лентах с ``feed_date`` не раньше ``since``."""
+        dates: set[str] = set()
+        for path in self._parquet_paths_since(market, since):
+            column = pq.read_table(path, columns=["trade_date"]).column("trade_date")
+            dates.update(str(v) for v in column.unique().to_pylist())
+        with self.session() as conn:
+            cur = conn.execute(
+                "SELECT DISTINCT trade_date FROM iss_trades WHERE market = ? AND feed_date >= ?",
+                (market, since),
+            )
+            dates.update(str(r[0]) for r in cur.fetchall())
+        return dates
+
+    def count_trades(self, market: str, trade_date: str, board: str, since: str) -> dict[str, int]:
+        """Число сделок по бумагам за торговый день в режиме ``board`` (лента + Parquet)."""
+        counts: dict[str, int] = {}
+        for path in self._parquet_paths_since(market, since):
+            table = pq.read_table(
+                path,
+                columns=["secid"],
+                filters=[("trade_date", "=", trade_date), ("board", "=", board)],
+            )
+            for secid, n in pd.Series(table.column("secid").to_pylist()).value_counts().items():
+                counts[str(secid)] = counts.get(str(secid), 0) + int(n)
+        with self.session() as conn:
+            cur = conn.execute(
+                "SELECT secid, COUNT(*) FROM iss_trades"
+                " WHERE market = ? AND trade_date = ? AND board = ? GROUP BY secid",
+                (market, trade_date, board),
+            )
+            for secid, n in cur.fetchall():
+                counts[str(secid)] = counts.get(str(secid), 0) + int(n)
+        return counts
+
+    # ------------------------------------------------------------------ #
+    # Статусы полноты и служебные флаги
+    # ------------------------------------------------------------------ #
+    def set_day_status(self, market: str, day: str, kind: str, status: str, detail: str) -> None:
+        with self.session() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO iss_day_status"
+                " (market, day, kind, status, detail, checked_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (market, day, kind, status, detail, datetime.now(UTC).isoformat()),
+            )
+            conn.commit()
+
+    def day_status(self, market: str, day: str, kind: str) -> str | None:
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT status FROM iss_day_status WHERE market = ? AND day = ? AND kind = ?",
+                (market, day, kind),
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def get_meta(self, key: str) -> str | None:
+        with self.session() as conn:
+            row = conn.execute("SELECT value FROM iss_meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row[0])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.session() as conn:
+            conn.execute("INSERT OR REPLACE INTO iss_meta (key, value) VALUES (?, ?)", (key, value))
+            conn.commit()
+
+
+_ISS_ARROW_SCHEMA = pa.schema(
+    [
+        ("market", pa.string()),
+        ("feed_date", pa.string()),
+        ("secid", pa.string()),
+        ("board", pa.string()),
+        ("tradeno", pa.int64()),
+        ("timestamp", pa.timestamp("us", tz="UTC")),
+        ("trade_date", pa.string()),
+        ("price", pa.float64()),
+        ("quantity", pa.int64()),
+        ("direction", pa.string()),
+        ("period", pa.string()),
+        ("session", pa.string()),
+        ("open_position", pa.int64()),
+        ("off_market", pa.int64()),
+    ]
+)
+
+
+def _iss_arrow_table(chunk: list[tuple[Any, ...]]) -> pa.Table:
+    columns = list(zip(*chunk, strict=True))
+    arrays: dict[str, Any] = {}
+    for idx, name in enumerate(ISS_COLUMNS):
+        values = list(columns[idx])
+        if name == "timestamp":
+            arrays[name] = pd.to_datetime(values, utc=True, format="ISO8601")
+        else:
+            arrays[name] = values
+    return pa.Table.from_pydict(arrays, schema=_ISS_ARROW_SCHEMA)

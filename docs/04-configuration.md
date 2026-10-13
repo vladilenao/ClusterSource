@@ -31,6 +31,8 @@ check-jsonschema --schemafile docs/contracts/schemas/config.schema.json config.y
 | `archiver.run_hour_utc` | integer 0–23 | `0` | `archiver.run_hour_utc` | планировщик | Час ежесуточного обслуживания (догрузка + архивация), UTC |
 | `archiver.run_minute_utc` | integer 0–59 | `5` | `archiver.run_minute_utc` | планировщик | Минута ежесуточного обслуживания, UTC |
 | `history_check_days` | integer ≥ 1 | `14` | `history_check_days` | догрузка | Окно в днях (включая сегодняшний) для догрузки отсутствующих и перекачки отмеченных дней; более старые отметки снимаются |
+| `iss.enabled` | boolean | `true` | `iss.enabled` | `amain` | Собирать ленту Мосбиржи из ISS ([SPEC-0003](specs/0003-iss-collection.md)) |
+| `iss.poll_interval_sec` | number | `60` | `iss.poll_interval_sec` | `IssCollector` | Пауза между циклами догонки ленты, с |
 | `tickers` | array | `[]` | `instruments` | все компоненты | Список инструментов (4.3) |
 
 ## 4.3. Элемент `tickers[]`

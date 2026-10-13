@@ -1,0 +1,94 @@
+openapi: 3.1.0
+info:
+  title: MOEX ISS — лента сделок и дневные итоги (как использует ClusterSource)
+  version: "1.0"
+  description: >-
+    Информационно-статистический сервер Мосбиржи. Без аутентификации данные
+    отдаются с задержкой 15 минут и только за текущий торговый день (лента);
+    дневные итоги — за прошедшие торговые дни. SPEC-0003.
+servers:
+  - url: https://iss.moex.com/iss
+paths:
+  /engines/{engine}/markets/{market}/trades.json:
+    get:
+      operationId: getTrades
+      summary: Общая лента сделок рынка за текущий торговый день
+      description: >-
+        ClusterSource вызывает для (stock, shares) и (futures, forts). Пагинация —
+        курсором: tradeno (акции) или recno (FORTS) с next_trade=1, limit=5000.
+        Параметр start устарел: на глубоких смещениях ISS отвечает пустыми страницами.
+      parameters:
+        - {name: engine, in: path, required: true, schema: {type: string, enum: [stock, futures]}}
+        - {name: market, in: path, required: true, schema: {type: string, enum: [shares, forts]}}
+        - {name: iss.meta, in: query, schema: {type: string, const: "off"}}
+        - {name: iss.only, in: query, schema: {type: string, const: trades}}
+        - {name: tradeno, in: query, description: "Акции: номер сделки-курсора.", schema: {type: integer}}
+        - {name: recno, in: query, description: "FORTS: RECNO сделки-курсора (порядок заключения).", schema: {type: integer}}
+        - {name: next_trade, in: query, description: "1 — без самой сделки-курсора.", schema: {type: integer, enum: [1]}}
+        - {name: limit, in: query, description: "Только 1, 10, 100, 1000, 5000.", schema: {type: integer, enum: [1, 10, 100, 1000, 5000]}}
+      responses:
+        "200":
+          description: Блок trades в табличном формате ISS (columns + data).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trades:
+                    type: object
+                    properties:
+                      columns:
+                        type: array
+                        items: {type: string}
+                        description: >-
+                          Акции: TRADENO, TRADETIME, SECID, PRICE, QUANTITY, PERIOD, VALUE,
+                          BOARDID, SYSTIME, BUYSELL, DECIMALS, TRADINGSESSION, TRADEDATE,
+                          TRADE_SESSION_DATE. FORTS: TRADENO, BOARDNAME, SECID, TRADEDATE,
+                          TRADETIME, PRICE, QUANTITY, SYSTIME, RECNO, OPENPOSITION,
+                          OFFMARKETDEAL, BUYSELL, TRADE_SESSION_DATE.
+                      data:
+                        type: array
+                        items: {type: array}
+              x-field-semantics:
+                TRADENO: Биржевой номер сделки; на фондовом рынке общий для всех бумаг, на FORTS не монотонен.
+                TRADETIME: Время сделки МСК, секунды, без даты.
+                SYSTIME: Время записи МСК. Сделки сессии выходного дня FORTS приходят пачкой в понедельник ~06:00.
+                TRADEDATE: Календарная дата сделки.
+                TRADE_SESSION_DATE: Торговый день (сессия выходного дня относится к следующему).
+                BUYSELL: B — покупка, S — продажа (агрессор).
+                PERIOD: Акции — период торгов (S — аукцион открытия, N — основная торговля).
+                TRADINGSESSION: Акции — 0 утренняя, 1 основная, 2 вечерняя сессия.
+                OPENPOSITION: FORTS — открытый интерес после сделки.
+                OFFMARKETDEAL: FORTS — 1 для внебиржевой адресной сделки.
+  /history/engines/stock/markets/shares/boards/TQBR/securities.json:
+    get:
+      operationId: getHistory
+      summary: Дневные итоги по бумагам режима TQBR за торговый день
+      description: >-
+        Для FORTS — /history/engines/futures/markets/forts/securities.json (режим RFUD).
+        ClusterSource использует SECID и NUMTRADES. Итоги дня появляются после сессии;
+        за субботу/воскресенье итогов нет — сессия выходного дня входит в следующий торговый день.
+      parameters:
+        - {name: date, in: query, required: true, schema: {type: string, format: date}}
+        - {name: start, in: query, schema: {type: integer, minimum: 0}}
+        - {name: iss.meta, in: query, schema: {type: string, const: "off"}}
+        - {name: iss.only, in: query, schema: {type: string, const: "history,history.cursor"}}
+      responses:
+        "200":
+          description: Блоки history (columns + data) и history.cursor (INDEX, TOTAL, PAGESIZE).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: object
+                    properties:
+                      columns: {type: array, items: {type: string}}
+                      data: {type: array, items: {type: array}}
+                  history.cursor:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items: {type: array, items: {type: integer}, minItems: 3, maxItems: 3}

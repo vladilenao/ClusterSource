@@ -1,4 +1,4 @@
-"""Тесты коллектора: конвертация DTO, обнаружение пропусков trade_id, батч консьюмера."""
+"""Тесты коллектора: конвертация DTO, пропуски trade_id, приём сделок, батч консьюмера."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
-from cluster_source.collector import DataCollector, InstrumentNotFound, StreamHandle, Tick, _to_dto
+from cluster_source.collector import DataCollector, Tick, _to_dto
 from cluster_source.config import AppConfig, Instrument, InstrumentType
 from cluster_source.database import MarketDataRepository
 
@@ -98,54 +98,14 @@ def test_gap_detection_logs_warning(
 
 
 async def test_consumer_flushes_batch_and_drains(share_config: AppConfig) -> None:
+    """Сделки, принятые deliver, записываются консьюмером при остановке."""
     repo = MarketDataRepository(share_config.storage_root, share_config.instruments[0])
     collector = DataCollector(share_config, share_config.instruments[0], repo)
-    datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
-
-    async def fake_factory(_instr: Instrument) -> StreamHandle:
-        class FakeStream:
-            def __init__(self) -> None:
-                self._trades = [_trade(100.0 + i, str(i + 1)) for i in range(5)]
-                self._idx = 0
-
-            def __aiter__(self) -> FakeStream:
-                return self
-
-            async def __anext__(self) -> Any:
-                if self._idx >= len(self._trades):
-                    raise StopAsyncIteration
-                t = self._trades[self._idx]
-                self._idx += 1
-                return t
-
-        return StreamHandle(stream=FakeStream(), teardown=None)
-
-    collector._stream_factory = fake_factory
-    collector._running = True
-    handle = await fake_factory(share_config.instruments[0])
-    await collector.subscribe(handle.stream)
-    # Конец стрима: выключаем running, чтобы консьюмер опустошил очередь.
+    for i in range(5):
+        await collector.deliver(_trade(100.0 + i, str(i + 1)))
     collector._running = False
     await collector._consumer()
     assert repo.count_hot() == 5
-
-
-async def test_not_found_instrument_stops_without_retry(share_config: AppConfig) -> None:
-    repo = MarketDataRepository(share_config.storage_root, share_config.instruments[0])
-    collector = DataCollector(share_config, share_config.instruments[0], repo)
-
-    calls = 0
-
-    async def not_found_factory(_instr: Instrument) -> StreamHandle:
-        nonlocal calls
-        calls += 1
-        raise InstrumentNotFound(f"Тикер не найден: {_instr.id}")
-
-    collector._stream_factory = not_found_factory
-    await collector.run()
-    assert calls == 1
-    assert not collector._running
-    assert repo.count_hot() == 0
 
 
 def _fast_config(share_config: AppConfig) -> AppConfig:
@@ -166,6 +126,11 @@ async def test_gap_and_stream_open_mark_days_via_consumer(share_config: AppConfi
     await collector._flush([])
     assert repo.days_to_refresh() == {"2026-09-04": "compromised"}
 
+    collector.on_stream_opened()
+    await collector._flush([])
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    assert repo.days_to_refresh()[today] == "stream_gap"
+
 
 def test_to_dto_unspecified_direction_is_unknown() -> None:
     """KI-10: TRADE_DIRECTION_UNSPECIFIED не превращается в SELL."""
@@ -173,77 +138,36 @@ def test_to_dto_unspecified_direction_is_unknown() -> None:
     assert _to_dto(_trade(1.0, "1", direction=0), instr).direction == "UNKNOWN"
 
 
-def test_next_delay_is_exponential() -> None:
-    from cluster_source.collector import _next_delay
-
-    delays = [0.0]
-    for _ in range(7):
-        delays.append(_next_delay(delays[-1]))
-    assert delays[1:] == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
-
-
-class _ListStream:
-    """Стрим из готовых сделок; по окончании — ошибка соединения."""
-
-    def __init__(self, trades: list[Any]) -> None:
-        self._trades = list(trades)
-
-    def __aiter__(self) -> _ListStream:
-        return self
-
-    async def __anext__(self) -> Any:
-        if self._trades:
-            return self._trades.pop(0)
-        raise ConnectionError("stream reset")
-
-
-async def test_stream_errors_back_off_exponentially(share_config: AppConfig, monkeypatch) -> None:
-    """KI-07: повторяющиеся разрывы стрима дают растущую задержку."""
+async def test_cancel_drains_queue(share_config: AppConfig) -> None:
+    """KI-08: отмена задачи коллектора не теряет накопленные тики."""
     import asyncio
 
     cfg = _fast_config(share_config)
     repo = MarketDataRepository(cfg.storage_root, cfg.instruments[0])
     collector = DataCollector(cfg, cfg.instruments[0], repo)
-    real_sleep = asyncio.sleep
-    delays: list[float] = []
-
-    async def fake_sleep(delay: float, *args: Any) -> None:
-        delays.append(delay)
-        if len(delays) >= 3:
-            collector._running = False
-        await real_sleep(0)
-
-    async def factory(_instr: Instrument) -> StreamHandle:
-        return StreamHandle(stream=_ListStream([]))
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    collector._stream_factory = factory
-    await collector.run()
-    assert delays[:3] == [2.0, 4.0, 8.0]
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    assert repo.days_to_refresh() == {today: "stream_gap"}
-
-
-async def test_cancel_during_backoff_drains_queue(share_config: AppConfig) -> None:
-    """KI-08: отмена во время паузы переподключения не теряет накопленные тики."""
-    import asyncio
-
-    cfg = _fast_config(share_config)
-    repo = MarketDataRepository(cfg.storage_root, cfg.instruments[0])
-    collector = DataCollector(cfg, cfg.instruments[0], repo)
-
-    async def factory(_instr: Instrument) -> StreamHandle:
-        return StreamHandle(stream=_ListStream([_trade(100.0 + i, str(i)) for i in range(3)]))
-
-    collector._stream_factory = factory
     task = asyncio.create_task(collector.run())
-    await asyncio.sleep(0.05)  # тики в буфере, run спит перед переподключением
+    for i in range(3):
+        await collector.deliver(_trade(100.0 + i, str(i)))
+    await asyncio.sleep(0)
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
     assert repo.count_hot() == 3
+
+
+async def test_shutdown_stops_run_and_drains(share_config: AppConfig) -> None:
+    import asyncio
+
+    cfg = _fast_config(share_config)
+    repo = MarketDataRepository(cfg.storage_root, cfg.instruments[0])
+    collector = DataCollector(cfg, cfg.instruments[0], repo)
+    task = asyncio.create_task(collector.run())
+    await collector.deliver(_trade(100.0, "1"))
+    await collector.shutdown()
+    await asyncio.wait_for(task, timeout=5)
+    assert repo.count_hot() == 1
 
 
 async def test_consumer_batches_by_interval(share_config: AppConfig) -> None:
@@ -269,39 +193,3 @@ async def test_consumer_batches_by_interval(share_config: AppConfig) -> None:
     collector._running = False
     await consumer
     assert calls == [5]
-
-
-async def test_request_reconnect_reopens_stream(share_config: AppConfig, monkeypatch) -> None:
-    """После запроса стрим переоткрывается через фабрику (новая резолюция контракта)."""
-    import asyncio
-
-    cfg = _fast_config(share_config)
-    repo = MarketDataRepository(cfg.storage_root, cfg.instruments[0])
-    collector = DataCollector(cfg, cfg.instruments[0], repo)
-    real_sleep = asyncio.sleep
-    opened = 0
-
-    class PingStream:
-        def __aiter__(self) -> PingStream:
-            return self
-
-        async def __anext__(self) -> Any:
-            await real_sleep(0.01)
-            return SimpleNamespace(trade=None)  # ping-кадр
-
-    async def factory(_instr: Instrument) -> StreamHandle:
-        nonlocal opened
-        opened += 1
-        if opened == 1:
-            collector.request_reconnect()
-        else:
-            collector._running = False
-        return StreamHandle(stream=PingStream())
-
-    async def fast_sleep(_delay: float, *args: Any) -> None:
-        await real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
-    collector._stream_factory = factory
-    await asyncio.wait_for(collector.run(), timeout=5)
-    assert opened == 2

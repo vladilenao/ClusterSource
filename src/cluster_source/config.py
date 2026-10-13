@@ -158,11 +158,20 @@ class ArchiverConfig:
 
 
 @dataclass(frozen=True)
+class IssConfig:
+    """Сбор ленты Мосбиржи из ISS (SPEC-0003)."""
+
+    enabled: bool = True
+    poll_interval_sec: float = 60.0
+
+
+@dataclass(frozen=True)
 class AppConfig:
     token: str
     data_dir: Path
     batch: BatchConfig = field(default_factory=BatchConfig)
     archiver: ArchiverConfig = field(default_factory=ArchiverConfig)
+    iss: IssConfig = field(default_factory=IssConfig)
     history_check_days: int = 14
     instruments: list[Instrument] = field(default_factory=list)
 
@@ -195,6 +204,7 @@ class AppConfig:
 
         batch_raw = raw.get("batch", {})
         arch_raw = raw.get("archiver", {})
+        iss_raw = raw.get("iss", {})
 
         return cls(
             token=token_value,
@@ -206,6 +216,10 @@ class AppConfig:
             archiver=ArchiverConfig(
                 run_hour_utc=int(arch_raw.get("run_hour_utc", 0)),
                 run_minute_utc=int(arch_raw.get("run_minute_utc", 5)),
+            ),
+            iss=IssConfig(
+                enabled=bool(iss_raw.get("enabled", True)),
+                poll_interval_sec=float(iss_raw.get("poll_interval_sec", 60.0)),
             ),
             history_check_days=int(raw.get("history_check_days", 14)),
             instruments=instruments,

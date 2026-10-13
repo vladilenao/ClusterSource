@@ -55,6 +55,23 @@
         }
       }
     },
+    "iss": {
+      "type": "object",
+      "description": "Сбор ленты Мосбиржи из ISS (SPEC-0003).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Собирать ленту сделок рынка акций и FORTS из ISS."
+        },
+        "poll_interval_sec": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 60,
+          "description": "Пауза между циклами догонки ленты, секунды."
+        }
+      }
+    },
     "history_check_days": {
       "type": "integer",
       "minimum": 1,

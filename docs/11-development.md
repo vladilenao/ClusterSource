@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 | Линтер | `ruff check .` | правила `E, F, I, W, UP`, длина строки 100 |
 | Форматирование | `ruff format .` | |
 | Типизация | `mypy src/` | `strict`, `python_version = 3.13` |
-| Тесты | `pytest -q` | `asyncio_mode = auto`, 82 теста |
+| Тесты | `pytest -q` | `asyncio_mode = auto`, 105 тестов |
 
 Порядок проверки после изменений: `ruff check` → `mypy src/` → `pytest -q`.
 
@@ -22,10 +22,12 @@ pip install -e ".[dev]"
 | `tests/conftest.py` | Фабрика `AppConfig` и репозитория на `tmp_path` |
 | `tests/test_config.py` | Разбор YAML, `storage_name`, переопределение токена, шаблон тикера контракта, `nearest_contract`, `parse_direction` |
 | `tests/test_database.py` | Вставка/чтение SQLite, WAL, Parquet (точный фильтр по времени), очистка, `replace_hot_day`, отметки перекачки, смешанные форматы времени |
-| `tests/test_collector.py` | `_to_dto`, Producer/Consumer, пакетная запись по интервалу, дренаж при отмене, отметки дней, экспоненциальная задержка, переподключение по запросу, `InstrumentNotFound` |
+| `tests/test_collector.py` | `_to_dto`, приём сделок `deliver`, пакетная запись по интервалу, дренаж при отмене и `shutdown`, отметки дней (`compromised`, `stream_gap`) |
 | `tests/test_autoload.py` | Разбор CSV (`history-trades` и легаси), ключи архива и выбор контракта, FIGI на сегодня, выбор акции, `GetLastTrades`, `missing_days`, `refresh_days`, перекачка и судьба отметок |
 | `tests/test_archiver.py` | Перенос дней в Parquet, архивация всех прошедших дней, отмена очистки без Parquet, расписание |
 | `tests/test_exchange_only.py` | SPEC-0002: разбор источника сделки, подписка `TRADE_SOURCE_EXCHANGE`, фильтр стрима/архива/`GetLastTrades`, чистка `dealer_cleanup`, удаление дня без биржевых сделок |
+| `tests/test_iss.py` | SPEC-0003: нормализация ленты ISS (время МСК → UTC, сессии выходного дня, FORTS), догонка с неполными и пустыми страницами, смена дня, отсутствие дублей, импорт этапа 1, проверка полноты по `NUMTRADES` |
+| `tests/test_stream_hub.py` | SPEC-0009: одно соединение, раздача сделок по FIGI/UID, переподключение без новой резолюции, экспоненциальная пауза, неподтверждённая подписка, ролловер с резолюцией |
 | `tests/test_reader.py` | Footprint, выбор источника по дню, точные границы интервала, пустой интервал, одинаковые сделки, `UNKNOWN`, округление |
 
 Тесты не требуют SDK и сети: внешние сервисы заменяются duck-typed
@@ -56,6 +58,7 @@ pip install -e ".[dev]"
 | Ключ `config.yaml` или значение по умолчанию | [04-configuration.md](04-configuration.md), `contracts/schemas/config.schema.json` |
 | Колонка SQLite/Parquet, формат `trade_id` | [03-data-model.md](03-data-model.md), `contracts/schemas/tick.schema.json` |
 | Колонки результата `get_cluster_data` | [08-footprint-reader.md](08-footprint-reader.md), `contracts/schemas/footprint-row.schema.json` |
+| Лента/итоги ISS, колонки `iss_trades` | [03-data-model.md § 3.7](03-data-model.md#37-лента-мосбиржи-iss), [09](09-external-integrations.md), `contracts/openapi/moex-iss.openapi.yaml` |
 | Вызов внешнего API, URL, поля запроса/ответа | [09-external-integrations.md](09-external-integrations.md), `contracts/openapi/*`, `contracts/asyncapi/*` |
 | Маппинг полей (`_to_dto`, `_trade_to_row`, `_history_rows`) | таблицы маппинга в [05](05-realtime-collection.md), [06](06-history-backfill.md) |
 | Константы задержек, лимитов, удержания | [05](05-realtime-collection.md), [06](06-history-backfill.md), [07](07-archiving.md) |

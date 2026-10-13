@@ -12,27 +12,37 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from cluster_source import archiver as archiver_mod
 from cluster_source import autoload
-from cluster_source.collector import (
-    DataCollector,
-    InstrumentNotFound,
-    StreamFactory,
-    StreamHandle,
-)
+from cluster_source.collector import DataCollector, InstrumentNotFound
 from cluster_source.config import AppConfig, Instrument, InstrumentType, nearest_contract
-from cluster_source.database import MarketDataRepository
+from cluster_source.database import IssTapeRepository, MarketDataRepository
+from cluster_source.iss import IssCollector
+from cluster_source.stream_hub import (
+    MAX_SUBSCRIPTIONS_PER_STREAM,
+    ConnectionFactory,
+    HubConnection,
+    StreamHub,
+)
 
 logger = logging.getLogger("cluster_source")
 
 CONFIG_PATH = Path("config.yaml")
+
+# gRPC по умолчанию разрешает имена встроенным резолвером c-ares. За VPN/прокси
+# с собственным DNS (режим fake-ip, интерфейс 198.18.0.0/15) он отвечает
+# «Could not contact DNS servers» и стримы не открываются; системный резолвер
+# работает. Задаётся до импорта SDK (gRPC читает переменную при инициализации);
+# значение из окружения не перезаписывается.
+os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
 
 # Необязательный импорт SDK: gRPC-стриминг работает только когда установлен
 # T-Invest Python SDK (это жёсткая зависимость, но такой импорт держит модуль
@@ -86,20 +96,25 @@ def setup_logging() -> None:
     )
 
 
-async def _resolve_stream_figi(client: Any, instrument: Instrument) -> str:
-    """Разрешает FIGI, на который должен подписаться коллектор.
+async def _resolve_stream_figi(
+    client: Any, instrument: Instrument, futures: list[Any] | None = None
+) -> str:
+    """Разрешает FIGI, на который подписывается стрим для инструмента.
 
     Для ``continuous_futures`` (например, ``Si``) через сервис инструментов
     находится ближайший к истечению активный контракт, чтобы мы всегда
     отслеживали текущий ликвидный контракт, сохраняя под непрерывным ключом.
+    ``futures`` — уже полученный справочник фьючерсов (один запрос на все).
     """
     instruments_service = client.instruments
     if instrument.is_continuous or instrument.type == InstrumentType.FUTURES_CONTRACT:
-        futures = await instruments_service.futures(
-            instrument_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_BASE
-        )
+        if futures is None:
+            response = await instruments_service.futures(
+                instrument_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_BASE
+            )
+            futures = list(response.instruments)
         if instrument.is_continuous:
-            metas = autoload.futures_from_sdk(futures.instruments)
+            metas = autoload.futures_from_sdk(futures)
             active = nearest_contract(instrument, metas.values(), datetime.now(UTC).date())
             if active is None:
                 raise InstrumentNotFound(
@@ -113,7 +128,7 @@ async def _resolve_stream_figi(client: Any, instrument: Instrument) -> str:
                 active.expiration,
             )
             return active.figi
-        matches = [f for f in futures.instruments if f.ticker == instrument.id]
+        matches = [f for f in futures if f.ticker == instrument.id]
         if not matches:
             raise InstrumentNotFound(f"Фьючерсный контракт не найден: {instrument.id}")
         return str(matches[0].figi)
@@ -136,57 +151,129 @@ async def _resolve_stream_figi(client: Any, instrument: Instrument) -> str:
     return str(ticker_matches[0].figi)
 
 
-def make_stream_factory(config: AppConfig) -> StreamFactory:
-    """Привязывает конфиг к вызываемому stream factory, инжектируемому в коллекторы."""
+def build_trades_subscription(figis: list[str]) -> Any:
+    """Запрос подписки одного стрима на сделки всех инструментов ``figis``.
 
-    async def factory(instrument: Instrument) -> StreamHandle:
-        return await create_stream(config, instrument)
-
-    return factory
-
-
-def build_trades_subscription(figi: str) -> Any:
-    """Запрос подписки стрима на сделки инструмента ``figi``.
-
+    SPEC-0009: одна подписка в одном соединении (до 300 инструментов).
     SPEC-0002 G-2: только биржевые сделки. По умолчанию сервер отдаёт и
     дилерские (``TRADE_SOURCE_ALL``), поэтому источник задаётся явно.
     """
     return MarketDataRequest(
         subscribe_trades_request=SubscribeTradesRequest(
             subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
-            instruments=[TradeInstrument(instrument_id=figi)],
+            instruments=[TradeInstrument(instrument_id=figi) for figi in figis],
             trade_source=TradeSourceType.TRADE_SOURCE_EXCHANGE,
         )
     )
 
 
-async def create_stream(config: AppConfig, instrument: Instrument) -> StreamHandle:
-    """Открывает gRPC-стрим сделок для ``instrument``.
+async def _resolve_figis(
+    services: Any, instruments: list[Instrument]
+) -> tuple[dict[str, str], list[str]]:
+    """FIGI всех инструментов ``{storage_name: figi}`` и список ненайденных.
 
-    Для ``continuous_futures`` сначала резолвится ближайший к истечению
-    (активный) контракт, но все тики сохраняются под непрерывным ключом.
+    Справочник фьючерсов запрашивается один раз на все инструменты.
     """
-    if not _has_sdk:
-        raise RuntimeError("t-tech-investments не установлен; стриминг рыночных данных недоступен")
-
-    client = AsyncClient(config.token)
-    services = await client.__aenter__()
-    try:
-        figi = await _resolve_stream_figi(services, instrument)
-        stream = services.create_market_data_stream()
-        stream.subscribe(build_trades_subscription(figi))
-    except BaseException:
-        # Иначе при каждом повторе открытия стрима утекал бы gRPC-канал.
-        await client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
-        raise
-
-    async def teardown() -> None:
+    futures: list[Any] | None = None
+    if any(i.type != InstrumentType.SHARE for i in instruments):
+        response = await services.instruments.futures(
+            instrument_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_BASE
+        )
+        futures = list(response.instruments)
+    resolved: dict[str, str] = {}
+    not_found: list[str] = []
+    for instrument in instruments:
         try:
-            stream.stop()
-        finally:
-            await client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+            resolved[instrument.storage_name] = await _resolve_stream_figi(
+                services, instrument, futures
+            )
+        except InstrumentNotFound as exc:
+            logger.warning("%s", exc)
+            not_found.append(instrument.storage_name)
+    return resolved, not_found
 
-    return StreamHandle(stream=stream, teardown=teardown)
+
+async def _log_stream_limits(services: Any) -> None:
+    """Пишет в лог лимит stream-соединений котировок из тарифа (SPEC-0009)."""
+    try:
+        tariff = await services.users.get_user_tariff()
+    except Exception as exc:  # noqa: BLE001 - лимит справочный, сбор не блокирует
+        logger.warning("Не удалось получить тариф T-Invest: %s", exc)
+        return
+    for limit in getattr(tariff, "stream_limits", None) or []:
+        streams = list(getattr(limit, "streams", None) or [])
+        if any("MarketDataStream" in name for name in streams):
+            logger.info(
+                "Лимит stream-соединений котировок: %s (открыто сейчас: %s)",
+                limit.limit,
+                getattr(limit, "open", "?"),
+            )
+
+
+def make_connection_factory(config: AppConfig) -> ConnectionFactory:
+    """Фабрика единственного стрим-соединения для :class:`StreamHub` (SPEC-0009).
+
+    FIGI кэшируются между переподключениями и разрешаются заново только при
+    ``resolve=True`` (старт, ролловер непрерывных фьючерсов) — G-4.
+    """
+    figis: dict[str, str] = {}
+    not_found: list[str] = []
+    limits_logged = False
+
+    async def factory(instruments: Sequence[Instrument], resolve: bool) -> HubConnection:
+        nonlocal limits_logged
+        if not _has_sdk:
+            raise RuntimeError(
+                "t-tech-investments не установлен; стриминг рыночных данных недоступен"
+            )
+        client = AsyncClient(config.token)
+        services = await client.__aenter__()
+        try:
+            if not limits_logged:
+                await _log_stream_limits(services)
+                limits_logged = True
+            if resolve or not figis:
+                resolved, missing = await _resolve_figis(services, list(instruments))
+                figis.clear()
+                figis.update(resolved)
+                not_found[:] = missing
+            if not figis:
+                raise RuntimeError("ни один инструмент не разрешён в FIGI")
+            if len(figis) > MAX_SUBSCRIPTIONS_PER_STREAM:
+                raise ValueError(
+                    f"{len(figis)} инструментов больше лимита подписок одного стрима "
+                    f"({MAX_SUBSCRIPTIONS_PER_STREAM})"
+                )
+            routes: dict[str, str] = {}
+            for name, figi in figis.items():
+                if figi in routes:
+                    logger.error(
+                        "FIGI %s у %s и %s: сделки получит только %s",
+                        figi,
+                        routes[figi],
+                        name,
+                        routes[figi],
+                    )
+                    continue
+                routes[figi] = name
+            stream = services.create_market_data_stream()
+            stream.subscribe(build_trades_subscription(list(routes)))
+        except BaseException:
+            # Иначе при каждом повторе открытия стрима утекал бы gRPC-канал.
+            await client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+            raise
+
+        async def teardown() -> None:
+            try:
+                stream.stop()
+            finally:
+                await client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+
+        return HubConnection(
+            stream=stream, routes=routes, teardown=teardown, not_found=list(not_found)
+        )
+
+    return factory
 
 
 async def _run_backfill(
@@ -304,19 +391,12 @@ async def amain(config: AppConfig) -> int:
     async with maintenance_lock:
         await run_maintenance(config, repos, gate=archive_gate)
 
-    collectors: list[DataCollector] = []
-    stream_factory = make_stream_factory(config)
-    for instrument in config.instruments:
-        repo = repos[instrument.storage_name]
-        logger.info("Подготовка коллектора для %s (%s)", instrument.id, instrument.type.value)
-        collectors.append(
-            DataCollector(
-                config=config,
-                instrument=instrument,
-                repo=repo,
-                stream_factory=stream_factory,
-            )
-        )
+    collectors = [
+        DataCollector(config, instrument, repos[instrument.storage_name])
+        for instrument in config.instruments
+    ]
+    # SPEC-0009: одно стрим-соединение на все инструменты (лимит T-Invest — 16).
+    hub = StreamHub(collectors, make_connection_factory(config))
 
     stop_event = asyncio.Event()
 
@@ -333,29 +413,37 @@ async def amain(config: AppConfig) -> int:
                 pass
 
     collector_tasks = [asyncio.create_task(c.run()) for c in collectors]
+    hub_task = asyncio.create_task(hub.run())
 
     async def nightly() -> None:
         async with maintenance_lock:
             await run_maintenance(config, repos, gate=archive_gate)
         # Активный контракт непрерывного фьючерса мог смениться (экспирация).
-        for collector in collectors:
-            if collector.instrument.is_continuous:
-                collector.request_reconnect()
+        if any(c.instrument.is_continuous for c in collectors):
+            hub.request_reconnect(resolve=True)
 
     scheduler_task = asyncio.create_task(run_scheduler(config, nightly))
     cleanup_task = asyncio.create_task(
         run_dealer_cleanup(config, repos, gate=archive_gate, lock=maintenance_lock)
     )
+    background = [hub_task, scheduler_task, cleanup_task]
+    if config.iss.enabled:
+        # SPEC-0003: лента Мосбиржи — источник номеров сделок и ОИ по сделкам.
+        iss_collector = IssCollector(config, IssTapeRepository(config.storage_root))
+        background.append(asyncio.create_task(iss_collector.run()))
 
     try:
         await stop_event.wait()
     finally:
         logger.info("Запрошено корректное завершение; сбрасываем накопленные тики в SQLite")
-        scheduler_task.cancel()
-        cleanup_task.cancel()
+        await hub.shutdown()
+        # Сначала останавливаем стрим, затем коллекторы дописывают свои очереди.
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
         for task in collector_tasks:
             task.cancel()
-        await asyncio.gather(scheduler_task, cleanup_task, *collector_tasks, return_exceptions=True)
+        await asyncio.gather(*collector_tasks, return_exceptions=True)
         for collector in collectors:
             await collector.shutdown()
         logger.info("Все коллекторы опустошены; соединения с БД закрыты")
