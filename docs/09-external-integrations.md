@@ -18,7 +18,7 @@
 | I7 | Список фьючерсов (фолбэк) | HTTPS POST | `…/InstrumentsService/Futures` | `autoload._fetch_futures_rest` | без SDK | OpenAPI `listFutures` |
 | I8 | Последние сделки (фолбэк) | HTTPS POST | `…/MarketDataService/GetLastTrades` | `autoload._backfill_current_session` | без SDK | OpenAPI `getLastTrades` |
 | I9 | Лента сделок Мосбиржи | HTTPS GET | `https://iss.moex.com/iss/engines/{stock/markets/shares, futures/markets/forts}/trades.json` | `iss.IssCollector.poll_market` | раз в `iss.poll_interval_sec` | [OpenAPI](contracts/openapi/moex-iss.openapi.yaml) `getTrades` |
-| I10 | Дневные итоги Мосбиржи | HTTPS GET | `…/iss/history/engines/…/securities.json?date=` | `iss.IssCollector.verify_pending` | раз в час для непроверенных дней | [OpenAPI](contracts/openapi/moex-iss.openapi.yaml) `getHistory` |
+| I10 | Дневные итоги Мосбиржи | HTTPS GET | `…/iss/history/engines/…/securities.json?date=` | `iss.IssCollector.verify_pending`, `final.run_final_check` | раз в час для непроверенных дней ленты; ночью для вердикта дня (кэш в `_iss.sqlite3`) | [OpenAPI](contracts/openapi/moex-iss.openapi.yaml) `getHistory` |
 
 Унарные gRPC-методы I2–I4 описаны в [OpenAPI](contracts/openapi/t-invest-rest.openapi.yaml)
 через их REST-эквиваленты I6–I8: сообщения совпадают (REST-шлюз — это
@@ -66,6 +66,8 @@ grpc-gateway над тем же protobuf-контрактом `tinkoff.public.in
 | I9 | Бесплатно — только текущий торговый день, с задержкой 15 мин | Сбор непрерывно; день, не догнанный до смены ленты, помечается `ISS_FEED_INCOMPLETE` |
 | I9 | Параметр `start` устарел: на глубоких смещениях (от ~1,3 млн строк) — пустые страницы | Курсор `tradeno` (акции) / `recno` (FORTS) с `next_trade=1`; пустой ответ перепроверяется 2 раза |
 | I9 | `previous_session=1` (FORTS) отдаёт лишь начало прошлой сессии | Не используется |
+| I10 | Итоги FORTS включают блочные/переговорные сделки, которых нет в анонимных лентах (до 0,76% сделок, до 15% объёма контракта за день) | Эталон фьючерсов для FINAL — полная лента ISS; полнота ленты FORTS — с допуском 1% (L-14) |
+| I10 | `VOLUME` акций — в штуках | Сравнение с нашим объёмом × `lot_size` |
 | I9 | Сделки сессии выходного дня FORTS приходят пачкой в понедельник (`SYSTIME` 06:00) | Дата сделки — из `TRADEDATE` ([3.7](03-data-model.md#37-лента-мосбиржи-iss)) |
 | I10 | Итоги за день появляются после сессии; сессия выходного дня входит в следующий торговый день | Сверка дня D не раньше 06:00 МСК D+1, по `trade_date`; без итогов 3 суток — `unverifiable` |
 | I1 | Сервер закрывает стрим или стрим обрывается | Переподключение с экспоненциальной задержкой 2 → 60 с; день отмечается `stream_gap` |

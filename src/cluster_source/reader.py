@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import numpy as np
 import pandas as pd
@@ -145,3 +145,53 @@ def get_verified_until(repo: MarketDataRepository) -> datetime | None:
     """Момент, до которого данные инструмента сверены с лентой Мосбиржи (SPEC-0005)."""
     stored = repo.verified_until()
     return datetime.fromisoformat(stored) if stored else None
+
+
+def get_day_verdicts(repo: MarketDataRepository) -> pd.DataFrame:
+    """Вердикты торговых дней (SPEC-0006): ``FINAL`` / ``MISMATCH`` / ``UNVERIFIABLE``.
+
+    Колонки: ``trade_date``, ``status``, ``ours_n``, ``ref_n``, ``ours_volume``,
+    ``ref_volume``, ``reference`` (``iss_totals`` — акции, ``iss_tape`` —
+    фьючерсы), ``detail``, ``checked_at``.
+    """
+    return repo.day_verdicts()
+
+
+def get_final_days(repo: MarketDataRepository) -> list[date]:
+    """Торговые дни со статусом ``FINAL`` — только по ним считаются пороги
+    и базовые уровни (SPEC-0001 G-3, SPEC-0006 G-2)."""
+    df = repo.day_verdicts()
+    return [date.fromisoformat(d) for d in df.loc[df["status"] == "FINAL", "trade_date"]]
+
+
+#: Окно норм SPEC-0008 по умолчанию, торговых дней.
+BASELINE_DAYS = 20
+
+
+def get_baseline_days(
+    repo: MarketDataRepository, n: int = BASELINE_DAYS, allow_archive: bool = True
+) -> list[tuple[date, str]]:
+    """Дни для расчёта норм (RVOL, перцентили, профили): ``[(торговый день, статус)]``.
+
+    Берутся последние ``n`` дней ``FINAL``; если их меньше ``n`` и
+    ``allow_archive`` — окно добирается самыми свежими ``ARCHIVE_CONSISTENT``.
+    ``MISMATCH`` / ``UNVERIFIABLE`` не берутся никогда (SPEC-0001 G-3, SPEC-0006).
+    """
+    df = repo.day_verdicts().sort_values("trade_date", ascending=False)
+    final = [
+        (date.fromisoformat(d), "FINAL") for d in df.loc[df["status"] == "FINAL", "trade_date"]
+    ]
+    chosen = final[:n]
+    if allow_archive and len(chosen) < n:
+        archive = df.loc[df["status"] == "ARCHIVE_CONSISTENT", "trade_date"]
+        chosen += [(date.fromisoformat(d), "ARCHIVE_CONSISTENT") for d in archive][
+            : n - len(chosen)
+        ]
+    return sorted(chosen)
+
+
+def baseline_quality(days: list[tuple[date, str]]) -> str:
+    """``pure`` — все дни окна ``FINAL``; ``mixed`` — есть архивные; ``empty`` — дней нет."""
+    if not days:
+        return "empty"
+    return "pure" if all(status == "FINAL" for _, status in days) else "mixed"

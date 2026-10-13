@@ -134,6 +134,20 @@ if state["state"] != "OK" or not bad.empty:
 лентой биржи. Footprint по `REPAIRED`-минутам строится по полным данным: у
 дозалитых сделок время с точностью до секунды.
 
+Окончательный статус дня ([SPEC-0006](specs/0006-final-day.md)) — ночью:
+
+| Функция | Возвращает |
+|---------|------------|
+| `get_day_verdicts(repo)` | Вердикты торговых дней: `FINAL` / `ARCHIVE_CONSISTENT` / `MISMATCH` / `UNVERIFIABLE`, наши и эталонные число сделок и объём, эталон (`iss_totals` / `iss_tape`) |
+| `get_final_days(repo)` | Торговые дни `FINAL` — доказанно совпадают с эталоном биржи |
+| `get_baseline_days(repo, n=20, allow_archive=True)` | Окно для норм (RVOL, перцентили, профили): последние `n` дней `FINAL`, при нехватке — добор `ARCHIVE_CONSISTENT`; `[(день, статус)]` |
+| `baseline_quality(days)` | `pure` — все дни окна `FINAL`; `mixed` — есть архивные; `empty` — дней нет |
+
+Нормы считаются только по окну `get_baseline_days` (SPEC-0001 G-3, SPEC-0006 G-4).
+Статус `ARCHIVE_CONSISTENT` бывает только у фьючерсов: день из архива
+согласуется с итогами биржи в пределах сделок вне анонимной ленты, но не
+доказан полной лентой ISS.
+
 Причины: `stream_gap`, `subscription_failed`, `stream_silence`, `latency`,
 `backlog`, `write_failure`, `unknown_direction`, `contract_roll`,
 `dealer_leak` — см. [5.8](05-realtime-collection.md#58-детекторы-деградации-spec-0004).

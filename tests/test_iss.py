@@ -447,3 +447,24 @@ async def test_verify_waits_for_daily_totals(
         share_config, iss_repo, fake, now=datetime(2026, 10, 15, 6, 0, tzinfo=UTC)
     ).verify_pending()
     assert iss_repo.day_status("shares", "2026-10-12", KIND_TRADE_DATE) == STATUS_UNVERIFIABLE
+
+
+async def test_verify_forts_allows_trades_outside_anonymous_tape(
+    share_config: AppConfig, iss_repo: IssTapeRepository
+) -> None:
+    """SPEC-0006 / SPEC-0003 G-5: в итогах FORTS есть сделки вне анонимной ленты (до 1%)."""
+    rows = [fut(k, day="2026-10-12") for k in range(1, 100)]
+    iss_repo.stage_rows(normalize_trades("forts", "2026-10-12", FORTS_COLUMNS, rows))
+    iss_repo.finalize_feed_day("forts", "2026-10-12")
+    fake = FakeIss()
+    fake.history[("forts", "2026-10-12")] = {"SiZ6": 100}  # 99 в ленте + 1 блочная
+    now = datetime(2026, 10, 13, 6, 0, tzinfo=UTC)
+    await collector(share_config, iss_repo, fake, now=now).verify_pending()
+    assert iss_repo.day_status("forts", "2026-10-12", KIND_TRADE_DATE) == STATUS_COMPLETE
+
+    with iss_repo.session() as conn:
+        conn.execute("DELETE FROM iss_day_status")
+        conn.commit()
+    fake.history[("forts", "2026-10-12")] = {"SiZ6": 200}  # лента усечена вдвое
+    await collector(share_config, iss_repo, fake, now=now).verify_pending()
+    assert iss_repo.day_status("forts", "2026-10-12", KIND_TRADE_DATE) == STATUS_INCOMPLETE

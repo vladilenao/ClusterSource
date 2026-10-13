@@ -74,5 +74,6 @@ docs/contracts/
 | Delta | `buy_volume − sell_volume` в ячейке footprint. |
 | COMPROMISED | Устаревший маркер разрыва числовых `trade_id` (удалён в SPEC-0005); причина `compromised` может встречаться в старых отметках `days_to_refresh`. |
 | Отметка для перекачки | Строка таблицы `days_to_refresh`: день неполон (`stream_gap`, `partial_backfill`; устаревшая `compromised`) или сохранён до биржевого фильтра (`dealer_cleanup`). |
+| FINAL | Окончательный статус торгового дня инструмента: число сделок и объём совпали с эталоном биржи ([SPEC-0006](specs/0006-final-day.md)). Пороги и базовые уровни считаются только по FINAL-дням. |
 | Вердикт сверки | `VERIFIED` / `REPAIRED` / `GAP` минуты после сверки с лентой Мосбиржи ([SPEC-0005](specs/0005-iss-reconciliation.md)). |
 | Биржевая / дилерская сделка | Биржевая — сделка Мосбиржи (`TRADE_SOURCE_EXCHANGE`); дилерская — сделка внутреннего рынка Т-Банка (`TRADE_SOURCE_DEALER`). Хранятся только биржевые ([SPEC-0002](specs/0002-exchange-only-trades.md)). |

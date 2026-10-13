@@ -232,6 +232,27 @@ CREATE TABLE IF NOT EXISTS minute_verdicts (
 Курсор сверки — `meta.recon_verified_until` (всё раньше — сверено). Минуты
 без сделок вердикта не имеют.
 
+Окончательный статус торгового дня ([SPEC-0006](specs/0006-final-day.md)):
+
+```sql
+CREATE TABLE IF NOT EXISTS day_verdicts (
+    trade_date   TEXT PRIMARY KEY,  -- торговый день биржи
+    status       TEXT NOT NULL,     -- FINAL | ARCHIVE_CONSISTENT | MISMATCH | UNVERIFIABLE
+    ours_n       INTEGER NOT NULL,
+    ref_n        INTEGER NOT NULL,
+    ours_volume  REAL NOT NULL,     -- в единицах эталона (акции — штуки)
+    ref_volume   REAL NOT NULL,
+    reference    TEXT NOT NULL,     -- iss_totals | iss_tape | none
+    detail       TEXT NOT NULL,
+    checked_at   TEXT NOT NULL
+);
+```
+
+В `_iss.sqlite3` — кэш дневных итогов ISS: `iss_day_totals (market,
+trade_date, secid, numtrades, volume)` и `iss_trading_dates (market,
+trade_date, trading)`; пустой ответ кэшируется как неторговая дата, только
+когда итоги точно вышли (через 3 суток).
+
 В хранилище только биржевые сделки
 ([SPEC-0002](specs/0002-exchange-only-trades.md)): источник сделки
 проверяется до записи и отдельной колонкой не хранится.

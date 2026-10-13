@@ -98,6 +98,21 @@ class MarketDataRepository:
             conn.execute("ALTER TABLE ticks_hot_store ADD COLUMN exchange_trade_no INTEGER")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS day_verdicts (
+                trade_date   TEXT PRIMARY KEY,
+                status       TEXT NOT NULL,
+                ours_n       INTEGER NOT NULL,
+                ref_n        INTEGER NOT NULL,
+                ours_volume  REAL NOT NULL,
+                ref_volume   REAL NOT NULL,
+                reference    TEXT NOT NULL,
+                detail       TEXT NOT NULL,
+                checked_at   TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS minute_verdicts (
                 minute    TEXT PRIMARY KEY,
                 status    TEXT NOT NULL,
@@ -399,6 +414,74 @@ class MarketDataRepository:
         return df
 
     # ------------------------------------------------------------------ #
+    # Окончательный статус дня (SPEC-0006)
+    # ------------------------------------------------------------------ #
+    def day_totals(self, day: str) -> tuple[int, float]:
+        """Число сделок и сумма объёма за календарный день UTC — из того же
+        источника, что читает ридер: Parquet дня, иначе SQLite."""
+        path = self.parquet_day_path(day)
+        if path is not None:
+            column = pq.read_table(path, columns=["volume"]).column("volume")
+            return len(column), float(sum(v or 0 for v in column.to_pylist()))
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(volume), 0) FROM ticks_hot_store"
+                " WHERE ticker = ? AND substr(timestamp, 1, 10) = ?",
+                (self.instrument.storage_name, day),
+            ).fetchone()
+        return int(row[0]), float(row[1])
+
+    def set_day_verdict(
+        self,
+        trade_date: str,
+        status: str,
+        ours: tuple[int, float],
+        ref: tuple[int, float],
+        reference: str,
+        detail: str,
+    ) -> None:
+        with self.session() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO day_verdicts (trade_date, status, ours_n, ref_n,"
+                " ours_volume, ref_volume, reference, detail, checked_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trade_date,
+                    status,
+                    ours[0],
+                    ref[0],
+                    ours[1],
+                    ref[1],
+                    reference,
+                    detail,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def day_verdicts(self) -> pd.DataFrame:
+        """Все вердикты дней (SPEC-0006), по возрастанию торгового дня."""
+        with self.session() as conn:
+            rows = conn.execute(
+                "SELECT trade_date, status, ours_n, ref_n, ours_volume, ref_volume, reference,"
+                " detail, checked_at FROM day_verdicts ORDER BY trade_date"
+            ).fetchall()
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "trade_date",
+                "status",
+                "ours_n",
+                "ref_n",
+                "ours_volume",
+                "ref_volume",
+                "reference",
+                "detail",
+                "checked_at",
+            ],
+        )
+
+    # ------------------------------------------------------------------ #
     # Качество данных (SPEC-0004)
     # ------------------------------------------------------------------ #
     def save_quality(
@@ -684,6 +767,28 @@ class IssTapeRepository:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS iss_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS iss_day_totals (
+                market      TEXT NOT NULL,
+                trade_date  TEXT NOT NULL,
+                secid       TEXT NOT NULL,
+                numtrades   INTEGER NOT NULL,
+                volume      REAL NOT NULL,
+                PRIMARY KEY (market, trade_date, secid)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS iss_trading_dates (
+                market      TEXT NOT NULL,
+                trade_date  TEXT NOT NULL,
+                trading     INTEGER NOT NULL,
+                PRIMARY KEY (market, trade_date)
+            )
+            """
+        )
 
     # ------------------------------------------------------------------ #
     # Состояние ленты
@@ -945,6 +1050,72 @@ class IssTapeRepository:
                         )
                     )
         return out
+
+    # ------------------------------------------------------------------ #
+    # Дневные итоги биржи и лента торгового дня (SPEC-0006)
+    # ------------------------------------------------------------------ #
+    def cached_totals(self, market: str, trade_date: str) -> dict[str, tuple[int, float]] | None:
+        """Итоги рынка за дату из кэша; ``None`` — дата не кэширована, ``{}`` — неторговая."""
+        with self.session() as conn:
+            flag = conn.execute(
+                "SELECT trading FROM iss_trading_dates WHERE market = ? AND trade_date = ?",
+                (market, trade_date),
+            ).fetchone()
+            if flag is None:
+                return None
+            rows = conn.execute(
+                "SELECT secid, numtrades, volume FROM iss_day_totals"
+                " WHERE market = ? AND trade_date = ?",
+                (market, trade_date),
+            ).fetchall()
+        return {str(r[0]): (int(r[1]), float(r[2])) for r in rows}
+
+    def save_totals(
+        self, market: str, trade_date: str, totals: dict[str, tuple[int, float]]
+    ) -> None:
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO iss_trading_dates (market, trade_date, trading)"
+                    " VALUES (?, ?, ?)",
+                    (market, trade_date, int(bool(totals))),
+                )
+                conn.executemany(
+                    "INSERT OR REPLACE INTO iss_day_totals"
+                    " (market, trade_date, secid, numtrades, volume) VALUES (?, ?, ?, ?, ?)",
+                    [(market, trade_date, k, n, v) for k, (n, v) in totals.items()],
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def tape_day(self, market: str, secid: str, board: str, trade_date: str) -> tuple[int, float]:
+        """Число сделок и объём бумаги в ленте ISS за торговый день (``trade_date``)."""
+        n, volume = 0, 0.0
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(quantity), 0) FROM iss_trades"
+                " WHERE market = ? AND secid = ? AND board = ? AND trade_date = ?",
+                (market, secid, board, trade_date),
+            ).fetchone()
+            n, volume = int(row[0]), float(row[1])
+        day = pd.Timestamp(trade_date)
+        near = {(day + pd.Timedelta(days=k)).strftime("%Y-%m-%d") for k in range(-4, 2)}
+        for feed_date in sorted(near & self.parquet_feed_dates(market)):
+            table = pq.read_table(
+                self.parquet_path(market, feed_date),
+                columns=["quantity"],
+                filters=[
+                    ("secid", "=", secid),
+                    ("board", "=", board),
+                    ("trade_date", "=", trade_date),
+                ],
+            )
+            n += table.num_rows
+            volume += float(sum(v or 0 for v in table.column("quantity").to_pylist()))
+        return n, volume
 
     # ------------------------------------------------------------------ #
     # Статусы полноты и служебные флаги

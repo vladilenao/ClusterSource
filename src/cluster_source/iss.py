@@ -498,8 +498,18 @@ class IssCollector:
         mismatches = {
             secid: (ours.get(secid, 0), exchange.get(secid, 0))
             for secid in set(exchange) | set(ours)
-            if ours.get(secid, 0) != exchange.get(secid, 0)
+            if not _tape_matches(market, ours.get(secid, 0), exchange.get(secid, 0))
         }
+        if market == "forts":
+            outside = sum(exchange.get(s, 0) - ours.get(s, 0) for s in exchange) - sum(
+                e - o for o, e in mismatches.values()
+            )
+            if outside:
+                logger.info(
+                    "ISS forts %s: %d сделок в итогах вне анонимной ленты (блочные/переговорные)",
+                    trade_date,
+                    outside,
+                )
         if not mismatches:
             status, detail = STATUS_COMPLETE, f"{len(exchange)} бумаг"
             logger.info(
@@ -552,6 +562,18 @@ class IssCollector:
             if page <= 0 or start >= total:
                 break
         return counts
+
+
+#: SPEC-0006: в итоги FORTS входят сделки вне анонимной ленты (блочные/переговорные);
+#: исследование 2026-10-13 — до 0,76% сделок контракта за день. Тот же допуск — в final.py.
+FORTS_OUTSIDE_TAPE_MAX_SHARE = 0.01
+
+
+def _tape_matches(market: str, tape: int, official: int) -> bool:
+    """Лента бумаги полна относительно итогов дня (SPEC-0003 G-5, SPEC-0006)."""
+    if market != "forts":
+        return tape == official
+    return tape <= official and official - tape <= FORTS_OUTSIDE_TAPE_MAX_SHARE * official
 
 
 def _read_raw_chunks(path: Path) -> Iterator[tuple[list[str], list[list[object]]]]:

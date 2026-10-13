@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 | Линтер | `ruff check .` | правила `E, F, I, W, UP`, длина строки 100 |
 | Форматирование | `ruff format .` | |
 | Типизация | `mypy src/` | `strict`, `python_version = 3.13` |
-| Тесты | `pytest -q` | `asyncio_mode = auto`, 141 тест |
+| Тесты | `pytest -q` | `asyncio_mode = auto`, 155 тестов |
 
 Порядок проверки после изменений: `ruff check` → `mypy src/` → `pytest -q`.
 
@@ -31,6 +31,7 @@ pip install -e ".[dev]"
 | `tests/test_quality.py` | SPEC-0004: условия и отметки минут, события `DATA_DEGRADED`/`DATA_RESTORED`, каждый детектор, тишина вне `NORMAL_TRADING`, сохранение консьюмером, функции чтения |
 | `tests/test_keep_awake.py` | SPEC-0010: `caffeinate -i -w PID` на macOS, отключение настройкой, реальный запрет снимается с выходом процесса |
 | `tests/test_reconcile.py` | SPEC-0005: VERIFIED с номерами, дозаливка REPAIRED, GAP (пусто у ISS, лишние сделки, сторона), граница ленты и «сейчас − 16 мин», архивные дни, идемпотентность, ожидание при backlog, миграция старой базы |
+| `tests/test_final.py` | SPEC-0006: FINAL акций (число и объём × лот), MISMATCH и перекачка, торговый день понедельника, эталон фьючерсов — лента, UNVERIFIABLE, неопубликованные итоги, кэш, отметка вне окна |
 | `tests/test_reader.py` | Footprint, выбор источника по дню, точные границы интервала, пустой интервал, одинаковые сделки, `UNKNOWN`, округление |
 
 Тесты не требуют SDK и сети: внешние сервисы заменяются duck-typed

@@ -85,6 +85,9 @@ REFRESH_PARTIAL_BACKFILL = "partial_backfill"
 
 #: SPEC-0002 G-4: однократная перекачка всех сохранённых дней без дилерских сделок.
 REFRESH_DEALER_CLEANUP = "dealer_cleanup"
+#: SPEC-0006: день не совпал с эталоном биржи — перекачать из архива независимо от
+#: давности (окно ``history_check_days`` на эту отметку не действует).
+REFRESH_FINAL_MISMATCH = "final_mismatch"
 DEALER_CLEANUP_META_KEY = "spec0002_dealer_cleanup_scheduled"
 #: Архив за день гарантированно опубликован через столько суток: 404 по отметке
 #: чистки тогда означает, что биржевых сделок за день не было.
@@ -196,7 +199,8 @@ def refresh_days(
     Сегодняшний день не возвращается: его архив ещё не опубликован.
 
     * ``cleanup=False`` — все отметки, кроме ``dealer_cleanup``, внутри окна
-      ``history_check_days``; отметки старше окна снимаются с предупреждением.
+      ``history_check_days``; отметки старше окна снимаются с предупреждением,
+      кроме ``final_mismatch`` (SPEC-0006) — она окном не ограничена.
     * ``cleanup=True`` — только отметки ``dealer_cleanup`` без ограничения
       окном (SPEC-0002 G-4), от новых дней к старым.
     """
@@ -208,7 +212,7 @@ def refresh_days(
         is_cleanup = reason == REFRESH_DEALER_CLEANUP
         if is_cleanup != cleanup or day_str >= today_str:
             continue
-        if not cleanup and day_str < window_start:
+        if not cleanup and day_str < window_start and reason != REFRESH_FINAL_MISMATCH:
             logger.warning(
                 "Отметка перекачки %s за %s (%s) вышла за окно %d дней — снята без перекачки",
                 repo.instrument.storage_name,

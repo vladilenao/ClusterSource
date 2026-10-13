@@ -22,12 +22,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import aiohttp
+
 from cluster_source import archiver as archiver_mod
 from cluster_source import autoload
+from cluster_source import final as final_mod
 from cluster_source.collector import DataCollector, InstrumentNotFound
-from cluster_source.config import AppConfig, Instrument, InstrumentType, nearest_contract
+from cluster_source.config import (
+    AppConfig,
+    FuturesMeta,
+    Instrument,
+    InstrumentType,
+    nearest_contract,
+)
 from cluster_source.database import IssTapeRepository, MarketDataRepository
-from cluster_source.iss import IssCollector
+from cluster_source.iss import MSK, HttpIssClient, IssCollector
 from cluster_source.quality import REASON_BACKLOG, REASON_WRITE_FAILURE
 from cluster_source.reconcile import Reconciler
 from cluster_source.stream_hub import (
@@ -343,6 +352,7 @@ async def run_maintenance(
     repos: dict[str, MarketDataRepository],
     *,
     gate: Any = None,
+    final_check: bool = True,
 ) -> None:
     """Обслуживание хранилища: догрузка/перекачка дней, затем архивация и очистка.
 
@@ -363,6 +373,45 @@ async def run_maintenance(
         await archiver_mod.run_archiver(config, repos)
     except Exception as exc:  # noqa: BLE001
         logger.error("Ошибка сверки архиватора: %s", exc)
+
+    if final_check:
+        await run_final_check_safely(config, repos)
+
+
+async def run_final_check_safely(config: AppConfig, repos: dict[str, MarketDataRepository]) -> None:
+    logger.info("Проверка FINAL прошедших торговых дней")
+    try:
+        await _run_final_check(config, repos)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Ошибка проверки FINAL: %s", exc)
+
+
+async def _run_final_check(config: AppConfig, repos: dict[str, MarketDataRepository]) -> None:
+    """SPEC-0006: вердикт по прошедшим торговым дням (справочник фьючерсов — через SDK)."""
+    futures: dict[str, FuturesMeta] = {}
+    if _has_sdk and any(i.type != InstrumentType.SHARE for i in config.instruments):
+        sdk_client = AsyncClient(config.token)
+        services = await sdk_client.__aenter__()
+        try:
+            # Истёкшие контракты нужны для прошедших дней непрерывных фьючерсов.
+            futures = await autoload._fetch_futures_grpc(
+                services.instruments, _SdkInstrumentStatus.INSTRUMENT_STATUS_ALL
+            )
+        finally:
+            await sdk_client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(ssl=autoload._ssl_context()),
+        timeout=aiohttp.ClientTimeout(total=120),
+    ) as session:
+        stats = await final_mod.run_final_check(
+            config,
+            repos,
+            IssTapeRepository(config.storage_root),
+            HttpIssClient(session),
+            futures,
+            datetime.now(MSK).date(),
+        )
+    logger.info("Проверка FINAL завершена: %s", dict(stats) or "новых торговых дней нет")
 
 
 async def run_dealer_cleanup(
@@ -426,7 +475,9 @@ async def amain(config: AppConfig) -> int:
     archive_gate = autoload.archive_gate()
     maintenance_lock = asyncio.Lock()
     async with maintenance_lock:
-        await run_maintenance(config, repos, gate=archive_gate)
+        # Проверка FINAL при старте — в фоне после запуска сбора: первая проверка
+        # загружает итоги ISS за всю историю и задержала бы стрим на минуты.
+        await run_maintenance(config, repos, gate=archive_gate, final_check=False)
 
     collectors = [
         DataCollector(config, instrument, repos[instrument.storage_name])
@@ -463,7 +514,17 @@ async def amain(config: AppConfig) -> int:
     cleanup_task = asyncio.create_task(
         run_dealer_cleanup(config, repos, gate=archive_gate, lock=maintenance_lock)
     )
-    background = [hub_task, scheduler_task, cleanup_task]
+
+    async def startup_final_check() -> None:
+        async with maintenance_lock:
+            await run_final_check_safely(config, repos)
+
+    background = [
+        hub_task,
+        scheduler_task,
+        cleanup_task,
+        asyncio.create_task(startup_final_check()),
+    ]
     if config.iss.enabled:
         # SPEC-0003: лента Мосбиржи — источник номеров сделок и ОИ по сделкам.
         iss_repo = IssTapeRepository(config.storage_root)

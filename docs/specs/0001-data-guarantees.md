@@ -183,6 +183,8 @@ G-1…G-3), [08-footprint-reader.md](../08-footprint-reader.md),
 
 ## Журнал решений
 
+- **2026-10-13** — `FINAL` реализован по торговым дням (SPEC-0006): `day_verdicts`, `reader.get_final_days`. Для фьючерсов эталон — полная лента ISS (итоги включают сделки вне анонимных лент), поэтому фьючерсы до 2026-10-13 — `UNVERIFIABLE`.
+
 - **2026-10-13** — Вердикты `VERIFIED` / `REPAIRED` / `GAP` по минутам реализованы (SPEC-0005): `minute_verdicts`, `reader.get_minute_verdicts` / `get_verified_until`. Итоги проверки сигналов — в SPEC-0008.
 
 - **2026-10-13** — Статус `DEGRADED` по минутам и состояние инструмента реализованы (SPEC-0004): `degraded_minutes`, `quality_events`, `reader.get_degraded_minutes` / `get_data_state`. `VERIFIED` / `REPAIRED` / `GAP` — SPEC-0005, `FINAL` — SPEC-0006.
