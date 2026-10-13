@@ -376,7 +376,9 @@ async def run_maintenance(
         config.history_check_days,
     )
     try:
-        await _run_backfill(config, repos, gate=gate)
+        # При старте (final_check=False) дни final_mismatch не перекачиваются: их
+        # бывают сотни, а стрим ждёт конца этого этапа. Их берёт фоновый проход.
+        await _run_backfill(config, repos, gate=gate, final_mismatch=None if final_check else False)
     except Exception as exc:  # noqa: BLE001
         logger.error("Ошибка автозагрузки: %s", exc)
 
@@ -528,7 +530,13 @@ async def amain(config: AppConfig) -> int:
     )
 
     async def startup_final_check() -> None:
+        # SPEC-0006: в фоне после запуска сбора — перекачка дней final_mismatch
+        # и проверка FINAL (при старте они задержали бы стрим на минуты).
         async with maintenance_lock:
+            try:
+                await _run_backfill(config, repos, gate=archive_gate, final_mismatch=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Ошибка перекачки дней final_mismatch: %s", exc)
             await run_final_check_safely(config, repos)
 
     background = [

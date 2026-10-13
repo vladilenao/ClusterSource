@@ -192,7 +192,11 @@ def missing_days(config: AppConfig, repo: MarketDataRepository) -> list[datetime
 
 
 def refresh_days(
-    config: AppConfig, repo: MarketDataRepository, *, cleanup: bool = False
+    config: AppConfig,
+    repo: MarketDataRepository,
+    *,
+    cleanup: bool = False,
+    final_mismatch: bool | None = None,
 ) -> list[datetime]:
     """Отмеченные для перекачки прошедшие дни.
 
@@ -203,6 +207,9 @@ def refresh_days(
       кроме ``final_mismatch`` (SPEC-0006) — она окном не ограничена.
     * ``cleanup=True`` — только отметки ``dealer_cleanup`` без ограничения
       окном (SPEC-0002 G-4), от новых дней к старым.
+    * ``final_mismatch`` (только при ``cleanup=False``): ``None`` — все отметки,
+      ``False`` — без ``final_mismatch`` (старт процесса: стрим не ждёт перекачки
+      сотен дней), ``True`` — только ``final_mismatch`` (фоновый проход).
     """
     today = _utc_today()
     window_start = (today - timedelta(days=config.history_check_days - 1)).strftime("%Y-%m-%d")
@@ -211,6 +218,8 @@ def refresh_days(
     for day_str, reason in sorted(repo.days_to_refresh().items(), reverse=cleanup):
         is_cleanup = reason == REFRESH_DEALER_CLEANUP
         if is_cleanup != cleanup or day_str >= today_str:
+            continue
+        if final_mismatch is not None and (reason == REFRESH_FINAL_MISMATCH) != final_mismatch:
             continue
         if not cleanup and day_str < window_start and reason != REFRESH_FINAL_MISMATCH:
             logger.warning(
@@ -701,6 +710,7 @@ async def run_backfill(
     gate: _RateGate | None = None,
     lock: asyncio.Lock | None = None,
     cleanup: bool = False,
+    final_mismatch: bool | None = None,
 ) -> None:
     """Догружает отсутствующие и перекачивает отмеченные дни всех инструментов, с троттлингом.
 
@@ -778,11 +788,11 @@ async def run_backfill(
         for instrument in config.instruments:
             repo = repos[instrument.storage_name]
             figi = current_figi(instrument, share_figis, futures, today.date())
-            missing = [] if cleanup else missing_days(config, repo)
+            missing = [] if cleanup or final_mismatch else missing_days(config, repo)
             missing_set = {d.strftime("%Y-%m-%d") for d in missing}
             refresh = [
                 d
-                for d in refresh_days(config, repo, cleanup=cleanup)
+                for d in refresh_days(config, repo, cleanup=cleanup, final_mismatch=final_mismatch)
                 if d.strftime("%Y-%m-%d") not in missing_set
             ]
             for day in missing:

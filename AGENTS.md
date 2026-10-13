@@ -5,7 +5,7 @@ Python 3.11+ project; src-layout package `cluster_source`. Realtime T-Investment
 ## Commands (run from repo root)
 
 - Install: `pip install -e ".[dev]"` (dev includes SDK extra; the SDK `t-tech-investments` may be unavailable on PyPI in some networks — base install works without it).
-- Test: `pytest -q` (asyncio auto-mode; 162 tests).
+- Test: `pytest -q` (asyncio auto-mode; 163 tests).
 - Lint/format: `ruff check . && ruff format .`
 - Typecheck: `mypy src/` (strict, python 3.13).
 - Run: `cluster-source` or `.venv/bin/python -m cluster_source.main`.

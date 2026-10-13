@@ -51,7 +51,7 @@ flowchart TD
 | `compromised` | — (устарела, SPEC-0005) | Ставилась при разрыве числовых `trade_id`; может встречаться в старых отметках |
 | `partial_backfill` | догрузка | Сегодняшний день записан из `GetLastTrades` |
 | `dealer_cleanup` | `schedule_dealer_cleanup` (однократно) | День сохранён до введения биржевого фильтра (SPEC-0002 G-4) |
-| `final_mismatch` | ночная проверка FINAL | День не совпал с эталоном биржи (SPEC-0006); окном `history_check_days` не ограничена |
+| `final_mismatch` | ночная проверка FINAL | День не совпал с эталоном биржи (SPEC-0006); окном `history_check_days` не ограничена; при старте процесса перекачивается в фоне, после открытия стрима |
 
 `refresh_days(config, repo)` возвращает отмеченные дни раньше сегодняшнего
 внутри окна `history_check_days`, кроме отметок `dealer_cleanup`;

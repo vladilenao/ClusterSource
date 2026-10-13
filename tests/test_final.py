@@ -275,3 +275,23 @@ def test_final_mismatch_mark_not_limited_by_window(cfg: AppConfig, repos: Any) -
     days = [d.strftime("%Y-%m-%d") for d in refresh_days(cfg, repo)]
     assert days == [old]
     assert repo.days_to_refresh() == {old: REFRESH_FINAL_MISMATCH}
+
+
+def test_startup_skips_final_mismatch_days(cfg: AppConfig, repos: Any) -> None:
+    """SPEC-0006: при старте дни final_mismatch не перекачиваются (стрим не ждёт),
+    фоновый проход берёт только их, ночью — все."""
+    from cluster_source.autoload import refresh_days
+
+    repo = repos["GAZP"]
+    today = datetime.now(UTC)
+    recent = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+    old = (today - timedelta(days=60)).strftime("%Y-%m-%d")
+    repo.mark_days_for_refresh([recent], "stream_gap")
+    repo.mark_days_for_refresh([old], REFRESH_FINAL_MISMATCH)
+
+    def picked(**kw: Any) -> list[str]:
+        return [d.strftime("%Y-%m-%d") for d in refresh_days(cfg, repo, **kw)]
+
+    assert picked(final_mismatch=False) == [recent]  # старт
+    assert picked(final_mismatch=True) == [old]  # фоновый проход после старта
+    assert picked() == [old, recent]  # ночь
