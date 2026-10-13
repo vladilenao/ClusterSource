@@ -254,7 +254,7 @@ CREATE TABLE IF NOT EXISTS day_verdicts (
     ours_volume  REAL NOT NULL,     -- в единицах эталона (акции — штуки)
     ref_volume   REAL NOT NULL,
     reference    TEXT NOT NULL,     -- iss_totals | iss_tape | none
-    detail       TEXT NOT NULL,
+    detail       TEXT NOT NULL,     -- справка; префикс archive_exhausted — перекачка не помогла
     checked_at   TEXT NOT NULL
 );
 ```

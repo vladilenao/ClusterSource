@@ -138,7 +138,7 @@ if state["state"] != "OK" or not bad.empty:
 
 | Функция | Возвращает |
 |---------|------------|
-| `get_day_verdicts(repo)` | Вердикты торговых дней: `FINAL` / `ARCHIVE_CONSISTENT` / `MISMATCH` / `UNVERIFIABLE`, наши и эталонные число сделок и объём, эталон (`iss_totals` / `iss_tape`) |
+| `get_day_verdicts(repo)` | Вердикты торговых дней: `FINAL` / `ARCHIVE_CONSISTENT` / `MISMATCH` / `UNVERIFIABLE`, наши и эталонные число сделок и объём, эталон (`iss_totals` / `iss_tape`), справка `detail` (префикс `archive_exhausted` — день не исправить перекачкой) |
 | `get_final_days(repo)` | Торговые дни `FINAL` — доказанно совпадают с эталоном биржи |
 | `get_baseline_days(repo, n=20, allow_archive=True)` | Окно для норм (RVOL, перцентили, профили): последние `n` дней `FINAL`, при нехватке — добор `ARCHIVE_CONSISTENT`; `[(день, статус)]` |
 | `baseline_quality(days)` | `pure` — все дни окна `FINAL`; `mixed` — есть архивные; `empty` — дней нет |

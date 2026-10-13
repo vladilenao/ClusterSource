@@ -12,6 +12,7 @@ import pytest
 from cluster_source.config import AppConfig, FuturesMeta, Instrument, InstrumentType
 from cluster_source.database import IssTapeRepository, MarketDataRepository
 from cluster_source.final import (
+    ARCHIVE_EXHAUSTED,
     REFRESH_FINAL_MISMATCH,
     STATUS_ARCHIVE_CONSISTENT,
     STATUS_FINAL,
@@ -295,3 +296,54 @@ def test_startup_skips_final_mismatch_days(cfg: AppConfig, repos: Any) -> None:
     assert picked(final_mismatch=False) == [recent]  # старт
     assert picked(final_mismatch=True) == [old]  # фоновый проход после старта
     assert picked() == [old, recent]  # ночь
+
+
+async def test_archive_exhausted_stops_refresh(
+    cfg: AppConfig, repos: Any, iss: IssTapeRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SPEC-0006 A-10 (G-5): перекачка не изменила день → archive_exhausted, без отметки."""
+    d = date(2026, 10, 13)
+    repo = repos["GAZP"]
+    repo.insert_ticks(ticks("GAZP", d, 4))
+    fake = FakeIss({("shares", d.isoformat()): {"GAZP": (5, 50.0)}})
+    await check(cfg, repos, iss, fake)  # ночь 1: MISMATCH, отметка
+    repo.clear_refresh_mark(d.isoformat())  # перекачка прошла, данные те же
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        await check(cfg, repos, iss, fake)  # ночь 2
+    df = get_day_verdicts(repo)
+    assert status_of(repo, "2026-10-13") == STATUS_MISMATCH
+    assert str(df["detail"].iloc[0]).startswith(ARCHIVE_EXHAUSTED)
+    assert "DAY_ARCHIVE_EXHAUSTED GAZP 2026-10-13" in caplog.text
+    assert "DAY_NOT_FINAL GAZP 2026-10-13" not in caplog.text
+    assert repo.days_to_refresh() == {}
+    assert get_baseline_days(repo) == []
+
+    caplog.clear()  # ночь 3: молча, вердикт не переписан
+    with caplog.at_level(logging.ERROR):
+        stats = await check(cfg, repos, iss, fake)
+    assert not stats and "GAZP" not in caplog.text
+    assert list(get_day_verdicts(repo)["checked_at"]) == list(df["checked_at"])
+
+    repo.insert_ticks(ticks("GAZP", d, 1))  # данные изменились (ручная перекачка)
+    with caplog.at_level(logging.ERROR):
+        await check(cfg, repos, iss, fake)
+    assert status_of(repo, "2026-10-13") == STATUS_FINAL
+    assert get_final_days(repo) == [d]
+
+
+async def test_not_exhausted_while_refresh_pending(
+    cfg: AppConfig, repos: Any, iss: IssTapeRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SPEC-0006 A-10 (G-5): перекачка не состоялась (отметка осталась) — не исчерпан."""
+    d = date(2026, 10, 13)
+    repo = repos["GAZP"]
+    repo.insert_ticks(ticks("GAZP", d, 4))
+    fake = FakeIss({("shares", d.isoformat()): {"GAZP": (5, 50.0)}})
+    await check(cfg, repos, iss, fake)
+    with caplog.at_level(logging.ERROR):
+        await check(cfg, repos, iss, fake)  # отметка final_mismatch не снята
+    assert "DAY_ARCHIVE_EXHAUSTED" not in caplog.text
+    assert "DAY_NOT_FINAL GAZP 2026-10-13" in caplog.text
+    assert not str(get_day_verdicts(repo)["detail"].iloc[0]).startswith(ARCHIVE_EXHAUSTED)
+    assert repo.days_to_refresh() == {"2026-10-13": REFRESH_FINAL_MISMATCH}

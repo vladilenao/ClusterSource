@@ -18,6 +18,7 @@ import logging
 from collections import Counter
 from collections.abc import Mapping
 from datetime import date, timedelta
+from typing import Any
 
 from cluster_source.autoload import REFRESH_FINAL_MISMATCH
 from cluster_source.config import (
@@ -42,6 +43,8 @@ STATUS_ARCHIVE_CONSISTENT = "ARCHIVE_CONSISTENT"
 SETTLED = frozenset({STATUS_FINAL, STATUS_ARCHIVE_CONSISTENT})
 #: Максимальная доля сделок FORTS вне анонимной ленты (исследование: до 0,76%).
 FORTS_OUTSIDE_TAPE_MAX_SHARE = 0.01
+#: Префикс ``detail`` дня, который перекачка из архива не изменила (G-5).
+ARCHIVE_EXHAUSTED = "archive_exhausted"
 
 BOARDS = {"shares": "TQBR", "forts": "RFUD"}
 #: Итоги за дату точно опубликованы через столько суток: пустой ответ — неторговая дата.
@@ -164,6 +167,8 @@ async def _check_instrument(
     market = market_of(inst)
     done = await asyncio.to_thread(repo.day_verdicts)
     final_days = set(done.loc[done["status"].isin(SETTLED), "trade_date"])
+    previous = {str(row.trade_date): row for row in done.itertuples(index=False)}
+    marks = await asyncio.to_thread(repo.days_to_refresh)
     for trade_date, span in spans.items():
         if trade_date.isoformat() in final_days:
             continue
@@ -185,14 +190,35 @@ async def _check_instrument(
             )
         if status is None:
             continue
+        span_days = [d.isoformat() for d in span]
+        exhausted = False
+        prev = previous.get(trade_date.isoformat())
+        if status == STATUS_MISMATCH and prev is not None and _same_verdict(prev, ours, ref):
+            if str(prev.detail).startswith(ARCHIVE_EXHAUSTED):
+                continue  # SPEC-0006 G-5: уже признан исчерпанным, данные не менялись
+            # Перекачка прошла (отметок нет) и ничего не изменила (SPEC-0006 G-5).
+            exhausted = not any(day in marks for day in span_days)
+            if exhausted:
+                detail = f"{ARCHIVE_EXHAUSTED}: перекачка из архива не изменила день; {detail}"
         await asyncio.to_thread(
             repo.set_day_verdict, trade_date.isoformat(), status, ours, ref, reference, detail
         )
         stats[status] += 1
-        span_days = [d.isoformat() for d in span]
         if status in SETTLED:  # перекачка из архива ничего не улучшит
             for day_str in span_days:
                 await asyncio.to_thread(repo.clear_refresh_mark, day_str)
+        elif exhausted:
+            logger.error(
+                "DAY_ARCHIVE_EXHAUSTED %s %s: перекачка из архива не изменила день"
+                " (у нас %d сделок / %.0f, эталон %d / %.0f) — остаётся MISMATCH,"
+                " больше не перекачивается",
+                inst.storage_name,
+                trade_date,
+                ours[0],
+                ours[1],
+                ref[0],
+                ref[1],
+            )
         elif status == STATUS_MISMATCH:
             logger.error(
                 "DAY_NOT_FINAL %s %s: у нас %d сделок / %.0f, эталон %d / %.0f (%s)",
@@ -219,6 +245,21 @@ async def _check_instrument(
             stats[STATUS_UNVERIFIABLE],
         )
     return stats
+
+
+def _same_verdict(prev: Any, ours: tuple[int, float], ref: tuple[int, float]) -> bool:
+    """Прошлый вердикт дня — ``MISMATCH`` с теми же числами (наши и эталон)."""
+
+    def close(a: float, b: float) -> bool:
+        return abs(a - b) <= _VOLUME_EPS * max(1.0, abs(b))
+
+    return (
+        prev.status == STATUS_MISMATCH
+        and int(prev.ours_n) == ours[0]
+        and int(prev.ref_n) == ref[0]
+        and close(float(prev.ours_volume), ours[1])
+        and close(float(prev.ref_volume), ref[1])
+    )
 
 
 async def _forts_verdict(
