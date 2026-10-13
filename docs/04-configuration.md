@@ -33,6 +33,7 @@ check-jsonschema --schemafile docs/contracts/schemas/config.schema.json config.y
 | `history_check_days` | integer ≥ 1 | `14` | `history_check_days` | догрузка | Окно в днях (включая сегодняшний) для догрузки отсутствующих и перекачки отмеченных дней; более старые отметки снимаются |
 | `iss.enabled` | boolean | `true` | `iss.enabled` | `amain` | Собирать ленту Мосбиржи из ISS ([SPEC-0003](specs/0003-iss-collection.md)) |
 | `iss.poll_interval_sec` | number | `60` | `iss.poll_interval_sec` | `IssCollector` | Пауза между циклами догонки ленты, с |
+| `keep_awake` | boolean | `true` | `keep_awake` | `main` | macOS: запрещать сон по простою, пока работает процесс (`caffeinate -i -w PID`, [SPEC-0010](specs/0010-keep-awake.md)) |
 | `tickers` | array | `[]` | `instruments` | все компоненты | Список инструментов (4.3) |
 
 ## 4.3. Элемент `tickers[]`

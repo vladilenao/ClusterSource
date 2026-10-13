@@ -5,7 +5,7 @@ Python 3.11+ project; src-layout package `cluster_source`. Realtime T-Investment
 ## Commands (run from repo root)
 
 - Install: `pip install -e ".[dev]"` (dev includes SDK extra; the SDK `t-tech-investments` may be unavailable on PyPI in some networks — base install works without it).
-- Test: `pytest -q` (asyncio auto-mode; 124 tests).
+- Test: `pytest -q` (asyncio auto-mode; 130 tests).
 - Lint/format: `ruff check . && ruff format .`
 - Typecheck: `mypy src/` (strict, python 3.13).
 - Run: `cluster-source` or `.venv/bin/python -m cluster_source.main`.
@@ -41,6 +41,7 @@ Run order after changes: `ruff check` → `mypy src/` → `pytest -q`.
 - All timestamps are UTC. Never write naive datetimes; `_iso()` tz-normalizes and always writes microseconds. Parse timestamp strings with `format="ISO8601"` (legacy rows lack the fraction; without it pandas fails or, with `errors="coerce"`, silently drops rows).
 - Directions are normalized by `config.parse_direction`: BUY / SELL / UNKNOWN (UNSPECIFIED or missing → UNKNOWN, never SELL/BUY).
 - `t-tech-investments` is imported defensively in main.py (`_has_sdk`); the collector/reader/archiver run without the SDK for tests. Do not import SDK in other modules. The package is not on PyPI in some networks — then copy `t_tech/` + `t_tech_investments-*.dist-info` from another venv into `.venv/lib/python3.13/site-packages/` (plus deps: grpcio, protobuf, iprotopy, sentry-sdk, urllib3).
+- **Keep awake (SPEC-0010).** On macOS `main.prevent_idle_sleep` starts `caffeinate -i -w <pid>` (config `keep_awake`, default true): while the Mac sleeps nothing is collected. Lid close still sleeps (L-13).
 - **gRPC DNS:** `main.py` sets `GRPC_DNS_RESOLVER=native` before importing the SDK — the bundled c-ares resolver fails behind the user's VPN/fake-ip DNS ("Could not contact DNS servers"). Keep it (KI-19).
 - **TLS on macOS python.org builds:** the interpreter has no default CA file, and T-Investments endpoints are signed by Russia's Trusted Root CA (present in the macOS keychain, absent from certifi). `autoload._ssl_context()` uses `truststore` (OS trust store) with a certifi fallback — keep verification on, never add `ssl._create_unverified_context`.
 - Mypy strict: row dicts are typed as `dict[str, object]`; conversion helpers `_as_float`/`_as_int` in database.py exist for this.

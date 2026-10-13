@@ -19,6 +19,9 @@ iss:
   enabled: true
   poll_interval_sec: 60
 
+# macOS: prevent idle sleep while the collector runs (SPEC-0010)
+keep_awake: true
+
 # History completeness window (days)
 history_check_days: 32
 

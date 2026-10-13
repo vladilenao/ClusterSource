@@ -72,6 +72,11 @@
         }
       }
     },
+    "keep_awake": {
+      "type": "boolean",
+      "default": true,
+      "description": "macOS: запрещать сон по простою, пока работает процесс (caffeinate -i -w PID), SPEC-0010."
+    },
     "history_check_days": {
       "type": "integer",
       "minimum": 1,

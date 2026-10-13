@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
@@ -469,10 +471,33 @@ async def amain(config: AppConfig) -> int:
     return 0
 
 
+def prevent_idle_sleep(config: AppConfig) -> subprocess.Popen[bytes] | None:
+    """SPEC-0010: на macOS запрещает сон по простою, пока жив этот процесс.
+
+    Пока Mac спит, сбор стоит целиком (2026-10-13: сон 08:08–08:21 МСК).
+    ``caffeinate -i -w <pid>`` держит запрет ровно до выхода процесса, даже
+    при аварийном завершении. Закрытие крышки ноутбука это не отменяет.
+    """
+    if sys.platform != "darwin" or not config.keep_awake:
+        return None
+    binary = shutil.which("caffeinate")
+    if binary is None:
+        logger.warning("caffeinate не найден — Mac может уснуть и остановить сбор")
+        return None
+    try:
+        proc = subprocess.Popen([binary, "-i", "-w", str(os.getpid())])
+    except OSError as exc:
+        logger.warning("Не удалось запретить сон (caffeinate): %s", exc)
+        return None
+    logger.info("Сон по простою запрещён, пока работает процесс (caffeinate, PID %d)", proc.pid)
+    return proc
+
+
 def main() -> int:
     setup_logging()
     config_path = Path("config.local.yaml") if Path("config.local.yaml").exists() else CONFIG_PATH
     config = AppConfig.from_yaml(config_path)
+    prevent_idle_sleep(config)
     if not config.token or config.token == "your-token-here":
         logger.warning(
             "Не задан API-токен — стриминг не заработает. "

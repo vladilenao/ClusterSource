@@ -172,6 +172,8 @@ class AppConfig:
     batch: BatchConfig = field(default_factory=BatchConfig)
     archiver: ArchiverConfig = field(default_factory=ArchiverConfig)
     iss: IssConfig = field(default_factory=IssConfig)
+    #: SPEC-0010: на macOS не давать системе засыпать по простою, пока жив процесс.
+    keep_awake: bool = True
     history_check_days: int = 14
     instruments: list[Instrument] = field(default_factory=list)
 
@@ -222,6 +224,7 @@ class AppConfig:
                 poll_interval_sec=float(iss_raw.get("poll_interval_sec", 60.0)),
             ),
             history_check_days=int(raw.get("history_check_days", 14)),
+            keep_awake=bool(raw.get("keep_awake", True)),
             instruments=instruments,
         )
 
