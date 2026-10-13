@@ -95,6 +95,44 @@ components:
               instruments:
                 - instrument_id: BBG004730N88
 
+    SubscribeInfoRequest:
+      name: MarketDataRequest.subscribe_info_request
+      title: Подписка на торговые статусы (SPEC-0004)
+      summary: >-
+        Отправляется в том же соединении, отдельным сообщением, со всеми FIGI.
+        Сервер сразу присылает текущий статус каждого инструмента; лимита на
+        число таких подписок нет.
+      contentType: application/x-protobuf
+      payload:
+        type: object
+        properties:
+          subscribe_info_request:
+            type: object
+            properties:
+              subscription_action: { type: string, const: SUBSCRIPTION_ACTION_SUBSCRIBE }
+              instruments:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    instrument_id: { type: string, description: FIGI }
+
+    TradingStatusEvent:
+      name: MarketDataResponse.trading_status
+      title: Торговый статус инструмента (SPEC-0004)
+      contentType: application/x-protobuf
+      payload:
+        type: object
+        properties:
+          figi: { type: string }
+          instrument_uid: { type: string }
+          trading_status:
+            type: string
+            description: >-
+              SECURITY_TRADING_STATUS_*; только NORMAL_TRADING (5) включает детектор
+              тишины stream_silence.
+          time: { type: string, format: date-time, description: Время смены статуса. }
+
     TradeEvent:
       name: MarketDataResponse.trade
       title: Сделка

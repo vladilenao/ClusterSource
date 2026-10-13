@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 | Линтер | `ruff check .` | правила `E, F, I, W, UP`, длина строки 100 |
 | Форматирование | `ruff format .` | |
 | Типизация | `mypy src/` | `strict`, `python_version = 3.13` |
-| Тесты | `pytest -q` | `asyncio_mode = auto`, 105 тестов |
+| Тесты | `pytest -q` | `asyncio_mode = auto`, 124 теста |
 
 Порядок проверки после изменений: `ruff check` → `mypy src/` → `pytest -q`.
 
@@ -28,6 +28,7 @@ pip install -e ".[dev]"
 | `tests/test_exchange_only.py` | SPEC-0002: разбор источника сделки, подписка `TRADE_SOURCE_EXCHANGE`, фильтр стрима/архива/`GetLastTrades`, чистка `dealer_cleanup`, удаление дня без биржевых сделок |
 | `tests/test_iss.py` | SPEC-0003: нормализация ленты ISS (время МСК → UTC, сессии выходного дня, FORTS), догонка с неполными и пустыми страницами, смена дня, отсутствие дублей, импорт этапа 1, проверка полноты по `NUMTRADES` |
 | `tests/test_stream_hub.py` | SPEC-0009: одно соединение, раздача сделок по FIGI/UID, переподключение без новой резолюции, экспоненциальная пауза, неподтверждённая подписка, ролловер с резолюцией |
+| `tests/test_quality.py` | SPEC-0004: условия и отметки минут, события `DATA_DEGRADED`/`DATA_RESTORED`, каждый детектор, тишина вне `NORMAL_TRADING`, сохранение консьюмером, функции чтения |
 | `tests/test_reader.py` | Footprint, выбор источника по дню, точные границы интервала, пустой интервал, одинаковые сделки, `UNKNOWN`, округление |
 
 Тесты не требуют SDK и сети: внешние сервисы заменяются duck-typed
@@ -57,6 +58,7 @@ pip install -e ".[dev]"
 | Новое или изменённое поведение | спецификация в [specs/](specs/README.md): статус, приёмка, журнал решений |
 | Ключ `config.yaml` или значение по умолчанию | [04-configuration.md](04-configuration.md), `contracts/schemas/config.schema.json` |
 | Колонка SQLite/Parquet, формат `trade_id` | [03-data-model.md](03-data-model.md), `contracts/schemas/tick.schema.json` |
+| Детекторы, причины, пороги качества | [05 § 5.8](05-realtime-collection.md#58-детекторы-деградации-spec-0004), [08 § 8.3.1](08-footprint-reader.md#831-качество-данных-spec-0004), SPEC-0004 |
 | Колонки результата `get_cluster_data` | [08-footprint-reader.md](08-footprint-reader.md), `contracts/schemas/footprint-row.schema.json` |
 | Лента/итоги ISS, колонки `iss_trades` | [03-data-model.md § 3.7](03-data-model.md#37-лента-мосбиржи-iss), [09](09-external-integrations.md), `contracts/openapi/moex-iss.openapi.yaml` |
 | Вызов внешнего API, URL, поля запроса/ответа | [09-external-integrations.md](09-external-integrations.md), `contracts/openapi/*`, `contracts/asyncapi/*` |

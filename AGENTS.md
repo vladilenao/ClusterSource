@@ -5,7 +5,7 @@ Python 3.11+ project; src-layout package `cluster_source`. Realtime T-Investment
 ## Commands (run from repo root)
 
 - Install: `pip install -e ".[dev]"` (dev includes SDK extra; the SDK `t-tech-investments` may be unavailable on PyPI in some networks — base install works without it).
-- Test: `pytest -q` (asyncio auto-mode; 105 tests).
+- Test: `pytest -q` (asyncio auto-mode; 124 tests).
 - Lint/format: `ruff check . && ruff format .`
 - Typecheck: `mypy src/` (strict, python 3.13).
 - Run: `cluster-source` or `.venv/bin/python -m cluster_source.main`.
@@ -21,6 +21,7 @@ Run order after changes: `ruff check` → `mypy src/` → `pytest -q`.
 - **WAL mode required.** `session()` sets `PRAGMA journal_mode=WAL` — the bot reads while the collector writes. Never drop it.
 - **Graceful shutdown.** `amain` stops the hub, cancels background tasks, then cancels collectors; `DataCollector.run` drains the queue in `finally` on any exit, then re-raises.
 - **Docs.** Human-readable docs live in `docs/` (see `docs/README.md`; contracts in `docs/contracts/`). When behaviour changes, update the matching doc per the table in `docs/11-development.md`.
+- **Degradation detectors (SPEC-0004).** `quality.InstrumentQuality` per collector holds conditions (stream_gap, subscription_failed, stream_silence, latency, backlog, write_failure) and one-off marks (unknown_direction, contract_roll, dealer_leak); minutes go to `degraded_minutes`, transitions to `quality_events` (log `DATA_DEGRADED`/`DATA_RESTORED`), written by the consumer only. Silence counts only during `NORMAL_TRADING` and never before the subscription was confirmed. The robot reads `reader.get_degraded_minutes` / `get_data_state` before any signal.
 - **Specs first.** Every behaviour change starts with a spec in `docs/specs/` (format and registry in `docs/specs/README.md`; no openspec). Implementing code carries `# SPEC-NNNN G-N` at the guarantee, the covering test names the same id; a spec is "Готово" only when every acceptance criterion has a test.
 - **Data guarantees (SPEC-0001).** ClusterSource owns data correctness end-to-end: (G-1) no signal while the data window or instrument is `DEGRADED`/`GAP`; (G-2) every signal gets `SIGNAL_CONFIRMED`/`SIGNAL_REVOKED` within 20 min (unverifiable ⇒ revoked); (G-3) thresholds/baselines use `FINAL` days only. Only exchange trades are stored — dealer trades are filtered at the source (SPEC-0002).
 - **MOEX ISS tape (SPEC-0003).** `iss.IssCollector` (background task in `amain`, `iss.enabled`) pages the market-wide trade feeds of shares and FORTS into `_sqlite/_iss.sqlite3` (`UNIQUE(market, secid, tradeno)`), finalizes each ISS day to `_iss/{market}/{feed_date}.parquet` on feed change, marks a feed not caught up before the change `ISS_FEED_INCOMPLETE`, and hourly verifies trading days against ISS `NUMTRADES` (`ISS_DAY_VERIFIED` / `ISS_DAY_INCOMPLETE`). Free ISS serves only the current day: never delete `_iss*` data. Page the feed by cursor (`tradeno` for shares, `recno` for FORTS, `next_trade=1`) — never `start` (deprecated; deep offsets return empty pages). `previous_session=1` returns only the start of the previous FORTS session — never treat it as day recovery. Trade time: date from SYSTIME if recorded promptly, else TRADEDATE (FORTS weekend trades arrive Monday 06:00); trading day = TRADE_SESSION_DATE. Stage-1 script `scripts/iss_raw_dump.py` (launchd `local.clustersource.iss-raw-dump`) stays until the service runs this code; its raw files are imported automatically — removal steps in docs/10-operations.md § 10.4.1.
@@ -56,6 +57,7 @@ Run order after changes: `ruff check` → `mypy src/` → `pytest -q`.
 - `autoload.py` — backfill + re-download of marked days; official history-trades archive (`history-trades`, gzip CSV) for past days + `GetLastTrades` for today; REST/legacy CSV parser kept as fallback.
 - `archiver.py` — archival + purge guard; `DataArchiver`, `seconds_until_next_run`.
 - `reader.py` — `get_cluster_data()` footprint (pandas groupby, tick rounding).
+- `quality.py` — degradation conditions and minute marks (`InstrumentQuality`); SPEC-0004.
 - `stream_hub.py` — single T-Invest stream connection for all instruments (`StreamHub`, `HubConnection`); SPEC-0009.
 - `iss.py` — MOEX ISS tape collector (`IssCollector`, `HttpIssClient`, `normalize_trades`); SPEC-0003.
 - `main.py` — entrypoint, signal handling, DI wiring, `run_maintenance`, `run_scheduler`.

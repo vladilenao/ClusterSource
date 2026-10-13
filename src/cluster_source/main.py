@@ -59,7 +59,9 @@ try:  # pragma: no cover - depends on environment
         InstrumentType as _SdkInstrumentType,
     )
     from t_tech.invest.grpc.schemas import (  # type: ignore[import-not-found,unused-ignore]
+        InfoInstrument,
         MarketDataRequest,
+        SubscribeInfoRequest,
         SubscribeTradesRequest,
         SubscriptionAction,
         TradeInstrument,
@@ -71,7 +73,9 @@ except ImportError:  # pragma: no cover
     AsyncClient = None  # type: ignore[misc,assignment]
     _SdkInstrumentStatus = None  # type: ignore[misc,assignment]
     _SdkInstrumentType = None  # type: ignore[misc,assignment]
+    InfoInstrument = None  # type: ignore[misc,assignment]
     MarketDataRequest = None  # type: ignore[misc,assignment]
+    SubscribeInfoRequest = None  # type: ignore[misc,assignment]
     SubscriptionAction = None  # type: ignore[misc,assignment]
     SubscribeTradesRequest = None  # type: ignore[misc,assignment]
     TradeInstrument = None  # type: ignore[misc,assignment]
@@ -149,6 +153,20 @@ async def _resolve_stream_figi(
             if getattr(item, "class_code", "") == preferred:
                 return str(item.figi)
     return str(ticker_matches[0].figi)
+
+
+def build_info_subscription(figis: list[str]) -> Any:
+    """Подписка того же соединения на торговые статусы (SPEC-0004: детектор тишины).
+
+    Сервер сразу присылает текущий статус каждого инструмента; лимита на число
+    таких подписок нет.
+    """
+    return MarketDataRequest(
+        subscribe_info_request=SubscribeInfoRequest(
+            subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
+            instruments=[InfoInstrument(instrument_id=figi) for figi in figis],
+        )
+    )
 
 
 def build_trades_subscription(figis: list[str]) -> Any:
@@ -258,6 +276,7 @@ def make_connection_factory(config: AppConfig) -> ConnectionFactory:
                 routes[figi] = name
             stream = services.create_market_data_stream()
             stream.subscribe(build_trades_subscription(list(routes)))
+            stream.subscribe(build_info_subscription(list(routes)))
         except BaseException:
             # Иначе при каждом повторе открытия стрима утекал бы gRPC-канал.
             await client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]

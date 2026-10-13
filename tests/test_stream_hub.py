@@ -107,7 +107,8 @@ def fast_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     delays: list[float] = []
 
     async def fake_sleep(delay: float, *args: Any) -> None:
-        delays.append(delay)
+        if delay != stream_hub.WATCHDOG_SEC:  # паузы сторожа SPEC-0004 не считаем
+            delays.append(delay)
         await _REAL_SLEEP(0)
 
     monkeypatch.setattr(stream_hub.asyncio, "sleep", fake_sleep)

@@ -101,6 +101,33 @@ flowchart TD
 | Выбор источника по дню | Если у дня есть Parquet-файл, берётся Parquet, строки SQLite этого дня отбрасываются | Parquet — архивная копия SQLite или перекачанный официальный архив; сделки не учитываются дважды, а реальные одинаковые сделки не схлопываются (дедупликации нет) |
 | Округление | Половина шага — банковское округление (`Series.round`) | `tick_size` из конфигурации |
 
+## 8.3.1. Качество данных ([SPEC-0004](specs/0004-degradation-detectors.md))
+
+Footprint не знает о качестве данных. Перед расчётом сигнала робот ДОЛЖЕН
+проверить окно ([SPEC-0001](specs/0001-data-guarantees.md) G-1):
+
+```python
+from cluster_source.reader import get_data_state, get_degraded_minutes
+
+state = get_data_state(
+    repo
+)  # {"state": "OK"|"DEGRADED"|"UNKNOWN", "reasons": [...], "since": "..."}
+bad = get_degraded_minutes(repo, start, end)  # DataFrame: minute (UTC), reasons
+if state["state"] != "OK" or not bad.empty:
+    ...  # сигнал по окну не выдаётся
+```
+
+| Функция | Возвращает |
+|---------|------------|
+| `get_degraded_minutes(repo, start, end)` | Минуты `DEGRADED` в `[start, end)`: `minute` — начало минуты UTC, `reasons` — причины через запятую. Минут нет в результате — они `PROVISIONAL` |
+| `get_data_state(repo)` | Текущее состояние инструмента: `state` (`OK` / `DEGRADED`; `UNKNOWN` — процесс сбора ещё не сообщал о состоянии), `reasons`, `since` — момент последнего перехода |
+
+Причины: `stream_gap`, `subscription_failed`, `stream_silence`, `latency`,
+`backlog`, `write_failure`, `unknown_direction`, `contract_roll`,
+`dealer_leak` — см. [5.8](05-realtime-collection.md#58-детекторы-деградации-spec-0004).
+Отметки появляются в базе при записи консьюмера, то есть с задержкой не
+больше `flush_interval_sec`.
+
 ## 8.4. Конкурентный доступ
 
 Чтение безопасно во время работы коллектора: SQLite в режиме WAL позволяет

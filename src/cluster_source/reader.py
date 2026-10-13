@@ -94,3 +94,32 @@ def get_cluster_data(
     result["delta"] = result["buy_volume"] - result["sell_volume"]
     result = result.sort_values(["timestamp", "price"]).reset_index(drop=True)
     return result[RESULT_COLUMNS]
+
+
+def get_degraded_minutes(
+    repo: MarketDataRepository, start_time: datetime, end_time: datetime
+) -> pd.DataFrame:
+    """Минуты со статусом ``DEGRADED`` в ``[start_time, end_time)`` (SPEC-0004).
+
+    Колонки: ``minute`` (начало минуты, UTC) и ``reasons`` (причины через
+    запятую). Минуты, которых нет в результате, — ``PROVISIONAL``. Сигнал,
+    в окне которого есть такая минута, выдавать нельзя (SPEC-0001 G-1).
+    """
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=UTC)
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=UTC)
+    return repo.read_degraded_minutes(start_time, end_time)
+
+
+def get_data_state(repo: MarketDataRepository) -> dict[str, object]:
+    """Текущее состояние данных инструмента: ``state`` (``OK`` / ``DEGRADED``),
+    ``reasons`` и ``since`` — момент последнего перехода (SPEC-0004 G-2).
+
+    До первого перехода — ``{"state": "UNKNOWN", ...}``: процесс сбора ещё не
+    сообщал о состоянии инструмента.
+    """
+    state = repo.quality_state()
+    if state is None:
+        return {"state": "UNKNOWN", "reasons": [], "since": None}
+    return state

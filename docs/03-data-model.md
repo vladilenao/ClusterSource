@@ -194,6 +194,24 @@ CREATE TABLE IF NOT EXISTS meta (
 
 `meta` — служебные флаги однократных операций обслуживания.
 
+Качество данных ([SPEC-0004](specs/0004-degradation-detectors.md)):
+
+```sql
+CREATE TABLE IF NOT EXISTS degraded_minutes (
+    minute  TEXT NOT NULL,          -- начало минуты, ISO UTC
+    reason  TEXT NOT NULL,          -- stream_gap | stream_silence | latency | …
+    PRIMARY KEY (minute, reason)
+);
+CREATE TABLE IF NOT EXISTS quality_events (
+    ts       TEXT NOT NULL,         -- момент перехода, ISO UTC
+    state    TEXT NOT NULL,         -- DEGRADED | OK
+    reasons  TEXT NOT NULL          -- активные причины через запятую
+);
+```
+
+Хранятся только минуты с отметками; остальные — `PROVISIONAL`. Последняя
+строка `quality_events` — текущее состояние инструмента.
+
 В хранилище только биржевые сделки
 ([SPEC-0002](specs/0002-exchange-only-trades.md)): источник сделки
 проверяется до записи и отдельной колонкой не хранится.

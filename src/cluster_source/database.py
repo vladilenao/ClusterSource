@@ -97,6 +97,24 @@ class MarketDataRepository:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS degraded_minutes (
+                minute  TEXT NOT NULL,
+                reason  TEXT NOT NULL,
+                PRIMARY KEY (minute, reason)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quality_events (
+                ts       TEXT NOT NULL,
+                state    TEXT NOT NULL,
+                reasons  TEXT NOT NULL
+            )
+            """
+        )
 
     # ------------------------------------------------------------------ #
     # Запись в горячее хранилище (SQLite) — батчами
@@ -269,6 +287,66 @@ class MarketDataRepository:
         with self.session() as conn:
             conn.execute("DELETE FROM days_to_refresh WHERE day = ?", (day,))
             conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # Качество данных (SPEC-0004)
+    # ------------------------------------------------------------------ #
+    def save_quality(
+        self, minutes: Sequence[tuple[str, str]], events: Sequence[tuple[str, str, str]]
+    ) -> None:
+        """Сохраняет отметки минут ``(минута, причина)`` и переходы состояния одной транзакцией."""
+        if not minutes and not events:
+            return
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO degraded_minutes (minute, reason) VALUES (?, ?)",
+                    list(minutes),
+                )
+                conn.executemany(
+                    "INSERT INTO quality_events (ts, state, reasons) VALUES (?, ?, ?)",
+                    list(events),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def read_degraded_minutes(self, start: datetime, end: datetime) -> pd.DataFrame:
+        """Минуты ``DEGRADED`` в ``[start, end)``: колонки ``minute`` (UTC), ``reasons``."""
+        start, end = self._as_utc(start), self._as_utc(end)
+        with self.session() as conn:
+            rows = conn.execute(
+                "SELECT minute, group_concat(reason, ',') FROM degraded_minutes"
+                " WHERE minute >= ? AND minute < ? GROUP BY minute ORDER BY minute",
+                (start.replace(second=0, microsecond=0).isoformat(), end.isoformat()),
+            ).fetchall()
+        df = pd.DataFrame(rows, columns=["minute", "reasons"])
+        df["minute"] = pd.to_datetime(df["minute"], utc=True, format="ISO8601")
+        return df
+
+    def quality_state(self) -> dict[str, object] | None:
+        """Текущее состояние инструмента — последняя строка журнала ``quality_events``."""
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT ts, state, reasons FROM quality_events ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {"since": row[0], "state": row[1], "reasons": [r for r in row[2].split(",") if r]}
+
+    def last_tick_time(self) -> datetime | None:
+        """Время последней сделки в горячем хранилище (UTC) или ``None``."""
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT MAX(timestamp) FROM ticks_hot_store WHERE ticker = ?",
+                (self.instrument.storage_name,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        moment: datetime = pd.to_datetime(row[0], utc=True, format="ISO8601").to_pydatetime()
+        return moment
 
     # ------------------------------------------------------------------ #
     # Служебные флаги (однократные операции обслуживания)
