@@ -61,7 +61,7 @@
     },
     "trade_id": {
       "type": "string",
-      "description": "Идентификатор сделки. Числовой — от легаси SDK; синтетический 's{YYYYmmddHHMMSSffffff}' — из стрима t-tech-investments; 's{YYYYmmddHHMMSSffffff}_{idx}' — из архива history-trades; пустая строка допустима для GetLastTrades. Уникальность не гарантируется.",
+      "description": "Идентификатор сделки. Числовой — от легаси SDK; синтетический 's{YYYYmmddHHMMSSffffff}' — из стрима t-tech-investments; 's{YYYYmmddHHMMSSffffff}_{idx}' — из архива history-trades; пустая строка допустима для GetLastTrades. Уникальность не гарантируется. У строк, дозалитых из ISS, — 'x{TRADENO}'.",
       "anyOf": [
         {
           "pattern": "^\\d+$"
@@ -81,6 +81,23 @@
         "s20260904100000123456",
         "s20260904035935341871_0"
       ]
+    },
+    "origin": {
+      "type": "string",
+      "enum": [
+        "stream",
+        "iss",
+        "archive"
+      ],
+      "default": "stream",
+      "description": "Источник строки (SPEC-0005): stream — стрим T-Invest (и GetLastTrades), iss — дозаливка из ленты Мосбиржи при сверке, archive — архив history-trades."
+    },
+    "exchange_trade_no": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Биржевой номер сделки TRADENO (SPEC-0005): проставляется сверкой с лентой ISS; null — минута ещё не сверена или строка из архива."
     }
   }
 }

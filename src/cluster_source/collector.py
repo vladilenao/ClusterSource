@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 
 CONSUMER_DRAIN_TIMEOUT = 30.0
 
-#: Причины отметки дня для перекачки из официального архива.
-REFRESH_COMPROMISED = "compromised"
+#: Причина отметки дня для перекачки из официального архива. Причина
+#: ``compromised`` (разрыв числовых ``trade_id``) больше не ставится — SPEC-0005 G-4.
 REFRESH_STREAM_GAP = "stream_gap"
 
 #: Отброшенная дилерская сделка логируется первой и далее каждой N-й.
@@ -127,9 +127,9 @@ def _to_dto(
     direction = parse_direction(getattr(trade, "direction", ""))
     trade_id = str(getattr(trade, "trade_id", "") or getattr(trade, "tradeId", "") or "")
     if not trade_id:
-        # Публичный стрим сделок t-tech-investments не содержит
-        # последовательного trade id; синтезируем монотонный нечисловой id,
-        # чтобы числовая проверка пропусков в _flag_gap безопасно пропускалась.
+        # Публичный стрим сделок t-tech-investments не содержит trade id;
+        # синтезируем нечисловой id. Биржевой номер сделки проставляет сверка
+        # с ISS в ``exchange_trade_no`` (SPEC-0005).
         trade_id = f"s{timestamp.strftime('%Y%m%d%H%M%S%f')}"
 
     return Tick(
@@ -162,7 +162,6 @@ class DataCollector:
         self._stopped = asyncio.Event()
         #: Дни, которые нужно перекачать: {YYYY-MM-DD: причина}. Пишет в БД консьюмер.
         self._pending_marks: dict[str, str] = {}
-        self._prev_ids: list[str] = []
         self._dealer_dropped = 0
         #: SPEC-0004: условия деградации и отметки минут; пишет в БД консьюмер.
         self.quality = InstrumentQuality(instrument.storage_name)
@@ -180,11 +179,9 @@ class DataCollector:
     def on_stream_opened(self) -> None:
         """Стрим (пере)открыт: сделки до этого момента не получены.
 
-        День отмечается ``stream_gap`` и будет перекачан из архива; контроль
-        непрерывности ``trade_id`` начинается заново.
+        День отмечается ``stream_gap`` и будет перекачан из архива.
         """
         self._mark_day(self._now().strftime("%Y-%m-%d"), REFRESH_STREAM_GAP)
-        self._prev_ids = []
 
     def last_stored_tick_time(self) -> datetime | None:
         """Время последней сохранённой сделки (блокирующий вызов — через ``to_thread``)."""
@@ -200,7 +197,6 @@ class DataCollector:
             self._drop_non_exchange(payload)
             return
         tick = _to_dto(payload, self._instrument)
-        self._flag_gap(tick, self._prev_ids)
         self._observe(tick)
         if self._queue.qsize() >= BACKLOG_HIGH:
             self.quality.begin(REASON_BACKLOG, self._now(), self._now())
@@ -292,30 +288,6 @@ class DataCollector:
 
     def _mark_day(self, day: str, reason: str) -> None:
         self._pending_marks.setdefault(day, reason)
-
-    def _flag_gap(self, tick: Tick, prev_ids: list[str]) -> None:
-        if not tick.trade_id or not prev_ids:
-            prev_ids.append(tick.trade_id)
-            return
-        try:
-            prev = int(prev_ids[-1])
-            cur = int(tick.trade_id)
-        except (TypeError, ValueError):
-            prev_ids.append(tick.trade_id)
-            return
-        if cur > prev + 1:
-            day = tick.timestamp.strftime("%Y-%m-%d")
-            logger.warning(
-                "TRADE_ID GAP по %s (%s): ожидалось около %d, получено %d"
-                " — день %s помечен COMPROMISED",
-                self._instrument.id,
-                tick.ticker,
-                prev + 1,
-                cur,
-                day,
-            )
-            self._mark_day(day, REFRESH_COMPROMISED)
-        prev_ids.append(tick.trade_id)
 
     async def _consumer(self) -> None:
         """Пишет тики пакетами: при ``batch_size`` тиков или раз в ``flush_interval_sec``.

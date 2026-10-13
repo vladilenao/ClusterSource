@@ -28,6 +28,8 @@ from cluster_source.collector import DataCollector, InstrumentNotFound
 from cluster_source.config import AppConfig, Instrument, InstrumentType, nearest_contract
 from cluster_source.database import IssTapeRepository, MarketDataRepository
 from cluster_source.iss import IssCollector
+from cluster_source.quality import REASON_BACKLOG, REASON_WRITE_FAILURE
+from cluster_source.reconcile import Reconciler
 from cluster_source.stream_hub import (
     MAX_SUBSCRIPTIONS_PER_STREAM,
     ConnectionFactory,
@@ -104,8 +106,11 @@ def setup_logging() -> None:
 
 async def _resolve_stream_figi(
     client: Any, instrument: Instrument, futures: list[Any] | None = None
-) -> str:
-    """Разрешает FIGI, на который подписывается стрим для инструмента.
+) -> tuple[str, str]:
+    """Разрешает FIGI, на который подписывается стрим, и тикер бумаги на бирже.
+
+    Тикер нужен сверке с лентой ISS (SPEC-0005): у непрерывного фьючерса это
+    тикер активного контракта, у остальных — ``id`` инструмента.
 
     Для ``continuous_futures`` (например, ``Si``) через сервис инструментов
     находится ближайший к истечению активный контракт, чтобы мы всегда
@@ -133,11 +138,11 @@ async def _resolve_stream_figi(
                 active.ticker,
                 active.expiration,
             )
-            return active.figi
+            return active.figi, active.ticker
         matches = [f for f in futures if f.ticker == instrument.id]
         if not matches:
             raise InstrumentNotFound(f"Фьючерсный контракт не найден: {instrument.id}")
-        return str(matches[0].figi)
+        return str(matches[0].figi), instrument.id
 
     share = await instruments_service.find_instrument(
         query=instrument.id,
@@ -153,8 +158,8 @@ async def _resolve_stream_figi(
     for preferred in ("TQBR", "SPBXM"):
         for item in ticker_matches:
             if getattr(item, "class_code", "") == preferred:
-                return str(item.figi)
-    return str(ticker_matches[0].figi)
+                return str(item.figi), instrument.id
+    return str(ticker_matches[0].figi), instrument.id
 
 
 def build_info_subscription(figis: list[str]) -> Any:
@@ -189,8 +194,8 @@ def build_trades_subscription(figis: list[str]) -> Any:
 
 async def _resolve_figis(
     services: Any, instruments: list[Instrument]
-) -> tuple[dict[str, str], list[str]]:
-    """FIGI всех инструментов ``{storage_name: figi}`` и список ненайденных.
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """FIGI ``{storage_name: figi}``, биржевые тикеры ``{storage_name: ticker}`` и ненайденные.
 
     Справочник фьючерсов запрашивается один раз на все инструменты.
     """
@@ -201,16 +206,18 @@ async def _resolve_figis(
         )
         futures = list(response.instruments)
     resolved: dict[str, str] = {}
+    tickers: dict[str, str] = {}
     not_found: list[str] = []
     for instrument in instruments:
         try:
-            resolved[instrument.storage_name] = await _resolve_stream_figi(
-                services, instrument, futures
-            )
+            figi, ticker = await _resolve_stream_figi(services, instrument, futures)
         except InstrumentNotFound as exc:
             logger.warning("%s", exc)
             not_found.append(instrument.storage_name)
-    return resolved, not_found
+            continue
+        resolved[instrument.storage_name] = figi
+        tickers[instrument.storage_name] = ticker
+    return resolved, tickers, not_found
 
 
 async def _log_stream_limits(services: Any) -> None:
@@ -237,6 +244,7 @@ def make_connection_factory(config: AppConfig) -> ConnectionFactory:
     ``resolve=True`` (старт, ролловер непрерывных фьючерсов) — G-4.
     """
     figis: dict[str, str] = {}
+    tickers: dict[str, str] = {}
     not_found: list[str] = []
     limits_logged = False
 
@@ -253,9 +261,13 @@ def make_connection_factory(config: AppConfig) -> ConnectionFactory:
                 await _log_stream_limits(services)
                 limits_logged = True
             if resolve or not figis:
-                resolved, missing = await _resolve_figis(services, list(instruments))
+                resolved, resolved_tickers, missing = await _resolve_figis(
+                    services, list(instruments)
+                )
                 figis.clear()
                 figis.update(resolved)
+                tickers.clear()
+                tickers.update(resolved_tickers)
                 not_found[:] = missing
             if not figis:
                 raise RuntimeError("ни один инструмент не разрешён в FIGI")
@@ -291,7 +303,11 @@ def make_connection_factory(config: AppConfig) -> ConnectionFactory:
                 await client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
 
         return HubConnection(
-            stream=stream, routes=routes, teardown=teardown, not_found=list(not_found)
+            stream=stream,
+            routes=routes,
+            teardown=teardown,
+            not_found=list(not_found),
+            tickers=dict(tickers),
         )
 
     return factory
@@ -450,8 +466,24 @@ async def amain(config: AppConfig) -> int:
     background = [hub_task, scheduler_task, cleanup_task]
     if config.iss.enabled:
         # SPEC-0003: лента Мосбиржи — источник номеров сделок и ОИ по сделкам.
-        iss_collector = IssCollector(config, IssTapeRepository(config.storage_root))
+        iss_repo = IssTapeRepository(config.storage_root)
+        iss_collector = IssCollector(config, iss_repo)
         background.append(asyncio.create_task(iss_collector.run()))
+        # SPEC-0005: сверка стрима с лентой ISS и дозаливка.
+        by_name = {c.instrument.storage_name: c for c in collectors}
+
+        def blocked(name: str) -> bool:
+            quality = by_name[name].quality
+            return quality.is_active(REASON_BACKLOG) or quality.is_active(REASON_WRITE_FAILURE)
+
+        reconciler = Reconciler(
+            config,
+            repos,
+            iss_repo,
+            lambda instrument: hub.tickers.get(instrument.storage_name),
+            is_blocked=blocked,
+        )
+        background.append(asyncio.create_task(reconciler.run()))
 
     try:
         await stop_event.wait()

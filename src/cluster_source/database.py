@@ -23,6 +23,14 @@ from cluster_source.config import Instrument
 logger = logging.getLogger(__name__)
 
 HOT_RETENTION_DAYS = 7
+#: Ключ курсора сверки с ISS в ``meta`` (SPEC-0005).
+RECON_CURSOR_KEY = "recon_verified_until"
+
+
+def _opt_int(value: object) -> int | None:
+    if value is None or (isinstance(value, float) and value != value):  # NaN из pandas
+        return None
+    return int(str(value)) if not isinstance(value, int | float) else int(value)
 
 
 class DataCorruptionError(RuntimeError):
@@ -79,6 +87,26 @@ class MarketDataRepository:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ticks_ticker_ts ON ticks_hot_store (ticker, timestamp)"
+        )
+        # SPEC-0005: источник строки и биржевой номер сделки (миграция старых баз).
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(ticks_hot_store)")}
+        if "origin" not in columns:
+            conn.execute(
+                "ALTER TABLE ticks_hot_store ADD COLUMN origin TEXT NOT NULL DEFAULT 'stream'"
+            )
+        if "exchange_trade_no" not in columns:
+            conn.execute("ALTER TABLE ticks_hot_store ADD COLUMN exchange_trade_no INTEGER")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS minute_verdicts (
+                minute    TEXT PRIMARY KEY,
+                status    TEXT NOT NULL,
+                stream_n  INTEGER NOT NULL,
+                iss_n     INTEGER NOT NULL,
+                repaired  INTEGER NOT NULL,
+                detail    TEXT NOT NULL
+            )
+            """
         )
         conn.execute(
             """
@@ -159,8 +187,8 @@ class MarketDataRepository:
         conn.executemany(
             """
             INSERT INTO ticks_hot_store
-                (ticker, timestamp, price, volume, direction, trade_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (ticker, timestamp, price, volume, direction, trade_id, origin, exchange_trade_no)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -170,6 +198,8 @@ class MarketDataRepository:
                     self._as_int(r["volume"]),
                     r["direction"],
                     str(r["trade_id"]),
+                    str(r.get("origin") or "stream"),
+                    _opt_int(r.get("exchange_trade_no")),
                 )
                 for r in rows
             ],
@@ -204,7 +234,8 @@ class MarketDataRepository:
         with self.session() as conn:
             df = pd.read_sql_query(
                 """
-                SELECT ticker, timestamp, price, volume, direction, trade_id
+                SELECT ticker, timestamp, price, volume, direction, trade_id,
+                       origin, exchange_trade_no
                 FROM ticks_hot_store
                 WHERE ticker = ?
                   AND timestamp >= ? AND timestamp < ?
@@ -287,6 +318,85 @@ class MarketDataRepository:
         with self.session() as conn:
             conn.execute("DELETE FROM days_to_refresh WHERE day = ?", (day,))
             conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # Сверка с лентой ISS (SPEC-0005)
+    # ------------------------------------------------------------------ #
+    def read_ticks_for_reconcile(
+        self, start: datetime, end: datetime
+    ) -> list[tuple[int, str, float, int, str]]:
+        """Строки горячего хранилища за [start, end): ``(rowid, время, цена, объём, сторона)``."""
+        with self.session() as conn:
+            return [
+                (int(r[0]), str(r[1]), float(r[2]), int(r[3]), str(r[4]))
+                for r in conn.execute(
+                    "SELECT rowid, timestamp, price, volume, direction FROM ticks_hot_store"
+                    " WHERE ticker = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                    (self.instrument.storage_name, self._iso(start), self._iso(end)),
+                ).fetchall()
+            ]
+
+    def apply_minute_verdict(
+        self,
+        minute: str,
+        verdict: tuple[str, int, int, int, str],
+        assignments: Sequence[tuple[int, int]],
+        delete_rowids: Sequence[int],
+        new_rows: Sequence[dict[str, object]],
+        cursor: str,
+    ) -> None:
+        """Применяет вердикт минуты одной транзакцией (SPEC-0005 G-5).
+
+        ``verdict`` — ``(status, stream_n, iss_n, repaired, detail)``;
+        ``assignments`` — ``(rowid, TRADENO)`` для сделок стрима;
+        ``delete_rowids`` / ``new_rows`` — замена несовпавших секунд;
+        ``cursor`` — новый курсор сверки (конец минуты).
+        """
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                conn.executemany(
+                    "UPDATE ticks_hot_store SET exchange_trade_no = ? WHERE rowid = ?",
+                    [(tradeno, rowid) for rowid, tradeno in assignments],
+                )
+                conn.executemany(
+                    "DELETE FROM ticks_hot_store WHERE rowid = ?", [(r,) for r in delete_rowids]
+                )
+                self._insert_rows(conn, new_rows)
+                if verdict[0]:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO minute_verdicts"
+                        " (minute, status, stream_n, iss_n, repaired, detail)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (minute, *verdict),
+                    )
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (RECON_CURSOR_KEY, cursor),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def verified_until(self) -> str | None:
+        """Курсор сверки: всё раньше этого момента сверено с ISS (SPEC-0005)."""
+        return self.get_meta(RECON_CURSOR_KEY)
+
+    def read_minute_verdicts(self, start: datetime, end: datetime) -> pd.DataFrame:
+        """Вердикты сверки минут в ``[start, end)``."""
+        start, end = self._as_utc(start), self._as_utc(end)
+        with self.session() as conn:
+            rows = conn.execute(
+                "SELECT minute, status, stream_n, iss_n, repaired, detail FROM minute_verdicts"
+                " WHERE minute >= ? AND minute < ? ORDER BY minute",
+                (start.replace(second=0, microsecond=0).isoformat(), end.isoformat()),
+            ).fetchall()
+        df = pd.DataFrame(
+            rows, columns=["minute", "status", "stream_n", "iss_n", "repaired", "detail"]
+        )
+        df["minute"] = pd.to_datetime(df["minute"], utc=True, format="ISO8601")
+        return df
 
     # ------------------------------------------------------------------ #
     # Качество данных (SPEC-0004)
@@ -544,6 +654,9 @@ class IssTapeRepository:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_iss_feed ON iss_trades (market, feed_date)")
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_iss_secid_ts ON iss_trades (market, secid, timestamp)"
+        )
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS iss_feed_state (
                 market     TEXT PRIMARY KEY,
@@ -771,6 +884,67 @@ class IssTapeRepository:
             for secid, n in cur.fetchall():
                 counts[str(secid)] = counts.get(str(secid), 0) + int(n)
         return counts
+
+    # ------------------------------------------------------------------ #
+    # Чтение для сверки (SPEC-0005)
+    # ------------------------------------------------------------------ #
+    def feed_bounds(self, market: str) -> tuple[datetime, datetime] | None:
+        """Первая и последняя сделка текущей ленты рынка в SQLite (UTC)."""
+        state = self.feed_state(market)
+        if state is None:
+            return None
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT MIN(timestamp), MAX(timestamp) FROM iss_trades"
+                " WHERE market = ? AND feed_date = ?",
+                (market, state["feed_date"]),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return (
+            datetime.fromisoformat(str(row[0])).astimezone(UTC),
+            datetime.fromisoformat(str(row[1])).astimezone(UTC),
+        )
+
+    def read_trades(
+        self, market: str, secid: str, board: str, start: datetime, end: datetime
+    ) -> list[tuple[int, str, float, int, str]]:
+        """Сделки бумаги за [start, end): ``(TRADENO, время, цена, количество, сторона)``.
+
+        Читается SQLite (текущая лента) и Parquet лент, выгруженных за
+        соседние дни (после смены дня в ISS).
+        """
+        out: list[tuple[int, str, float, int, str]] = []
+        with self.session() as conn:
+            out.extend(
+                (int(r[0]), str(r[1]), float(r[2]), int(r[3]), str(r[4]))
+                for r in conn.execute(
+                    "SELECT tradeno, timestamp, price, quantity, direction FROM iss_trades"
+                    " WHERE market = ? AND secid = ? AND board = ?"
+                    " AND timestamp >= ? AND timestamp < ?",
+                    (market, secid, board, start.isoformat(), end.isoformat()),
+                ).fetchall()
+            )
+        days = {(start + pd.Timedelta(days=k)).strftime("%Y-%m-%d") for k in (-3, -2, -1, 0, 1)}
+        for feed_date in sorted(days & self.parquet_feed_dates(market)):
+            table = pq.read_table(
+                self.parquet_path(market, feed_date),
+                columns=["tradeno", "timestamp", "price", "quantity", "direction"],
+                filters=[("secid", "=", secid), ("board", "=", board)],
+            )
+            for rec in table.to_pylist():
+                ts = rec["timestamp"]
+                if start <= ts < end:
+                    out.append(
+                        (
+                            int(rec["tradeno"]),
+                            ts.isoformat(timespec="microseconds"),
+                            float(rec["price"]),
+                            int(rec["quantity"]),
+                            str(rec["direction"]),
+                        )
+                    )
+        return out
 
     # ------------------------------------------------------------------ #
     # Статусы полноты и служебные флаги

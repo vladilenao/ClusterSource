@@ -68,6 +68,8 @@ class HubConnection:
     teardown: Callable[[], Awaitable[None]] | None = None
     #: Инструменты, которых нет у провайдера: в подписку не вошли.
     not_found: list[str] = field(default_factory=list)
+    #: Биржевой тикер инструмента ``{storage_name: ticker}`` — для сверки с ISS.
+    tickers: dict[str, str] = field(default_factory=dict)
 
 
 ConnectionFactory = Callable[[Sequence[Instrument], bool], Awaitable[HubConnection]]
@@ -109,6 +111,8 @@ class StreamHub:
         self._last_frame_at: datetime | None = None
         self._lags: deque[tuple[datetime, float]] = deque()
         self.failed_subscriptions: set[str] = set()
+        #: Биржевой тикер инструмента (у непрерывного фьючерса — активный контракт).
+        self.tickers: dict[str, str] = {}
 
     def request_reconnect(self, resolve: bool = False) -> None:
         """Просит переоткрыть соединение; ``resolve`` — заново разрешить FIGI.
@@ -207,6 +211,7 @@ class StreamHub:
                 collector.quality.mark(REASON_CONTRACT_ROLL, now)  # SPEC-0004
                 logger.info("Ролловер %s: %s -> %s", name, previous, figis[name])
         self._figis.update(figis)
+        self.tickers.update(conn.tickers)
         self._routes = dict(conn.routes)
         self._connected = True
         self._last_frame_at = now

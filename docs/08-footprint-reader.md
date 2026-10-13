@@ -122,6 +122,18 @@ if state["state"] != "OK" or not bad.empty:
 | `get_degraded_minutes(repo, start, end)` | Минуты `DEGRADED` в `[start, end)`: `minute` — начало минуты UTC, `reasons` — причины через запятую. Минут нет в результате — они `PROVISIONAL` |
 | `get_data_state(repo)` | Текущее состояние инструмента: `state` (`OK` / `DEGRADED`; `UNKNOWN` — процесс сбора ещё не сообщал о состоянии), `reasons`, `since` — момент последнего перехода |
 
+Сверка с лентой Мосбиржи ([SPEC-0005](specs/0005-iss-reconciliation.md)) — через 15–17 минут
+после минуты:
+
+| Функция | Возвращает |
+|---------|------------|
+| `get_minute_verdicts(repo, start, end)` | Вердикты минут: `VERIFIED` (совпало с биржей), `REPAIRED` (недостающие сделки дозалиты из ISS), `GAP` (сверить нельзя, данные не тронуты); `stream_n`, `iss_n`, `repaired`, `detail` |
+| `get_verified_until(repo)` | Момент, до которого данные сверены; минуты раньше него без вердикта — пустые и тоже сверены |
+
+Окно, целиком лежащее раньше `get_verified_until` и без `GAP`, совпадает с
+лентой биржи. Footprint по `REPAIRED`-минутам строится по полным данным: у
+дозалитых сделок время с точностью до секунды.
+
 Причины: `stream_gap`, `subscription_failed`, `stream_silence`, `latency`,
 `backlog`, `write_failure`, `unknown_direction`, `contract_roll`,
 `dealer_leak` — см. [5.8](05-realtime-collection.md#58-детекторы-деградации-spec-0004).

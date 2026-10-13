@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
-from cluster_source.collector import DataCollector, Tick, _to_dto
+from cluster_source.collector import DataCollector, _to_dto
 from cluster_source.config import AppConfig, Instrument, InstrumentType
 from cluster_source.database import MarketDataRepository
 
@@ -82,19 +82,9 @@ class AnyNamedTrade:
         self.direction = direction
 
 
-def test_gap_detection_logs_warning(
-    caplog, share_config: AppConfig, share_repo: MarketDataRepository
-) -> None:
-    import logging
-
-    collector = DataCollector(share_config, share_repo.instrument, share_repo)
-    now = datetime.now(UTC)
-    with caplog.at_level(logging.WARNING, logger="cluster_source.collector"):
-        collector._flag_gap(Tick("SBER", now, 1.0, 1, "BUY", "10"), ["9"])
-        # 10 идёт после 9 -> пропуска нет
-        collector._flag_gap(Tick("SBER", now, 1.0, 1, "BUY", "20"), ["10"])
-    assert "TRADE_ID GAP" in caplog.text
-    assert "COMPROMISED" in caplog.text
+def test_numeric_trade_id_gap_check_removed() -> None:
+    """SPEC-0005 G-4: непрерывность номеров не признак полноты — проверки больше нет."""
+    assert not hasattr(DataCollector, "_flag_gap")
 
 
 async def test_consumer_flushes_batch_and_drains(share_config: AppConfig) -> None:
@@ -116,17 +106,12 @@ def _fast_config(share_config: AppConfig) -> AppConfig:
     return replace(share_config, batch=BatchConfig(flush_interval_sec=0.3, batch_size=1000))
 
 
-async def test_gap_and_stream_open_mark_days_via_consumer(share_config: AppConfig) -> None:
-    """KI-03: разрыв trade_id и открытие стрима сохраняют отметку дня (пишет консьюмер)."""
+async def test_stream_open_marks_day_via_consumer(share_config: AppConfig) -> None:
+    """Открытие стрима отмечает день stream_gap; в БД пишет консьюмер (A2)."""
     repo = MarketDataRepository(share_config.storage_root, share_config.instruments[0])
     collector = DataCollector(share_config, share_config.instruments[0], repo)
-    day = datetime(2026, 9, 4, 10, tzinfo=UTC)
-    collector._flag_gap(Tick("SBER", day, 1.0, 1, "BUY", "20"), ["10"])
-    assert repo.days_to_refresh() == {}  # продюсер в БД не пишет
-    await collector._flush([])
-    assert repo.days_to_refresh() == {"2026-09-04": "compromised"}
-
     collector.on_stream_opened()
+    assert repo.days_to_refresh() == {}  # продюсер в БД не пишет
     await collector._flush([])
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     assert repo.days_to_refresh()[today] == "stream_gap"

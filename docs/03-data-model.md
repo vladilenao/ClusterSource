@@ -212,6 +212,26 @@ CREATE TABLE IF NOT EXISTS quality_events (
 Хранятся только минуты с отметками; остальные — `PROVISIONAL`. Последняя
 строка `quality_events` — текущее состояние инструмента.
 
+Сверка с лентой Мосбиржи ([SPEC-0005](specs/0005-iss-reconciliation.md)):
+
+```sql
+-- колонки ticks_hot_store (миграция старых баз при открытии)
+origin             TEXT NOT NULL DEFAULT 'stream'  -- stream | iss | archive
+exchange_trade_no  INTEGER                         -- TRADENO биржи после сверки
+
+CREATE TABLE IF NOT EXISTS minute_verdicts (
+    minute    TEXT PRIMARY KEY,   -- начало минуты, ISO UTC
+    status    TEXT NOT NULL,      -- VERIFIED | REPAIRED | GAP
+    stream_n  INTEGER NOT NULL,   -- сделок стрима до сверки
+    iss_n     INTEGER NOT NULL,   -- сделок ISS
+    repaired  INTEGER NOT NULL,   -- заменено секунд
+    detail    TEXT NOT NULL
+);
+```
+
+Курсор сверки — `meta.recon_verified_until` (всё раньше — сверено). Минуты
+без сделок вердикта не имеют.
+
 В хранилище только биржевые сделки
 ([SPEC-0002](specs/0002-exchange-only-trades.md)): источник сделки
 проверяется до записи и отдельной колонкой не хранится.

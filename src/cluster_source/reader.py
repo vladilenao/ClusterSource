@@ -123,3 +123,25 @@ def get_data_state(repo: MarketDataRepository) -> dict[str, object]:
     if state is None:
         return {"state": "UNKNOWN", "reasons": [], "since": None}
     return state
+
+
+def get_minute_verdicts(
+    repo: MarketDataRepository, start_time: datetime, end_time: datetime
+) -> pd.DataFrame:
+    """Вердикты сверки с лентой Мосбиржи в ``[start_time, end_time)`` (SPEC-0005).
+
+    Колонки: ``minute`` (UTC), ``status`` (``VERIFIED`` / ``REPAIRED`` / ``GAP``),
+    ``stream_n``, ``iss_n``, ``repaired`` (заменено секунд), ``detail``. Минуты
+    без сделок вердикта не имеют: раньше :func:`get_verified_until` они сверены.
+    """
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=UTC)
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=UTC)
+    return repo.read_minute_verdicts(start_time, end_time)
+
+
+def get_verified_until(repo: MarketDataRepository) -> datetime | None:
+    """Момент, до которого данные инструмента сверены с лентой Мосбиржи (SPEC-0005)."""
+    stored = repo.verified_until()
+    return datetime.fromisoformat(stored) if stored else None
