@@ -83,6 +83,23 @@ paths:
       responses:
         "200":
           description: "Блок candles: columns [open, close, high, low, value, volume, begin, end]"
+  /engines/{engine}.json:
+    get:
+      operationId: getEngine
+      summary: Календарь рынка — недельный шаблон и исключения по датам (SPEC-0012)
+      description: >-
+        stock — фондовый рынок (акции), futures — срочный (FORTS). Блок timetable: week_day
+        (1 — понедельник … 7 — воскресенье), is_work_day, start_time, stop_time (часы торговой
+        системы). Блок dailytable: date, is_work_day, start_time, stop_time — исключения с 2018 года
+        (праздники, отменённые сессии выходного дня). У futures есть блок session_schedule —
+        сессии только текущего дня (параметр даты игнорируется).
+      parameters:
+        - {name: engine, in: path, required: true, schema: {type: string, enum: [stock, futures]}}
+        - {name: iss.meta, in: query, schema: {type: string, const: "off"}}
+        - {name: iss.only, in: query, schema: {type: string, example: "timetable,dailytable"}}
+      responses:
+        "200":
+          description: Блоки timetable и dailytable.
   /history/engines/stock/markets/shares/boards/TQBR/securities.json:
     get:
       operationId: getHistory

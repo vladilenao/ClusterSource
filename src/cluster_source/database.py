@@ -882,6 +882,32 @@ class IssTapeRepository:
             )
             """
         )
+        # SPEC-0012: календарь торговых дней ISS (исключения по датам и недельный шаблон).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS iss_calendar (
+                market      TEXT NOT NULL,
+                day         TEXT NOT NULL,
+                is_work_day INTEGER NOT NULL,
+                start_time  TEXT,
+                stop_time   TEXT,
+                loaded_at   TEXT NOT NULL,
+                PRIMARY KEY (market, day)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS iss_week_timetable (
+                market      TEXT NOT NULL,
+                week_day    INTEGER NOT NULL,
+                is_work_day INTEGER NOT NULL,
+                start_time  TEXT,
+                stop_time   TEXT,
+                PRIMARY KEY (market, week_day)
+            )
+            """
+        )
 
     # ------------------------------------------------------------------ #
     # Состояние ленты
@@ -1297,6 +1323,64 @@ class IssTapeRepository:
     # ------------------------------------------------------------------ #
     # Статусы полноты и служебные флаги
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Календарь торговых дней (SPEC-0012)
+    # ------------------------------------------------------------------ #
+    def save_calendar(
+        self,
+        market: str,
+        days: Sequence[tuple[str, int, str | None, str | None]],
+        week: Sequence[tuple[int, int, str | None, str | None]],
+        loaded_at: str,
+    ) -> None:
+        """Исключения ``(день, торговый, начало, конец)`` и недельный шаблон — одной
+        транзакцией. Даты, которых нет в ответе, не удаляются (SPEC-0012 G-1)."""
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO iss_calendar"
+                    " (market, day, is_work_day, start_time, stop_time, loaded_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    [(market, d, int(w), a, b, loaded_at) for d, w, a, b in days],
+                )
+                if week:
+                    conn.execute("DELETE FROM iss_week_timetable WHERE market = ?", (market,))
+                    conn.executemany(
+                        "INSERT INTO iss_week_timetable"
+                        " (market, week_day, is_work_day, start_time, stop_time)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        [(market, int(k), int(w), a, b) for k, w, a, b in week],
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def calendar_day(self, market: str, day: str) -> int | None:
+        """``is_work_day`` исключения за дату или ``None``."""
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT is_work_day FROM iss_calendar WHERE market = ? AND day = ?", (market, day)
+            ).fetchone()
+        return None if row is None else int(row[0])
+
+    def week_timetable(self, market: str) -> dict[int, int]:
+        """Недельный шаблон: ``{день недели 1..7: is_work_day}``."""
+        with self.session() as conn:
+            rows = conn.execute(
+                "SELECT week_day, is_work_day FROM iss_week_timetable WHERE market = ?", (market,)
+            ).fetchall()
+        return {int(k): int(w) for k, w in rows}
+
+    def calendar_span(self, market: str) -> tuple[str, str, int] | None:
+        """Первая и последняя дата исключений и их число."""
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT MIN(day), MAX(day), COUNT(*) FROM iss_calendar WHERE market = ?", (market,)
+            ).fetchone()
+        return None if row is None or row[0] is None else (str(row[0]), str(row[1]), int(row[2]))
+
     def set_day_status(self, market: str, day: str, kind: str, status: str, detail: str) -> None:
         with self.session() as conn:
             conn.execute(

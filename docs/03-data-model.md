@@ -417,3 +417,12 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- quality_rowid
 События качества переносятся в `outbox` из `quality_events` инструментов по
 курсору `meta['quality_rowid:{ticker}']`. Хранение — `signals.redis.retention_days`
 (90 суток): удаляются сигналы с итогом и доставленные события.
+
+## 3.9. Календарь торговых дней (SPEC-0012)
+
+В `_iss.sqlite3` (`IssTapeRepository`): `iss_calendar (market, day,
+is_work_day, start_time, stop_time, loaded_at)` — исключения по датам из ISS
+`dailytable` с 2018 года (праздники, отменённые сессии выходного дня, торговые
+дни в праздники) и `iss_week_timetable (market, week_day, is_work_day, …)` —
+недельный шаблон. Торговый ли день — `schedule.is_trading_day`: исключение
+важнее шаблона. Времена — часы торговой системы, не сессий.

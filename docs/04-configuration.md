@@ -44,7 +44,7 @@ check-jsonschema --schemafile docs/contracts/schemas/config.schema.json config.y
 | `signals.level_bar_minutes` | integer | `5` | `signals.*` | `LevelDetector` | Бар кластерных сигналов, минут |
 | `signals.stacked_ratio` / `stacked_levels` / `stacked_level_percentile` | number / integer / number | `3` / `3` / `50` | `signals.*` | `stacked_imbalances` | Диагональный дисбаланс ≥ ratio на ≥ levels уровнях подряд; доминирующий объём уровня ≥ перцентиля объёмов уровня по нормам |
 | `signals.absorption_percentile` / `absorption_close_ticks` | number / integer | `99` / `2` | `signals.*` | `absorptions` | Поглощение: объём стороны на экстремуме ≥ перцентиля; закрытие не ближе N шагов к экстремуму |
-| `signals.regimes` | object | акции: утро 06:50–10:00, основная 10:00–19:00, вечер 19:00–24:00; FORTS: утро 06:50–09:00, основная 09:00–19:00, вечер 19:00–24:00 | `signals.regimes.{shares,forts}.{режим}: [начало, конец]` | `regime_of` | Режимы торгов МСК для норм; суббота и воскресенье — `weekend` |
+| `signals.regimes` | object | акции и FORTS: утро 06:50–09:00, основная 09:00–19:00, вечер 19:00–24:00 (по расписанию биржи, SPEC-0012) | `signals.regimes.{shares,forts}.{режим}: [начало, конец]` | `regime_of` | Режимы торгов МСК для норм; суббота и воскресенье — `weekend` |
 | `keep_awake` | boolean | `true` | `keep_awake` | `main` | macOS: запрещать сон по простою, пока работает процесс (`caffeinate -i -w PID`, [SPEC-0010](specs/0010-keep-awake.md)) |
 | `tickers` | array | `[]` | `instruments` | все компоненты | Список инструментов (4.3) |
 

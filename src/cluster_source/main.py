@@ -27,6 +27,7 @@ import aiohttp
 from cluster_source import archiver as archiver_mod
 from cluster_source import autoload
 from cluster_source import final as final_mod
+from cluster_source import schedule as schedule_mod
 from cluster_source.collector import DataCollector, InstrumentNotFound
 from cluster_source.config import (
     AppConfig,
@@ -390,6 +391,21 @@ async def run_maintenance(
         logger.error("Ошибка сверки архиватора: %s", exc)
 
     await run_final_check_safely(config, repos)
+    await refresh_calendar(config)
+
+
+async def refresh_calendar(config: AppConfig) -> None:
+    """SPEC-0012: календарь торговых дней ISS обоих рынков (ошибка не роняет обслуживание)."""
+    try:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=autoload._ssl_context()),
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as session:
+            await schedule_mod.load_iss_calendar(
+                HttpIssClient(session), IssTapeRepository(config.storage_root)
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ошибка загрузки календаря ISS: %s", exc)
 
 
 async def startup_maintenance(
