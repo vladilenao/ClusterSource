@@ -127,7 +127,7 @@ if state["state"] != "OK" or not bad.empty:
 
 | Функция | Возвращает |
 |---------|------------|
-| `get_minute_verdicts(repo, start, end)` | Вердикты минут: `VERIFIED` (совпало с биржей), `REPAIRED` (недостающие сделки дозалиты из ISS), `GAP` (сверить нельзя, данные не тронуты); `stream_n`, `iss_n`, `repaired`, `detail` |
+| `get_minute_verdicts(repo, start, end)` | Вердикты минут: `VERIFIED` (совпало с биржей), `REPAIRED` (недостающие сделки дозалиты из ISS), `GAP` (сверить нельзя, данные не тронуты), `CANDLE_VERIFIED` (хвост вечерней сессии совпал с минутной свечой ISS — объём, максимум, минимум; ставится ночью, [SPEC-0011](specs/0011-session-tail.md)); `stream_n`, `iss_n`, `repaired`, `detail` |
 | `get_verified_until(repo)` | Момент, до которого данные сверены; минуты раньше него без вердикта — пустые и тоже сверены |
 
 Окно, целиком лежащее раньше `get_verified_until` и без `GAP`, совпадает с

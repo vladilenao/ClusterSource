@@ -66,11 +66,15 @@
   (инвариант A10).
 - **G-4 (этап 2).** Повторно загруженные строки не дублируются: ключ
   уникальности — (рынок, `SECID`, `TRADENO`).
-- **G-5.** Полнота забранного дня ДОЛЖНА проверяться (для FORTS — с допуском 1% на сделки вне анонимной ленты, SPEC-0006): число сделок ленты по
+- **G-5.** Полнота забранного дня ДОЛЖНА проверяться: число сделок ленты по
   каждой бумаге режима `TQBR` (акции) и `RFUD` (FORTS) за торговый день
   сверяется с дневными итогами ISS (`NUMTRADES`). Сверяются все бумаги
   режима, а не только инструменты ClusterSource: это строже и не стоит
-  дополнительных запросов. Расхождение равносильно G-2.
+  дополнительных запросов. Расхождение равносильно G-2. Хвост вечерней
+  сессии ISS не публикует, поэтому с 2026-10-14 правило уточнено
+  ([SPEC-0011](0011-session-tail.md) G-4): лента полна «до среза» — по
+  каждой бумаге не больше итогов, недостача по рынку ≤ 2%, срез не раньше
+  23:30 МСК; календарные спреды FORTS не сверяются.
 
 ## Этап 1: временный сборщик (отключён 2026-10-13)
 
@@ -163,7 +167,7 @@ launchctl bootout gui/$(id -u)/local.clustersource.iss-raw-dump
 | A-2 | Смена дня определяется по первой сделке ленты; прежний день выгружается; не догнанный — неполный (G-2) | `test_day_change_finalizes_previous_feed`, `test_day_change_before_catch_up_is_marked_incomplete`, `test_stale_staged_feed_finalized_on_housekeeping` |
 | A-3 | Повторная загрузка и импорт не создают дублей (G-4); импорт только завершённых дней, повторный — при росте файла | `test_restaging_and_refinalizing_do_not_duplicate`, `test_import_raw_stage1_files`, `test_import_reimports_grown_file_and_extra_files`, `test_import_truncated_raw_marks_incomplete` |
 | A-4 | Нормализация времени МСК → UTC, торгового дня и направления | `test_normalize_shares_time_direction_and_fields`, `test_normalize_forts_and_csv_strings`, `test_normalize_forts_weekend_batch_loaded_on_monday`, `test_normalize_weekend_session_and_midnight` |
-| A-5 | Полнота торгового дня сверяется с `NUMTRADES`, включая сессии выходного дня (G-5) | `test_verify_complete_day_with_weekend_session`, `test_verify_detects_missing_trades`, `test_verify_waits_for_daily_totals` |
+| A-5 | Полнота торгового дня сверяется с `NUMTRADES`, включая сессии выходного дня (G-5; хвост сессии и спреды — SPEC-0011) | `test_verify_complete_day_with_weekend_session`, `test_verify_detects_missing_trades`, `test_verify_waits_for_daily_totals`, `test_verify_tolerates_session_tail_and_spreads` |
 
 ## Затронутые документы
 
@@ -198,3 +202,4 @@ launchctl bootout gui/$(id -u)/local.clustersource.iss-raw-dump
 - **2026-10-13** — Импорт этапа 1 срабатывал до смены дня (сборщик ещё не видел ленту FORTS: ISS ответил пусто), и FORTS 2026-10-12 был импортирован недописанным. Теперь импорт — только когда сборщик сам видит более новую ленту, и повторный при росте файла.
 - **2026-10-13** — Проверено и отвергнуто: `previous_session=1` у FORTS отдаёт лишь начало прошлой сессии, восстановить по нему день нельзя; принять его пустой ответ за «дочитано» нарушило бы G-2.
 - **2026-10-12** — Исправлено: пустая страница тоже не считается концом ленты; при расхождении с последней сделкой ленты повтор через 2 с. Скорость догонки выросла с ~7,5 до ~36 тыс. строк/мин; потерь не было (курсор `start` не сдвигается на пустых ответах).
+- **2026-10-14** — G-5 уточнена SPEC-0011: точное совпадение с `NUMTRADES` недостижимо — ISS не публикует хвост вечерней сессии (23:45–23:50 МСК), а спредов FORTS нет в анонимной ленте.

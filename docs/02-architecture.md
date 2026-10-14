@@ -23,14 +23,14 @@ flowchart TB
     BOT["Торговый робот"]
 
     MAIN --> CFG
-    MAIN -->|"при старте"| MAINT
+    MAIN -->|"при старте, в фоне после стрима"| MAINT
     MAIN --> SCHED
     SCHED -->|"ежесуточно"| MAINT
     MAINT -->|"1"| AUTO
     MAINT -->|"2"| ARCH
     SCHED -.->|"request_reconnect(resolve=True)<br/>непрерывные фьючерсы"| HUB
-    MAIN -->|"3. создаёт и запускает"| COLL
-    MAIN -->|"4. создаёт и запускает"| HUB
+    MAIN -->|"1. создаёт и запускает"| COLL
+    MAIN -->|"2. создаёт и запускает"| HUB
     HUB -->|"deliver(trade) по FIGI"| COLL
     MAIN --> FACT
     FACT --> SDK
@@ -120,14 +120,15 @@ sequenceDiagram
     M->>M: AppConfig.from_yaml(config.local.yaml | config.yaml)
     M->>A: asyncio.run(amain(config))
     A->>R: создать репозиторий на каждый storage_name
-    rect rgba(127,127,127,0.1)
-    Note over A,AR: run_maintenance (при старте и ежесуточно)
-    A->>BF: run_backfill (SDK-клиент открывается и закрывается вокруг вызова)
-    Note over A,BF: ошибка логируется и не прерывает работу
-    A->>AR: run_archiver — архивировать прошедшие дни, очистить SQLite
-    end
     A->>C: create_task(run()) для каждого инструмента — консьюмеры
     A->>A: create_task(StreamHub.run) — одно соединение, подписка на все FIGI
+    rect rgba(127,127,127,0.1)
+    Note over A,AR: startup_maintenance — в фоне, стрим уже открыт (SPEC-0011 G-5); ночью — то же по расписанию
+    A->>BF: run_backfill (без текущего дня при старте; SDK-клиент открывается вокруг вызова)
+    Note over A,BF: ошибка логируется и не прерывает работу
+    A->>AR: run_archiver — архивировать прошедшие дни, очистить SQLite
+    A->>A: run_final_check — FINAL прошедших дней (SPEC-0006, хвост — SPEC-0011)
+    end
     A->>A: create_task(run_scheduler) — ночное обслуживание + переподключение хаба с новой резолюцией
     A->>A: create_task(run_dealer_cleanup) — однократная чистка от дилерских сделок (SPEC-0002)
     A->>A: ждать stop_event (SIGINT / SIGTERM)

@@ -33,6 +33,7 @@ import asyncio
 import csv
 import gzip
 import logging
+import re
 import zlib
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, date, datetime, time, timedelta
@@ -84,6 +85,12 @@ VERIFY_NOT_BEFORE = timedelta(days=1, hours=6)
 VERIFY_LOOKBACK_DAYS = 10
 #: Если итогов за день нет и через столько суток — день не сверить.
 VERIFY_GIVE_UP_DAYS = 3
+#: SPEC-0011: ISS не публикует хвост вечерней сессии (с ~23:45 МСК), поэтому лента
+#: дня неполна всегда; полна она «до среза». Срез раньше этого времени — потеря дня.
+TAPE_CUTOFF_NOT_BEFORE = time(23, 30)
+#: Недостача ленты против итогов рынка (хвост + сделки вне анонимной ленты):
+#: 13.10 — 0,16% у акций, 0,37% у FORTS. Больше — лента потеряла часть дня.
+TAPE_DEFICIT_MAX_SHARE = 0.02
 #: Ленты сессий выходного и праздничных дней относятся к торговому дню позже
 #: своей даты: при подсчёте за день D смотрим ленты с этой глубиной.
 FEED_LOOKBACK_DAYS = 10
@@ -496,41 +503,47 @@ class IssCollector:
         ours = await asyncio.to_thread(
             self._repo.count_trades, market, trade_date, CHECK_BOARDS[market], since
         )
-        mismatches = {
-            secid: (ours.get(secid, 0), exchange.get(secid, 0))
-            for secid in set(exchange) | set(ours)
-            if not _tape_matches(market, ours.get(secid, 0), exchange.get(secid, 0))
+        # SPEC-0011 G-4: календарных спредов FORTS нет ни в одной анонимной ленте.
+        exchange = {s: n for s, n in exchange.items() if not is_calendar_spread(s)}
+        over = {
+            secid: (ours[secid], exchange.get(secid, 0))
+            for secid in ours
+            if ours[secid] > exchange.get(secid, 0)
         }
-        if market == "forts":
-            outside = sum(exchange.get(s, 0) - ours.get(s, 0) for s in exchange) - sum(
-                e - o for o, e in mismatches.values()
+        total = sum(exchange.values())
+        missing = sum(max(n - ours.get(s, 0), 0) for s, n in exchange.items())
+        cutoff = await asyncio.to_thread(self._repo.tape_cutoff, market, trade_date)
+        cutoff_msk = None if cutoff is None else cutoff.astimezone(MSK)
+        problems: list[str] = []
+        if over:
+            worst = sorted(over.items(), key=lambda kv: kv[1][1] - kv[1][0])[:10]
+            problems.append(
+                "лента больше итогов: "
+                + "; ".join(f"{s}: у нас {o}, биржа {e}" for s, (o, e) in worst)
             )
-            if outside:
-                logger.info(
-                    "ISS forts %s: %d сделок в итогах вне анонимной ленты (блочные/переговорные)",
-                    trade_date,
-                    outside,
-                )
-        if not mismatches:
-            status, detail = STATUS_COMPLETE, f"{len(exchange)} бумаг"
+        if missing > TAPE_DEFICIT_MAX_SHARE * total:
+            problems.append(f"не в ленте {missing} из {total} сделок")
+        if cutoff_msk is None or cutoff_msk < datetime.combine(day, TAPE_CUTOFF_NOT_BEFORE, MSK):
+            problems.append(
+                "лента обрывается в " + ("—" if cutoff_msk is None else f"{cutoff_msk:%H:%M} МСК")
+            )
+        if not problems:
+            status = STATUS_COMPLETE
+            detail = f"{len(exchange)} бумаг; не в ленте {missing} сделок"
             logger.info(
-                "ISS_DAY_VERIFIED %s %s: число сделок совпало по %d бумагам",
+                "ISS_DAY_VERIFIED %s %s: лента полна до среза %s по %d бумагам; не в ленте"
+                " %d сделок (хвост после среза и вне анонимной ленты)",
                 market,
                 trade_date,
+                f"{cutoff_msk:%H:%M:%S} МСК" if cutoff_msk is not None else "—",
                 len(exchange),
+                missing,
             )
         else:
             # SPEC-0003 G-5: расхождение равносильно потере дня (G-2).
             status = STATUS_INCOMPLETE
-            worst = sorted(mismatches.items(), key=lambda kv: -abs(kv[1][1] - kv[1][0]))[:10]
-            detail = "; ".join(f"{s}: у нас {o}, биржа {e}" for s, (o, e) in worst)
-            logger.error(
-                "ISS_DAY_INCOMPLETE %s %s: расхождение по %d бумагам: %s",
-                market,
-                trade_date,
-                len(mismatches),
-                detail,
-            )
+            detail = "; ".join(problems)
+            logger.error("ISS_DAY_INCOMPLETE %s %s: %s", market, trade_date, detail)
         await asyncio.to_thread(
             self._repo.set_day_status, market, trade_date, KIND_TRADE_DATE, status, detail
         )
@@ -565,16 +578,13 @@ class IssCollector:
         return counts
 
 
-#: SPEC-0006: в итоги FORTS входят сделки вне анонимной ленты (блочные/переговорные);
-#: исследование 2026-10-13 — до 0,76% сделок контракта за день. Тот же допуск — в final.py.
-FORTS_OUTSIDE_TAPE_MAX_SHARE = 0.01
+#: Календарный спред FORTS: два кода контрактов подряд (``SiZ6SiH7``).
+_SPREAD_RE = re.compile(r"^([A-Za-z0-9]{2})[FGHJKMNQUVXZ]\d\1[FGHJKMNQUVXZ]\d$")
 
 
-def _tape_matches(market: str, tape: int, official: int) -> bool:
-    """Лента бумаги полна относительно итогов дня (SPEC-0003 G-5, SPEC-0006)."""
-    if market != "forts":
-        return tape == official
-    return tape <= official and official - tape <= FORTS_OUTSIDE_TAPE_MAX_SHARE * official
+def is_calendar_spread(secid: str) -> bool:
+    """Календарный спред FORTS — его сделок нет в анонимной ленте (SPEC-0011 G-4)."""
+    return bool(_SPREAD_RE.match(secid))
 
 
 def _read_raw_chunks(path: Path) -> Iterator[tuple[list[str], list[list[object]]]]:

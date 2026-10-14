@@ -221,7 +221,7 @@ exchange_trade_no  INTEGER                         -- TRADENO биржи пос�
 
 CREATE TABLE IF NOT EXISTS minute_verdicts (
     minute    TEXT PRIMARY KEY,   -- начало минуты, ISO UTC
-    status    TEXT NOT NULL,      -- VERIFIED | REPAIRED | GAP
+    status    TEXT NOT NULL,      -- VERIFIED | REPAIRED | GAP | CANDLE_VERIFIED (хвост сессии, SPEC-0011)
     stream_n  INTEGER NOT NULL,   -- сделок стрима до сверки
     iss_n     INTEGER NOT NULL,   -- сделок ISS
     repaired  INTEGER NOT NULL,   -- заменено секунд

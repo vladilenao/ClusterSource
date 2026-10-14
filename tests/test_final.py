@@ -37,14 +37,34 @@ TODAY = date(2026, 10, 14)
 
 
 class FakeIss:
-    """Дневные итоги ISS по датам, постранично по 2 бумаги."""
+    """Дневные итоги ISS по датам (постранично по 2 бумаги) и минутные свечи.
 
-    def __init__(self, totals: dict[tuple[str, str], dict[str, tuple[int, float]]]) -> None:
+    ``candles`` — ``{SECID: [(начало минуты МСК, объём, максимум, минимум), …]}``.
+    """
+
+    def __init__(
+        self,
+        totals: dict[tuple[str, str], dict[str, tuple[int, float]]],
+        candles: dict[str, list[tuple[str, float, float, float]]] | None = None,
+    ) -> None:
         self.totals = totals
+        self.candles = candles or {}
         self.calls = 0
 
     async def get_json(self, url: str, params: dict[str, str]) -> dict[str, Any]:
         self.calls += 1
+        if url.endswith("/candles.json"):
+            secid = url.split("/securities/")[1].split("/")[0]
+            return {
+                "candles": {
+                    "columns": ["open", "close", "high", "low", "value", "volume", "begin", "end"],
+                    "data": [
+                        [lo, hi, hi, lo, 0, v, begin, begin[:17] + "59"]
+                        for begin, v, hi, lo in self.candles.get(secid, [])
+                        if begin >= params["from"]
+                    ],
+                }
+            }
         market = "shares" if "/stock/" in url else "forts"
         items = sorted(self.totals.get((market, params["date"]), {}).items())
         start = int(params.get("start", "0"))
@@ -171,12 +191,16 @@ async def test_forts_reference_is_complete_tape(
         )  # fmt: skip
     iss.stage_rows(rows)
     iss.set_day_status("forts", d.isoformat(), KIND_FEED, STATUS_COMPLETE, "")
-    fake = FakeIss({("forts", d.isoformat()): {"SiZ6": (4, 500.0)}})  # +1 блочная сделка
+    fake = FakeIss(
+        {("forts", d.isoformat()): {"SiZ6": (4, 500.0)}},  # +1 блочная сделка
+        {"SiZ6": [("2026-10-13 11:00:00", 6.0, 100.0, 100.0)]},  # минута среза — по свече
+    )
     await check(cfg, repos, iss, fake)
     df = get_day_verdicts(repos["Si_CONTINUOUS"])
     row = df.iloc[0]
     assert (row["status"], row["reference"], row["ref_n"]) == (STATUS_FINAL, "iss_tape", 3)
     assert "вне анонимной ленты: 1 сделок" in row["detail"]
+    assert "хвост по свечам с 11:00 МСК" in row["detail"]
 
 
 @pytest.mark.parametrize(
@@ -276,26 +300,6 @@ def test_final_mismatch_mark_not_limited_by_window(cfg: AppConfig, repos: Any) -
     days = [d.strftime("%Y-%m-%d") for d in refresh_days(cfg, repo)]
     assert days == [old]
     assert repo.days_to_refresh() == {old: REFRESH_FINAL_MISMATCH}
-
-
-def test_startup_skips_final_mismatch_days(cfg: AppConfig, repos: Any) -> None:
-    """SPEC-0006: при старте дни final_mismatch не перекачиваются (стрим не ждёт),
-    фоновый проход берёт только их, ночью — все."""
-    from cluster_source.autoload import refresh_days
-
-    repo = repos["GAZP"]
-    today = datetime.now(UTC)
-    recent = (today - timedelta(days=2)).strftime("%Y-%m-%d")
-    old = (today - timedelta(days=60)).strftime("%Y-%m-%d")
-    repo.mark_days_for_refresh([recent], "stream_gap")
-    repo.mark_days_for_refresh([old], REFRESH_FINAL_MISMATCH)
-
-    def picked(**kw: Any) -> list[str]:
-        return [d.strftime("%Y-%m-%d") for d in refresh_days(cfg, repo, **kw)]
-
-    assert picked(final_mismatch=False) == [recent]  # старт
-    assert picked(final_mismatch=True) == [old]  # фоновый проход после старта
-    assert picked() == [old, recent]  # ночь
 
 
 async def test_archive_exhausted_stops_refresh(

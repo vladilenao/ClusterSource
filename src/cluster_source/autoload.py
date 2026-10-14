@@ -191,12 +191,33 @@ def missing_days(config: AppConfig, repo: MarketDataRepository) -> list[datetime
     return missing
 
 
-def refresh_days(
+def days_to_load(
     config: AppConfig,
     repo: MarketDataRepository,
     *,
     cleanup: bool = False,
-    final_mismatch: bool | None = None,
+    include_today: bool = True,
+) -> tuple[list[datetime], list[datetime]]:
+    """Дни для догрузки (данных нет) и для перекачки (отмечены) одного инструмента.
+
+    ``include_today=False`` — без текущего дня: при старте его пишет уже
+    открытый стрим, а пропущенное до старта дозаливает сверка (SPEC-0011 G-5).
+    """
+    missing = [] if cleanup else missing_days(config, repo)
+    if not include_today:
+        today = _utc_today().date()
+        missing = [d for d in missing if d.date() < today]
+    missing_set = {d.strftime("%Y-%m-%d") for d in missing}
+    refresh = [
+        d
+        for d in refresh_days(config, repo, cleanup=cleanup)
+        if d.strftime("%Y-%m-%d") not in missing_set
+    ]
+    return missing, refresh
+
+
+def refresh_days(
+    config: AppConfig, repo: MarketDataRepository, *, cleanup: bool = False
 ) -> list[datetime]:
     """Отмеченные для перекачки прошедшие дни.
 
@@ -207,9 +228,6 @@ def refresh_days(
       кроме ``final_mismatch`` (SPEC-0006) — она окном не ограничена.
     * ``cleanup=True`` — только отметки ``dealer_cleanup`` без ограничения
       окном (SPEC-0002 G-4), от новых дней к старым.
-    * ``final_mismatch`` (только при ``cleanup=False``): ``None`` — все отметки,
-      ``False`` — без ``final_mismatch`` (старт процесса: стрим не ждёт перекачки
-      сотен дней), ``True`` — только ``final_mismatch`` (фоновый проход).
     """
     today = _utc_today()
     window_start = (today - timedelta(days=config.history_check_days - 1)).strftime("%Y-%m-%d")
@@ -218,8 +236,6 @@ def refresh_days(
     for day_str, reason in sorted(repo.days_to_refresh().items(), reverse=cleanup):
         is_cleanup = reason == REFRESH_DEALER_CLEANUP
         if is_cleanup != cleanup or day_str >= today_str:
-            continue
-        if final_mismatch is not None and (reason == REFRESH_FINAL_MISMATCH) != final_mismatch:
             continue
         if not cleanup and day_str < window_start and reason != REFRESH_FINAL_MISMATCH:
             logger.warning(
@@ -425,7 +441,7 @@ async def _backfill_from_archive(
             )
             return BackfillResult.FAILED
         logger.info(
-            "Архива истории нет для %s за %s (в этот день не было торгов)",
+            "Архива истории нет для %s за %s (торгов не было или архив ещё не опубликован)",
             instrument.id,
             day_str,
         )
@@ -710,7 +726,7 @@ async def run_backfill(
     gate: _RateGate | None = None,
     lock: asyncio.Lock | None = None,
     cleanup: bool = False,
-    final_mismatch: bool | None = None,
+    include_today: bool = True,
 ) -> None:
     """Догружает отсутствующие и перекачивает отмеченные дни всех инструментов, с троттлингом.
 
@@ -788,13 +804,9 @@ async def run_backfill(
         for instrument in config.instruments:
             repo = repos[instrument.storage_name]
             figi = current_figi(instrument, share_figis, futures, today.date())
-            missing = [] if cleanup or final_mismatch else missing_days(config, repo)
-            missing_set = {d.strftime("%Y-%m-%d") for d in missing}
-            refresh = [
-                d
-                for d in refresh_days(config, repo, cleanup=cleanup, final_mismatch=final_mismatch)
-                if d.strftime("%Y-%m-%d") not in missing_set
-            ]
+            missing, refresh = days_to_load(
+                config, repo, cleanup=cleanup, include_today=include_today
+            )
             for day in missing:
                 tasks.append(process(session, instrument, repo, day, figi, replace=False))
             for day in refresh:
@@ -846,6 +858,12 @@ def _settle_refresh_mark(repo: MarketDataRepository, day: datetime, result: Back
         repo.clear_refresh_mark(day_str)
     elif result == BackfillResult.NO_DATA and day_str not in repo.available_days():
         repo.clear_refresh_mark(day_str)
+    elif result == BackfillResult.NO_DATA:
+        logger.info(
+            "Архив истории за %s для %s ещё не опубликован — отметка сохранена",
+            day_str,
+            repo.instrument.storage_name,
+        )
 
 
 def _pick_share(items: Iterable[Any], ticker: str) -> Any | None:

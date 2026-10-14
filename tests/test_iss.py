@@ -402,7 +402,8 @@ async def test_verify_complete_day_with_weekend_session(
     _tape(
         iss_repo,
         "2026-10-12",
-        [share(2), share(3, secid="GAZP"), share(4, board="SMAL")],  # SMAL не сверяется
+        # SMAL не сверяется; 23:44:30 — срез ленты (хвост сессии ISS не публикует)
+        [share(2), share(3, secid="GAZP", tradetime="23:44:30"), share(4, board="SMAL")],
     )
     fake = FakeIss()
     fake.history[("shares", "2026-10-12")] = {"SBER": 2, "GAZP": 1}
@@ -427,7 +428,7 @@ async def test_verify_detects_missing_trades(
         ).verify_pending()
     assert iss_repo.day_status("shares", "2026-10-12", KIND_TRADE_DATE) == STATUS_INCOMPLETE
     assert "ISS_DAY_INCOMPLETE" in caplog.text
-    assert "SBER: у нас 1, биржа 5" in caplog.text
+    assert "не в ленте 4 из 5 сделок" in caplog.text
 
 
 async def test_verify_waits_for_daily_totals(
@@ -449,22 +450,40 @@ async def test_verify_waits_for_daily_totals(
     assert iss_repo.day_status("shares", "2026-10-12", KIND_TRADE_DATE) == STATUS_UNVERIFIABLE
 
 
-async def test_verify_forts_allows_trades_outside_anonymous_tape(
-    share_config: AppConfig, iss_repo: IssTapeRepository
+async def test_verify_tolerates_session_tail_and_spreads(
+    share_config: AppConfig, iss_repo: IssTapeRepository, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """SPEC-0006 / SPEC-0003 G-5: в итогах FORTS есть сделки вне анонимной ленты (до 1%)."""
-    rows = [fut(k, day="2026-10-12") for k in range(1, 100)]
+    """SPEC-0011 G-4 (A-8): хвост сессии и спреды не дают INCOMPLETE; лента больше
+    итогов, большая недостача или ранний срез — дают."""
+    rows = [fut(k, day="2026-10-12") for k in range(1, 99)]
+    rows.append(fut(99, tradetime="23:44:37", day="2026-10-12"))  # срез ленты ISS
     iss_repo.stage_rows(normalize_trades("forts", "2026-10-12", FORTS_COLUMNS, rows))
     iss_repo.finalize_feed_day("forts", "2026-10-12")
     fake = FakeIss()
-    fake.history[("forts", "2026-10-12")] = {"SiZ6": 100}  # 99 в ленте + 1 блочная
     now = datetime(2026, 10, 13, 6, 0, tzinfo=UTC)
-    await collector(share_config, iss_repo, fake, now=now).verify_pending()
-    assert iss_repo.day_status("forts", "2026-10-12", KIND_TRADE_DATE) == STATUS_COMPLETE
 
-    with iss_repo.session() as conn:
-        conn.execute("DELETE FROM iss_day_status")
-        conn.commit()
-    fake.history[("forts", "2026-10-12")] = {"SiZ6": 200}  # лента усечена вдвое
-    await collector(share_config, iss_repo, fake, now=now).verify_pending()
-    assert iss_repo.day_status("forts", "2026-10-12", KIND_TRADE_DATE) == STATUS_INCOMPLETE
+    async def verify(totals: dict[str, int]) -> str | None:
+        with iss_repo.session() as conn:
+            conn.execute("DELETE FROM iss_day_status")
+            conn.commit()
+        fake.history[("forts", "2026-10-12")] = totals
+        await collector(share_config, iss_repo, fake, now=now).verify_pending()
+        return iss_repo.day_status("forts", "2026-10-12", KIND_TRADE_DATE)
+
+    # 99 в ленте + 1 в хвосте или вне ленты; спреда в ленте нет вовсе
+    with caplog.at_level(logging.INFO):
+        assert await verify({"SiZ6": 100, "SiZ6SiH7": 8000}) == STATUS_COMPLETE
+    assert "не в ленте 1 сделок" in caplog.text
+    assert await verify({"SiZ6": 200}) == STATUS_INCOMPLETE  # лента усечена вдвое
+    assert await verify({"SiZ6": 50}) == STATUS_INCOMPLETE  # лента больше итогов
+
+    early = [fut(k, day="2026-10-13") for k in range(1, 10)]  # обрыв в 10:00 МСК
+    iss_repo.stage_rows(normalize_trades("forts", "2026-10-13", FORTS_COLUMNS, early))
+    fake.history[("forts", "2026-10-13")] = {"SiZ6": 9}
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        await collector(
+            share_config, iss_repo, fake, now=datetime(2026, 10, 14, 6, 0, tzinfo=UTC)
+        ).verify_pending()
+    assert iss_repo.day_status("forts", "2026-10-13", KIND_TRADE_DATE) == STATUS_INCOMPLETE
+    assert "лента обрывается в 10:00 МСК" in caplog.text

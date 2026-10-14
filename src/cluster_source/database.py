@@ -400,6 +400,21 @@ class MarketDataRepository:
                 conn.rollback()
                 raise
 
+    def save_minute_verdicts(self, rows: Sequence[tuple[str, str, int, int, int, str]]) -> None:
+        """Записывает вердикты минут без сдвига курсора сверки (хвост сессии, SPEC-0011).
+
+        ``rows`` — ``(minute, status, stream_n, iss_n, repaired, detail)``.
+        """
+        if not rows:
+            return
+        with self.session() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO minute_verdicts"
+                " (minute, status, stream_n, iss_n, repaired, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+
     def verified_until(self) -> str | None:
         """Курсор сверки: всё раньше этого момента сверено с ISS (SPEC-0005)."""
         return self.get_meta(RECON_CURSOR_KEY)
@@ -460,6 +475,26 @@ class MarketDataRepository:
                 (self.instrument.storage_name, day),
             ).fetchone()
         return int(row[0]), float(row[1])
+
+    def read_day(self, day: str) -> pd.DataFrame:
+        """Сделки календарного дня UTC (``timestamp``, ``price``, ``volume``) — из того
+        же источника, что читает ридер: Parquet дня, иначе SQLite."""
+        path = self.parquet_day_path(day)
+        if path is not None:
+            df = pd.read_parquet(path, columns=["timestamp", "price", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601")
+            return df
+        start = datetime.fromisoformat(day).replace(tzinfo=UTC)
+        df = self.read_ticks(start, start + pd.Timedelta(days=1))
+        if df.empty:
+            return pd.DataFrame(
+                {
+                    "timestamp": pd.Series(dtype="datetime64[ns, UTC]"),
+                    "price": pd.Series(dtype=float),
+                    "volume": pd.Series(dtype=float),
+                }
+            )
+        return df[["timestamp", "price", "volume"]]
 
     def set_day_verdict(
         self,
@@ -1169,31 +1204,72 @@ class IssTapeRepository:
                 conn.rollback()
                 raise
 
-    def tape_day(self, market: str, secid: str, board: str, trade_date: str) -> tuple[int, float]:
-        """Число сделок и объём бумаги в ленте ISS за торговый день (``trade_date``)."""
+    def tape_day(
+        self,
+        market: str,
+        secid: str,
+        board: str,
+        trade_date: str,
+        before: datetime | None = None,
+    ) -> tuple[int, float]:
+        """Число сделок и объём бумаги в ленте ISS за торговый день (``trade_date``).
+
+        ``before`` — только сделки раньше этого момента (голова дня, SPEC-0011).
+        """
         n, volume = 0, 0.0
+        sql = (
+            "SELECT COUNT(*), COALESCE(SUM(quantity), 0) FROM iss_trades"
+            " WHERE market = ? AND secid = ? AND board = ? AND trade_date = ?"
+        )
+        params: list[object] = [market, secid, board, trade_date]
+        if before is not None:
+            sql += " AND timestamp < ?"
+            params.append(before.astimezone(UTC).isoformat(timespec="microseconds"))
         with self.session() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(quantity), 0) FROM iss_trades"
-                " WHERE market = ? AND secid = ? AND board = ? AND trade_date = ?",
-                (market, secid, board, trade_date),
-            ).fetchone()
+            row = conn.execute(sql, params).fetchone()
             n, volume = int(row[0]), float(row[1])
-        day = pd.Timestamp(trade_date)
-        near = {(day + pd.Timedelta(days=k)).strftime("%Y-%m-%d") for k in range(-4, 2)}
-        for feed_date in sorted(near & self.parquet_feed_dates(market)):
-            table = pq.read_table(
-                self.parquet_path(market, feed_date),
-                columns=["quantity"],
-                filters=[
-                    ("secid", "=", secid),
-                    ("board", "=", board),
-                    ("trade_date", "=", trade_date),
-                ],
-            )
+        filters: list[tuple[str, str, object]] = [
+            ("secid", "=", secid),
+            ("board", "=", board),
+            ("trade_date", "=", trade_date),
+        ]
+        if before is not None:
+            filters.append(("timestamp", "<", pd.Timestamp(before).tz_convert("UTC")))
+        for path in self._near_feed_paths(market, trade_date):
+            table = pq.read_table(path, columns=["quantity"], filters=filters)
             n += table.num_rows
             volume += float(sum(v or 0 for v in table.column("quantity").to_pylist()))
         return n, volume
+
+    def tape_cutoff(self, market: str, trade_date: str) -> datetime | None:
+        """Срез ленты рынка за торговый день: время последней сделки с этим ``trade_date``.
+
+        Бесплатный ISS после полуночи не публикует последние минуты вечерней
+        сессии (SPEC-0011), поэтому лента дня кончается раньше торгов.
+        """
+        found: list[datetime] = []
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT MAX(timestamp) FROM iss_trades WHERE market = ? AND trade_date = ?",
+                (market, trade_date),
+            ).fetchone()
+        if row is not None and row[0] is not None:
+            found.append(datetime.fromisoformat(str(row[0])).astimezone(UTC))
+        for path in self._near_feed_paths(market, trade_date):
+            table = pq.read_table(
+                path, columns=["timestamp"], filters=[("trade_date", "=", trade_date)]
+            )
+            if table.num_rows:
+                found.append(max(table.column("timestamp").to_pylist()).astimezone(UTC))
+        return max(found) if found else None
+
+    def _near_feed_paths(self, market: str, trade_date: str) -> list[Path]:
+        """Parquet лент, где могут быть сделки торгового дня (выходные — в ленте понедельника)."""
+        day = pd.Timestamp(trade_date)
+        near = {(day + pd.Timedelta(days=k)).strftime("%Y-%m-%d") for k in range(-4, 2)}
+        return [
+            self.parquet_path(market, d) for d in sorted(near & self.parquet_feed_dates(market))
+        ]
 
     # ------------------------------------------------------------------ #
     # Статусы полноты и служебные флаги

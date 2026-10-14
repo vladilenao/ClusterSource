@@ -60,6 +60,29 @@ paths:
                 TRADINGSESSION: Акции — 0 утренняя, 1 основная, 2 вечерняя сессия.
                 OPENPOSITION: FORTS — открытый интерес после сделки.
                 OFFMARKETDEAL: FORTS — 1 для внебиржевой адресной сделки.
+  /engines/{engine}/markets/{market}/securities/{secid}/candles.json:
+    get:
+      operationId: getCandles
+      summary: Минутные свечи бумаги (хвост вечерней сессии, SPEC-0011)
+      description: >-
+        Акции — /engines/stock/markets/shares/boards/TQBR/securities/{secid}/candles.json,
+        FORTS — /engines/futures/markets/forts/securities/{secid}/candles.json.
+        Бесплатная лента сделок не публикует последние минуты вечерней сессии (после
+        полуночи МСК окно задержки обрывается), а свечи за прошедший день доступны целиком.
+        ClusterSource сверяет по минутам volume (акции — в штуках), high, low; begin — время МСК.
+        Минут без сделок в ответе нет.
+      parameters:
+        - {name: engine, in: path, required: true, schema: {type: string, enum: [stock, futures]}}
+        - {name: market, in: path, required: true, schema: {type: string, enum: [shares, forts]}}
+        - {name: secid, in: path, required: true, schema: {type: string}}
+        - {name: interval, in: query, required: true, schema: {type: integer, const: 1}}
+        - {name: from, in: query, required: true, schema: {type: string, example: "2026-10-13 23:44"}}
+        - {name: till, in: query, required: true, schema: {type: string, example: "2026-10-13 23:59"}}
+        - {name: iss.meta, in: query, schema: {type: string, const: "off"}}
+        - {name: iss.only, in: query, schema: {type: string, const: candles}}
+      responses:
+        "200":
+          description: "Блок candles: columns [open, close, high, low, value, volume, begin, end]"
   /history/engines/stock/markets/shares/boards/TQBR/securities.json:
     get:
       operationId: getHistory

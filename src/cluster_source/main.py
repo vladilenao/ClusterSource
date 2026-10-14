@@ -364,21 +364,20 @@ async def run_maintenance(
     repos: dict[str, MarketDataRepository],
     *,
     gate: Any = None,
-    final_check: bool = True,
+    include_today: bool = True,
 ) -> None:
-    """Обслуживание хранилища: догрузка/перекачка дней, затем архивация и очистка.
+    """Обслуживание хранилища: догрузка/перекачка дней, архивация и очистка, FINAL.
 
-    Выполняется при старте и ежесуточно по расписанию ``config.archiver``.
-    Ошибки этапов логируются и не прерывают работу коллекторов.
+    Выполняется в фоне при старте (после открытия стрима, без текущего дня —
+    SPEC-0011 G-5) и ежесуточно по расписанию ``config.archiver``. Ошибки
+    этапов логируются и не прерывают работу коллекторов.
     """
     logger.info(
         "Проверка автозагрузки/догрузки истории (последние %d дней)",
         config.history_check_days,
     )
     try:
-        # При старте (final_check=False) дни final_mismatch не перекачиваются: их
-        # бывают сотни, а стрим ждёт конца этого этапа. Их берёт фоновый проход.
-        await _run_backfill(config, repos, gate=gate, final_mismatch=None if final_check else False)
+        await _run_backfill(config, repos, gate=gate, include_today=include_today)
     except Exception as exc:  # noqa: BLE001
         logger.error("Ошибка автозагрузки: %s", exc)
 
@@ -388,8 +387,23 @@ async def run_maintenance(
     except Exception as exc:  # noqa: BLE001
         logger.error("Ошибка сверки архиватора: %s", exc)
 
-    if final_check:
-        await run_final_check_safely(config, repos)
+    await run_final_check_safely(config, repos)
+
+
+async def startup_maintenance(
+    config: AppConfig,
+    repos: dict[str, MarketDataRepository],
+    gate: Any,
+    lock: asyncio.Lock,
+) -> None:
+    """Стартовое обслуживание — в фоне, когда стрим уже открыт (SPEC-0011 G-5).
+
+    Перекачка отмеченных дней (бывают сотни) и первая проверка FINAL занимают
+    минуты; стрим их не ждёт. Текущий день не дописывается: его пишет стрим, а
+    пропущенное до старта дозаливает сверка с ISS (SPEC-0005).
+    """
+    async with lock:
+        await run_maintenance(config, repos, gate=gate, include_today=False)
 
 
 async def run_final_check_safely(config: AppConfig, repos: dict[str, MarketDataRepository]) -> None:
@@ -488,10 +502,6 @@ async def amain(config: AppConfig) -> int:
 
     archive_gate = autoload.archive_gate()
     maintenance_lock = asyncio.Lock()
-    async with maintenance_lock:
-        # Проверка FINAL при старте — в фоне после запуска сбора: первая проверка
-        # загружает итоги ISS за всю историю и задержала бы стрим на минуты.
-        await run_maintenance(config, repos, gate=archive_gate, final_check=False)
 
     collectors = [
         DataCollector(config, instrument, repos[instrument.storage_name])
@@ -529,21 +539,11 @@ async def amain(config: AppConfig) -> int:
         run_dealer_cleanup(config, repos, gate=archive_gate, lock=maintenance_lock)
     )
 
-    async def startup_final_check() -> None:
-        # SPEC-0006: в фоне после запуска сбора — перекачка дней final_mismatch
-        # и проверка FINAL (при старте они задержали бы стрим на минуты).
-        async with maintenance_lock:
-            try:
-                await _run_backfill(config, repos, gate=archive_gate, final_mismatch=True)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Ошибка перекачки дней final_mismatch: %s", exc)
-            await run_final_check_safely(config, repos)
-
     background = [
         hub_task,
         scheduler_task,
         cleanup_task,
-        asyncio.create_task(startup_final_check()),
+        asyncio.create_task(startup_maintenance(config, repos, archive_gate, maintenance_lock)),
     ]
     if config.iss.enabled:
         # SPEC-0003: лента Мосбиржи — источник номеров сделок и ОИ по сделкам.

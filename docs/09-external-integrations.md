@@ -18,6 +18,7 @@
 | I7 | Список фьючерсов (фолбэк) | HTTPS POST | `…/InstrumentsService/Futures` | `autoload._fetch_futures_rest` | без SDK | OpenAPI `listFutures` |
 | I8 | Последние сделки (фолбэк) | HTTPS POST | `…/MarketDataService/GetLastTrades` | `autoload._backfill_current_session` | без SDK | OpenAPI `getLastTrades` |
 | I9 | Лента сделок Мосбиржи | HTTPS GET | `https://iss.moex.com/iss/engines/{stock/markets/shares, futures/markets/forts}/trades.json` | `iss.IssCollector.poll_market` | раз в `iss.poll_interval_sec` | [OpenAPI](contracts/openapi/moex-iss.openapi.yaml) `getTrades` |
+| I11 | Минутные свечи Мосбиржи | HTTPS GET | `…/iss/engines/…/securities/{SECID}/candles.json?interval=1` | `tail.check_tail` (из `final.run_final_check`) | ночью, раз на инструмент и торговый день с лентой — хвост вечерней сессии ([SPEC-0011](specs/0011-session-tail.md)) | [OpenAPI](contracts/openapi/moex-iss.openapi.yaml) `getCandles` |
 | I10 | Дневные итоги Мосбиржи | HTTPS GET | `…/iss/history/engines/…/securities.json?date=` | `iss.IssCollector.verify_pending`, `final.run_final_check` | раз в час для непроверенных дней ленты; ночью для вердикта дня (кэш в `_iss.sqlite3`) | [OpenAPI](contracts/openapi/moex-iss.openapi.yaml) `getHistory` |
 
 Унарные gRPC-методы I2–I4 описаны в [OpenAPI](contracts/openapi/t-invest-rest.openapi.yaml)
