@@ -156,6 +156,15 @@ if state["state"] != "OK" or not bad.empty:
 | `get_oi_flow(iss_repo, secid, start, end, timeframe="1min")` | Поток ОИ по ленте ISS (задержка 15 мин) по барам: `oi_close`, `oi_change`, `opened` / `closed` / `transferred` (контракты), `outside` (изменение ОИ сделками вне анонимной ленты), `trades` |
 | `get_contract(repo, day)` | Тикер активного контракта непрерывного фьючерса за день — `secid` для `get_oi_flow` |
 
+Сигналы ([SPEC-0008](specs/0008-volume-signals.md)); робот получает их из
+Redis Stream `cluster.events`, а функции ниже — для анализа и режима
+наблюдения:
+
+| Функция | Возвращает |
+|---------|------------|
+| `get_signals(signal_repo, start, end, ticker=None)` | Сигналы с концом окна в `[start, end)`: `status` (`PENDING` / `CONFIRMED` / `REVOKED` / `SUPPRESSED`), `outcome`, `reason`, `event_json` (конверт) |
+| `get_signal_stats(signal_repo, start, end)` | По инструменту и типу: число по статусам и причинам, доля отзывов `revoked_share`, медианная задержка итога `verify_delay_min` |
+
 ОИ Мосбиржи считает позиции обеих сторон: `opened = ΔОИ/2` при росте, `closed
 = −ΔОИ/2` при падении, `transferred = количество − |ΔОИ|/2`.
 

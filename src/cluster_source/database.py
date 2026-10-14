@@ -477,11 +477,13 @@ class MarketDataRepository:
         return int(row[0]), float(row[1])
 
     def read_day(self, day: str) -> pd.DataFrame:
-        """Сделки календарного дня UTC (``timestamp``, ``price``, ``volume``) — из того
-        же источника, что читает ридер: Parquet дня, иначе SQLite."""
+        """Сделки календарного дня UTC (``timestamp``, ``price``, ``volume``,
+        ``direction``) — из того же источника, что читает ридер: Parquet дня,
+        иначе SQLite."""
+        columns = ["timestamp", "price", "volume", "direction"]
         path = self.parquet_day_path(day)
         if path is not None:
-            df = pd.read_parquet(path, columns=["timestamp", "price", "volume"])
+            df = pd.read_parquet(path, columns=columns)
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601")
             return df
         start = datetime.fromisoformat(day).replace(tzinfo=UTC)
@@ -492,9 +494,10 @@ class MarketDataRepository:
                     "timestamp": pd.Series(dtype="datetime64[ns, UTC]"),
                     "price": pd.Series(dtype=float),
                     "volume": pd.Series(dtype=float),
+                    "direction": pd.Series(dtype=str),
                 }
             )
-        return df[["timestamp", "price", "volume"]]
+        return df[columns]
 
     def set_day_verdict(
         self,
@@ -583,6 +586,26 @@ class MarketDataRepository:
         df = pd.DataFrame(rows, columns=["minute", "reasons"])
         df["minute"] = pd.to_datetime(df["minute"], utc=True, format="ISO8601")
         return df
+
+    def read_quality_events(self, after_rowid: int) -> list[tuple[int, str, str, str]]:
+        """Переходы состояния после ``after_rowid``: ``(rowid, момент, состояние, причины)``.
+
+        Таблица ``quality_events`` — outbox событий качества (SPEC-0008).
+        """
+        with self.session() as conn:
+            return [
+                (int(r[0]), str(r[1]), str(r[2]), str(r[3]))
+                for r in conn.execute(
+                    "SELECT rowid, ts, state, reasons FROM quality_events WHERE rowid > ?"
+                    " ORDER BY rowid",
+                    (after_rowid,),
+                ).fetchall()
+            ]
+
+    def max_quality_event_rowid(self) -> int:
+        with self.session() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM quality_events").fetchone()
+        return int(row[0])
 
     def quality_state(self) -> dict[str, object] | None:
         """Текущее состояние инструмента — последняя строка журнала ``quality_events``."""
@@ -1333,3 +1356,271 @@ def _iss_arrow_table(chunk: list[tuple[Any, ...]]) -> pa.Table:
         else:
             arrays[name] = values
     return pa.Table.from_pydict(arrays, schema=_ISS_ARROW_SCHEMA)
+
+
+class SignalRepository:
+    """Сигналы и outbox событий для робота (SPEC-0008): ``_sqlite/_signals.sqlite3``.
+
+    ``signals`` — выданные сигналы и их итог проверки; ``outbox`` — события в
+    порядке записи (``seq``), которые публикатор отправляет в Redis Stream
+    (at-least-once, G-5). Сигнал и его событие пишутся одной транзакцией.
+    """
+
+    def __init__(self, repo_path: Path) -> None:
+        sqlite_dir = repo_path / "_sqlite"
+        sqlite_dir.mkdir(parents=True, exist_ok=True)
+        self._db_path = sqlite_dir / "_signals.sqlite3"
+
+    @contextmanager
+    def session(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self._db_path, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=FULL;")  # событие не должно теряться (G-5)
+            conn.execute("PRAGMA busy_timeout=15000;")
+            self._ensure_schema(conn)
+            yield conn
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _ensure_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signals (
+                signal_id       TEXT PRIMARY KEY,
+                ticker          TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                class           TEXT NOT NULL,
+                direction       TEXT NOT NULL,
+                window_from     TEXT NOT NULL,
+                window_to       TEXT NOT NULL,
+                verify_deadline TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                outcome         TEXT,
+                reason          TEXT,
+                event_json      TEXT NOT NULL,
+                emitted_at      TEXT NOT NULL,
+                resolved_at     TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals (status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_window ON signals (window_to)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbox (
+                seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id        TEXT NOT NULL UNIQUE,
+                event_json      TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL,
+                delivered_at    TEXT,
+                last_error      TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox (delivered_at, seq)")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+    # ------------------------------------------------------------------ #
+    # Сигналы
+    # ------------------------------------------------------------------ #
+    def add_signal(self, signal: dict[str, object], event_json: str, now: str) -> None:
+        """Сигнал (``PENDING``) и его событие в outbox — одной транзакцией."""
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO signals (signal_id, ticker, event_type, class,"
+                    " direction, window_from, window_to, verify_deadline, status, event_json,"
+                    " emitted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)",
+                    (
+                        signal["signal_id"],
+                        signal["ticker"],
+                        signal["event_type"],
+                        signal["class"],
+                        signal["direction"],
+                        signal["window_from"],
+                        signal["window_to"],
+                        signal["verify_deadline"],
+                        event_json,
+                        now,
+                    ),
+                )
+                self._enqueue(conn, str(signal["signal_id"]), event_json, now)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def add_suppressed(
+        self, signal: dict[str, object], reason: str, event_json: str, now: str
+    ) -> None:
+        """Отсеянный сигнал (G-3): только для статистики, в outbox не попадает."""
+        with self.session() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO signals (signal_id, ticker, event_type, class,"
+                " direction, window_from, window_to, verify_deadline, status, reason,"
+                " event_json, emitted_at, resolved_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUPPRESSED', ?, ?, ?, ?)",
+                (
+                    signal["signal_id"],
+                    signal["ticker"],
+                    signal["event_type"],
+                    signal["class"],
+                    signal["direction"],
+                    signal["window_from"],
+                    signal["window_to"],
+                    signal["verify_deadline"],
+                    reason,
+                    event_json,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def pending_signals(self) -> list[dict[str, object]]:
+        """Сигналы без итога проверки, по времени окна."""
+        with self.session() as conn:
+            cur = conn.execute(
+                "SELECT signal_id, ticker, event_type, class, direction, window_from, window_to,"
+                " verify_deadline, event_json FROM signals WHERE status = 'PENDING'"
+                " ORDER BY window_to"
+            )
+            names = [c[0] for c in cur.description]
+            return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+    def resolve_signal(
+        self,
+        signal_id: str,
+        status: str,
+        outcome: str | None,
+        reason: str | None,
+        event_id: str,
+        event_json: str,
+        now: str,
+    ) -> bool:
+        """Итог проверки и его событие — одной транзакцией; ``False`` — итог уже был (G-4)."""
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                cur = conn.execute(
+                    "UPDATE signals SET status = ?, outcome = ?, reason = ?, resolved_at = ?"
+                    " WHERE signal_id = ? AND status = 'PENDING'",
+                    (status, outcome, reason, now, signal_id),
+                )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return False
+                self._enqueue(conn, event_id, event_json, now)
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
+    def read_signals(self, start: str, end: str, ticker: str | None = None) -> pd.DataFrame:
+        """Сигналы с концом окна в ``[start, end)``."""
+        sql = (
+            "SELECT signal_id, ticker, event_type, class, direction, window_from, window_to,"
+            " verify_deadline, status, outcome, reason, emitted_at, resolved_at, event_json"
+            " FROM signals WHERE window_to >= ? AND window_to < ?"
+        )
+        params: list[str] = [start, end]
+        if ticker is not None:
+            sql += " AND ticker = ?"
+            params.append(ticker)
+        with self.session() as conn:
+            return pd.read_sql_query(sql + " ORDER BY window_to", conn, params=tuple(params))
+
+    # ------------------------------------------------------------------ #
+    # Outbox
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _enqueue(conn: sqlite3.Connection, event_id: str, event_json: str, now: str) -> None:
+        conn.execute(
+            "INSERT OR IGNORE INTO outbox (event_id, event_json, created_at, next_attempt_at)"
+            " VALUES (?, ?, ?, ?)",
+            (event_id, event_json, now, now),
+        )
+
+    def enqueue_events(
+        self, events: Sequence[tuple[str, str]], now: str, meta: dict[str, str] | None = None
+    ) -> None:
+        """События ``(event_id, json)`` в outbox и курсоры ``meta`` — одной транзакцией."""
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                for event_id, event_json in events:
+                    self._enqueue(conn, event_id, event_json, now)
+                for key, value in (meta or {}).items():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value)
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def due_events(self, now: str, limit: int = 100) -> list[tuple[int, str, str, int]]:
+        """Недоставленные события по порядку: ``(seq, event_id, json, попыток)``.
+
+        Выдаются подряд с самого раннего; если оно ещё ждёт повтора, не выдаётся
+        ничего — порядок публикации сохраняется (итог — после своего сигнала).
+        """
+        with self.session() as conn:
+            rows = conn.execute(
+                "SELECT seq, event_id, event_json, attempts, next_attempt_at FROM outbox"
+                " WHERE delivered_at IS NULL ORDER BY seq LIMIT ?",
+                (limit,),
+            ).fetchall()
+        if not rows or str(rows[0][4]) > now:
+            return []
+        return [(int(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in rows]
+
+    def mark_delivered(self, seq: int, now: str) -> None:
+        with self.session() as conn:
+            conn.execute(
+                "UPDATE outbox SET delivered_at = ?, attempts = attempts + 1, last_error = NULL"
+                " WHERE seq = ?",
+                (now, seq),
+            )
+            conn.commit()
+
+    def defer_event(self, seq: int, error: str, next_attempt_at: str) -> None:
+        with self.session() as conn:
+            conn.execute(
+                "UPDATE outbox SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?"
+                " WHERE seq = ?",
+                (error[:500], next_attempt_at, seq),
+            )
+            conn.commit()
+
+    def outbox_backlog(self) -> int:
+        with self.session() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM outbox WHERE delivered_at IS NULL").fetchone()
+        return int(row[0])
+
+    def purge_before(self, cutoff: str) -> None:
+        """Хранение 90 суток: сигналы с итогом и доставленные события старше ``cutoff``."""
+        with self.session() as conn:
+            conn.execute(
+                "DELETE FROM signals WHERE status != 'PENDING' AND window_to < ?", (cutoff,)
+            )
+            conn.execute(
+                "DELETE FROM outbox WHERE delivered_at IS NOT NULL AND created_at < ?", (cutoff,)
+            )
+            conn.commit()
+
+    def get_meta(self, key: str) -> str | None:
+        with self.session() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row[0])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.session() as conn:
+            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+            conn.commit()

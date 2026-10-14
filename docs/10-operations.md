@@ -36,6 +36,7 @@ cluster-source
 | `{data_dir}/history/{storage}/*.parquet` | Холодное хранилище | да — день будет догружен, если входит в `history_check_days` и отсутствует в SQLite |
 | `{data_dir}/history/_sqlite/_iss.sqlite3` | Лента Мосбиржи текущего дня и статусы полноты | **нет**: ISS отдаёт только текущий день |
 | `{data_dir}/history/_iss/{market}/*.parquet` | Лента Мосбиржи прошедших дней | **нет**: восстановить нельзя |
+| `{data_dir}/history/_sqlite/_signals.sqlite3` | Сигналы и outbox событий для робота (SPEC-0008) | нет: недоставленные события потеряются |
 | `{data_dir}/history/_iss_raw/` | Сырые файлы ленты ISS для ручного импорта (10.4.1); обычно отсутствует | после импорта (`raw_imported` в `iss_meta`) |
 
 ## 10.4. Регламент
@@ -92,6 +93,34 @@ pmset -g log | grep -E " (Sleep|Wake) "
 импортирует их при ближайшем обслуживании (раз в час) — только за дни, лента
 которых в ISS уже сменилась; дубли отсекаются ключом уникальности.
 
+### 10.4.2. Сигналы и Redis (SPEC-0008)
+
+Сигналы публикуются в Redis робота — контейнер `redis` (Docker Desktop, порт
+`127.0.0.1:6379`, AOF `appendfsync always`, том `redis-data`), созданный
+2026-10-14 так:
+
+```bash
+docker run -d --name redis --restart unless-stopped -p 127.0.0.1:6379:6379 -v redis-data:/data redis:7.4-alpine redis-server --appendonly yes --appendfsync always
+```
+
+Включение — в `config.local.yaml` раздел `signals:` с `enabled: true`
+(остальное по умолчанию, см. [4](04-configuration.md)); пароль Redis, если
+нужен, — переменная окружения `CLUSTER_SOURCE_REDIS_PASSWORD`. Нормы
+считаются после стартового обслуживания (~1,5 с на инструмент), до этого
+сигналов нет.
+
+Если Redis недоступен, сбор и сигналы работают, события копятся в
+`_signals.sqlite3` и уходят после запуска Redis (`EVENTS_PUBLISH_FAILED` в
+логе). Проверить поток:
+
+```bash
+docker exec redis redis-cli XLEN cluster.events
+```
+
+```bash
+docker exec redis redis-cli XREVRANGE cluster.events + - COUNT 3
+```
+
 ## 10.5. Формат лога и ключевые сообщения
 
 Формат: `%(asctime)s [%(levelname)s] %(name)s: %(message)s`, уровень INFO,
@@ -128,6 +157,13 @@ pmset -g log | grep -E " (Sleep|Wake) "
 | `RECONCILE X: минут N (VERIFIED a, REPAIRED b, GAP c), дозалито K сделок, до T` | INFO / WARNING | Сверка с лентой Мосбиржи (SPEC-0005); WARNING, если были REPAIRED или GAP | Много REPAIRED — стрим теряет сделки (см. `DATA_DEGRADED`); GAP — разобрать `minute_verdicts.detail` |
 | `ISS_DIRECTION_MISMATCH X минута M` | ERROR | Стороны сделок стрима и ISS расходятся — дозаливка остановлена для минуты | Проверить маппинг направления |
 | `DATA_RESTORED X` | INFO | Причины деградации устранены | — |
+| `SIGNAL X type direction: окно …` | INFO | Сигнал выдан и записан в outbox (SPEC-0008) | — |
+| `SIGNAL_SUPPRESSED X type: причина` | INFO | Сигнал отсеян: `degraded`, `degraded_minute`, `signals_paused` | Много — смотреть `DATA_DEGRADED` |
+| `SIGNAL_CONFIRMED X id: VERIFIED/REPAIRED` / `SIGNAL_REVOKED X id: reason` | INFO / WARNING | Итог проверки сигнала | Доля отзывов — `reader.get_signal_stats` |
+| `SIGNAL_DETECTOR_OFF X: в окне норм меньше N дней` | WARNING | Нет норм — сигналов по инструменту нет (G-6) | Ждать накопления FINAL/ARCHIVE_CONSISTENT-дней |
+| `SIGNALS_PAUSED X` | WARNING | Очередь детекторов переполнена; сбор не пострадал | Повторяется — проверить нагрузку CPU |
+| `EVENTS_PUBLISH_FAILED: …; в outbox N событий` | WARNING | Redis недоступен; события ждут в outbox (не чаще раза в минуту) | Запустить Redis (`docker start redis`) |
+| `Нормы сигналов: детекторы включены у N из M инструментов` | INFO | Нормы пересчитаны (старт, ночь) | — |
 | `Стрим сделок мёртв: нет кадров N с` | ERROR | При идущих торгах сервер молчит — переподключение | Самовосстановление |
 | `Подписка на торговые статусы подтверждена: N из M` | INFO | Статусы для детектора тишины | N < M — у части инструментов тишина не контролируется |
 | `ISS X D: +N сделок, курсор K` | INFO | Лента Мосбиржи догнана | — |

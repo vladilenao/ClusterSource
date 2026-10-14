@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from cluster_source.config import AppConfig
-from cluster_source.database import IssTapeRepository, MarketDataRepository
+from cluster_source.database import IssTapeRepository, MarketDataRepository, SignalRepository
 
 logger = logging.getLogger(__name__)
 
@@ -284,3 +284,45 @@ def get_oi_flow(
     )
     bars = bars[bars["trades"] > 0].reset_index(drop=True)
     return bars[OI_FLOW_COLUMNS]
+
+
+# ---------------------------------------------------------------------- #
+# Сигналы (SPEC-0008)
+# ---------------------------------------------------------------------- #
+def _utc_iso(moment: datetime) -> str:
+    moment = moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def get_signals(
+    repo: SignalRepository, start: datetime, end: datetime, ticker: str | None = None
+) -> pd.DataFrame:
+    """Сигналы с концом окна в ``[start, end)``: статус ``PENDING`` / ``CONFIRMED`` /
+    ``REVOKED`` / ``SUPPRESSED``, ``outcome`` / ``reason``, событие (``event_json``)."""
+    return repo.read_signals(_utc_iso(start), _utc_iso(end), ticker)
+
+
+def get_signal_stats(repo: SignalRepository, start: datetime, end: datetime) -> pd.DataFrame:
+    """Режим наблюдения (SPEC-0001): по инструменту и типу — выдано, подтверждено,
+    отозвано по причинам, отсеяно, доля отзывов и медианная задержка итога, мин."""
+    df = repo.read_signals(_utc_iso(start), _utc_iso(end))
+    columns = ["ticker", "event_type", "status", "reason", "count"]
+    if df.empty:
+        return pd.DataFrame(columns=[*columns, "revoked_share", "verify_delay_min"])
+    df["reason"] = df["reason"].fillna("")
+    counts = df.groupby(["ticker", "event_type", "status", "reason"]).size().reset_index()
+    counts.columns = columns
+    issued = df.loc[df["status"] != "SUPPRESSED"].groupby(["ticker", "event_type"]).size()
+    revoked = df.loc[df["status"] == "REVOKED"].groupby(["ticker", "event_type"]).size()
+    share = (revoked / issued).fillna(0.0).rename("revoked_share")
+    resolved = df.loc[df["status"].isin(["CONFIRMED", "REVOKED"])]
+    delay = (
+        pd.to_datetime(resolved["resolved_at"], utc=True, format="ISO8601")
+        - pd.to_datetime(resolved["window_to"], utc=True, format="ISO8601")
+    ).dt.total_seconds() / 60.0
+    delays = delay.groupby([resolved["ticker"], resolved["event_type"]]).median()
+    out = counts.merge(share.reset_index(), on=["ticker", "event_type"], how="left")
+    out = out.merge(
+        delays.rename("verify_delay_min").reset_index(), on=["ticker", "event_type"], how="left"
+    )
+    return out

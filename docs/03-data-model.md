@@ -139,7 +139,8 @@ classDiagram
 ├── _sqlite/
 │   ├── SBER.sqlite3                     # горячее хранилище (+ -wal, -shm)
 │   ├── Si_CONTINUOUS.sqlite3
-│   └── _iss.sqlite3                     # лента Мосбиржи текущего дня (SPEC-0003)
+│   ├── _iss.sqlite3                     # лента Мосбиржи текущего дня (SPEC-0003)
+│   └── _signals.sqlite3                 # сигналы и outbox событий для робота (SPEC-0008)
 ├── _iss/
 │   ├── shares/2026-10-12.parquet        # лента рынка акций, 1 файл = 1 лента ISS (feed_date, МСК)
 │   └── forts/2026-10-12.parquet         # лента FORTS
@@ -376,3 +377,43 @@ SQLite → Parquet — `hot_rows_for_day` → `write_parquet` без измен�
 | `iss_feed_state` | ленты рынка: первая сделка (`head`), `feed_date`, сохранено строк (`offset`), курсор `last` (`TRADENO` на акциях, `RECNO` на FORTS), `caught_up` |
 | `iss_day_status` | полнота: `kind = feed` (лента догнана до смены дня, G-2) и `kind = trade_date` (сверка с `NUMTRADES`, G-5); `status` — `complete` / `incomplete` / `unverifiable` |
 | `iss_meta` | однократные операции, например `raw_imported:{market}:{date}` |
+
+## 3.8. Сигналы и outbox (SPEC-0008)
+
+`_sqlite/_signals.sqlite3`, доступ — `SignalRepository` (`synchronous=FULL`:
+событие не должно теряться).
+
+```sql
+CREATE TABLE signals (
+    signal_id       TEXT PRIMARY KEY,   -- = event_id сигнала
+    ticker          TEXT NOT NULL,      -- ключ хранения
+    event_type      TEXT NOT NULL,      -- large_aggressor | volume_spike | …
+    class           TEXT NOT NULL,      -- fast | level
+    direction       TEXT NOT NULL,      -- long | short | neutral
+    window_from     TEXT NOT NULL,      -- окно данных [from, to), UTC ISO …Z
+    window_to       TEXT NOT NULL,
+    verify_deadline TEXT NOT NULL,      -- window_to + 20 мин
+    status          TEXT NOT NULL,      -- PENDING | CONFIRMED | REVOKED | SUPPRESSED
+    outcome         TEXT,               -- VERIFIED | REPAIRED (CONFIRMED)
+    reason          TEXT,               -- причина REVOKED / SUPPRESSED
+    event_json      TEXT NOT NULL,      -- событие сигнала (конверт AsyncAPI)
+    emitted_at      TEXT NOT NULL,
+    resolved_at     TEXT
+);
+CREATE TABLE outbox (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,  -- порядок публикации
+    event_id        TEXT NOT NULL UNIQUE,
+    event_json      TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    delivered_at    TEXT,
+    last_error      TEXT
+);
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- quality_rowid:{ticker}
+```
+
+Сигнал и его событие, итог и его событие пишутся одной транзакцией.
+События качества переносятся в `outbox` из `quality_events` инструментов по
+курсору `meta['quality_rowid:{ticker}']`. Хранение — `signals.redis.retention_days`
+(90 суток): удаляются сигналы с итогом и доставленные события.

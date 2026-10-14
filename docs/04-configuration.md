@@ -33,6 +33,15 @@ check-jsonschema --schemafile docs/contracts/schemas/config.schema.json config.y
 | `history_check_days` | integer ≥ 1 | `14` | `history_check_days` | догрузка | Окно в днях (включая сегодняшний) для догрузки отсутствующих и перекачки отмеченных дней; более старые отметки снимаются |
 | `iss.enabled` | boolean | `true` | `iss.enabled` | `amain` | Собирать ленту Мосбиржи из ISS ([SPEC-0003](specs/0003-iss-collection.md)) |
 | `iss.poll_interval_sec` | number | `60` | `iss.poll_interval_sec` | `IssCollector` | Пауза между циклами догонки ленты, с |
+| `signals.enabled` | boolean | `false` | `signals.enabled` | `amain` | Сигналы по объёмам и их публикация в Redis Stream ([SPEC-0008](specs/0008-volume-signals.md)) |
+| `signals.redis.host` / `port` / `db` | string / integer / integer | `127.0.0.1` / `6379` / `0` | `signals.redis.*` | `EventPublisher` | Redis робота; пароль — только переменная окружения `CLUSTER_SOURCE_REDIS_PASSWORD` |
+| `signals.redis.stream` | string | `cluster.events` | `signals.redis.stream` | `EventPublisher` | Redis Stream событий ([AsyncAPI](contracts/asyncapi/cluster-source-events.asyncapi.yaml)) |
+| `signals.redis.retention_days` | integer | `90` | `signals.redis.retention_days` | `EventPublisher` | Хранение событий: ежесуточный `XTRIM MINID`; столько же хранятся сигналы в `_signals.sqlite3` |
+| `signals.verify_deadline_min` | number | `20` | `signals.verify_deadline_min` | `SignalEngine` | Срок итога проверки сигнала после конца окна (SPEC-0001 G-2) |
+| `signals.baseline_days` / `baseline_min_days` | integer | `20` / `5` | `signals.*` | `compute_norms` | Окно норм (`get_baseline_days`) и минимум дней, без которого детекторы инструмента выключены |
+| `signals.large_aggressor_percentile` | number | `99.9` | `signals.*` | `LargeAggressorDetector` | Перцентиль размера родительской заявки по режиму торгов |
+| `signals.volume_spike_ratio` / `volume_spike_percentile` | number | `5` / `90` | `signals.*` | `VolumeSpikeDetector` | Объём минуты ≥ ratio × медиана той же минуты дня и ≥ перцентиля минутных объёмов режима |
+| `signals.regimes` | object | акции: утро 06:50–10:00, основная 10:00–19:00, вечер 19:00–24:00; FORTS: утро 06:50–09:00, основная 09:00–19:00, вечер 19:00–24:00 | `signals.regimes.{shares,forts}.{режим}: [начало, конец]` | `regime_of` | Режимы торгов МСК для норм; суббота и воскресенье — `weekend` |
 | `keep_awake` | boolean | `true` | `keep_awake` | `main` | macOS: запрещать сон по простою, пока работает процесс (`caffeinate -i -w PID`, [SPEC-0010](specs/0010-keep-awake.md)) |
 | `tickers` | array | `[]` | `instruments` | все компоненты | Список инструментов (4.3) |
 

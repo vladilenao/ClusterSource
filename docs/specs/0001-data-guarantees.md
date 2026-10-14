@@ -149,9 +149,9 @@ ClusterSource полностью отвечает за чистоту и пол�
 
 - Таблица статусов качества по минутам — в SQLite инструмента, доступ только
   через `MarketDataRepository` (инвариант A1).
-- Контракт сигналов и событий качества — новый файл
-  `docs/contracts/asyncapi/cluster-source-signals.asyncapi.yaml` (при
-  реализации SPEC-0008). Канал доставки роботу выбирается в SPEC-0008.
+- Контракт сигналов и событий качества —
+  [`docs/contracts/asyncapi/cluster-source-events.asyncapi.yaml`](../contracts/asyncapi/cluster-source-events.asyncapi.yaml);
+  канал доставки роботу — Redis Stream `cluster.events` (SPEC-0008).
 
 ## Наблюдаемость
 
@@ -164,10 +164,10 @@ ClusterSource полностью отвечает за чистоту и пол�
 
 | № | Критерий | Тест |
 |---|----------|------|
-| A-1 | При `DEGRADED` в окне сигнал не выдаётся | при реализации SPEC-0008 |
-| A-2 | Итог проверки выдаётся каждому сигналу не позднее `T_verify` | при реализации SPEC-0005/0008 |
-| A-3 | При недоступном ISS к сроку выдаётся `verification_unavailable` | при реализации SPEC-0005 |
-| A-4 | Расчёт порогов читает только `FINAL`-дни | при реализации SPEC-0006/0008 |
+| A-1 | При `DEGRADED` в окне сигнал не выдаётся | `tests/test_signals.py::test_signal_suppressed_on_degraded` (SPEC-0008) |
+| A-2 | Итог проверки выдаётся каждому сигналу не позднее `T_verify` | `tests/test_signals.py::test_verification_outcomes` (SPEC-0008) |
+| A-3 | При недоступном ISS к сроку выдаётся `verification_unavailable` | `tests/test_signals.py::test_verification_outcomes` (SPEC-0008) |
+| A-4 | Расчёт порогов читает только `FINAL`-дни (добор `ARCHIVE_CONSISTENT` — решение SPEC-0006) | `tests/test_final.py::test_baseline_window_prefers_final`, `tests/test_signals.py::test_detector_off_without_baseline` |
 
 ## Затронутые документы
 
@@ -178,7 +178,7 @@ G-1…G-3), [08-footprint-reader.md](../08-footprint-reader.md),
 
 ## Открытые вопросы
 
-- [ ] Канал доставки сигналов роботу (callback в процессе, очередь, Redis, Telegram) — решается в SPEC-0008.
+- [x] Канал доставки сигналов роботу — Redis Stream `cluster.events` в Redis робота (SPEC-0008, 2026-10-14).
 - [ ] Значение `T_verify` проверить на практике: задержка ISS 15 мин + опрос + обработка.
 
 ## Журнал решений

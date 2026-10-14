@@ -17,7 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -35,10 +35,12 @@ from cluster_source.config import (
     InstrumentType,
     nearest_contract,
 )
-from cluster_source.database import IssTapeRepository, MarketDataRepository
+from cluster_source.database import IssTapeRepository, MarketDataRepository, SignalRepository
 from cluster_source.iss import MSK, HttpIssClient, IssCollector
 from cluster_source.quality import REASON_BACKLOG, REASON_WRITE_FAILURE
 from cluster_source.reconcile import Reconciler
+from cluster_source.signals.engine import SignalEngine
+from cluster_source.signals.publisher import EventPublisher
 from cluster_source.stream_hub import (
     MAX_SUBSCRIPTIONS_PER_STREAM,
     ConnectionFactory,
@@ -510,6 +512,33 @@ async def amain(config: AppConfig) -> int:
     # SPEC-0009: одно стрим-соединение на все инструменты (лимит T-Invest — 16).
     hub = StreamHub(collectors, make_connection_factory(config))
 
+    engine: SignalEngine | None = None
+    signal_tasks: list[Coroutine[Any, Any, None]] = []
+    if config.signals.enabled:
+        # SPEC-0008: сигналы по объёмам и доставка роботу (Redis Stream cluster.events).
+        signal_repo = SignalRepository(config.storage_root)
+
+        def secid_of(name: str) -> str | None:
+            return hub.tickers.get(name)
+
+        engine = SignalEngine(
+            config,
+            repos,
+            {c.instrument.storage_name: c for c in collectors},
+            signal_repo,
+            secid_of,
+        )
+        for collector in collectors:
+            collector.tick_listener = engine.feed  # SPEC-0008 G-2: не блокирует сбор
+        publisher = EventPublisher(config, signal_repo, repos, secid_of)
+
+        async def signal_norms(eng: SignalEngine = engine) -> None:
+            # Нормы — после стартового обслуживания (FINAL-дни), под тем же замком.
+            async with maintenance_lock:
+                await eng.refresh_norms()
+
+        signal_tasks = [engine.run(), engine.verify_loop(), publisher.run(), signal_norms()]
+
     stop_event = asyncio.Event()
 
     def _on_signal() -> None:
@@ -530,6 +559,8 @@ async def amain(config: AppConfig) -> int:
     async def nightly() -> None:
         async with maintenance_lock:
             await run_maintenance(config, repos, gate=archive_gate)
+            if engine is not None:  # SPEC-0008: нормы по новым FINAL-дням
+                await engine.refresh_norms()
         # Активный контракт непрерывного фьючерса мог смениться (экспирация).
         if any(c.instrument.is_continuous for c in collectors):
             hub.request_reconnect(resolve=True)
@@ -544,6 +575,7 @@ async def amain(config: AppConfig) -> int:
         scheduler_task,
         cleanup_task,
         asyncio.create_task(startup_maintenance(config, repos, archive_gate, maintenance_lock)),
+        *(asyncio.create_task(task) for task in signal_tasks),
     ]
     if config.iss.enabled:
         # SPEC-0003: лента Мосбиржи — источник номеров сделок и ОИ по сделкам.

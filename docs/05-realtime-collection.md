@@ -279,3 +279,14 @@ stateDiagram-v2
 (`+2 × количество` — обе стороны открыли, `−2 × количество` — закрыли,
 `0` — передача). Поток ОИ по ленте ISS — `reader.get_oi_flow`
 ([8.3.1](08-footprint-reader.md#831-качество-данных-spec-0004)).
+
+## 5.11. Разветвление потока для сигналов (SPEC-0008)
+
+При `signals.enabled` продюсер `DataCollector.deliver` после фильтров и
+детекторов качества отдаёт тик в `SignalEngine.feed` (`tick_listener`) —
+`put_nowait` в очередь на 100 000 тиков. Сбор никогда не ждёт детекторов
+(G-2): при переполнении тик для детекторов теряется, сигналы инструмента
+приостанавливаются на минуту потери и следующую (`SIGNALS_PAUSED`), окна,
+задевающие паузу, отсеиваются как `signals_paused`. Детекторы и проверка —
+[SPEC-0008](specs/0008-volume-signals.md); доставка роботу — Redis Stream
+`cluster.events` ([AsyncAPI](contracts/asyncapi/cluster-source-events.asyncapi.yaml)).

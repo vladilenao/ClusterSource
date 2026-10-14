@@ -177,6 +177,8 @@ class DataCollector:
         self._minute_unknown = 0
         #: SPEC-0007: ряд открытого интереса из стрима; пишет консьюмер (A2).
         self._pending_oi: list[tuple[datetime, int]] = []
+        #: SPEC-0008 G-2: разветвление потока для детекторов сигналов (не блокирует).
+        self.tick_listener: Callable[[str, Tick], None] | None = None
 
     def on_stream_opened(self) -> None:
         """Стрим (пере)открыт: сделки до этого момента не получены.
@@ -200,6 +202,8 @@ class DataCollector:
             return
         tick = _to_dto(payload, self._instrument)
         self._observe(tick)
+        if self.tick_listener is not None:
+            self.tick_listener(self._instrument.storage_name, tick)  # SPEC-0008 G-2
         if self._queue.qsize() >= BACKLOG_HIGH:
             self.quality.begin(REASON_BACKLOG, self._now(), self._now())
         await self._queue.put(tick)

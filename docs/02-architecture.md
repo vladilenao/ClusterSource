@@ -46,6 +46,11 @@ flowchart TB
     ISSREPO --> STORE
     REPO --> STORE
     BOT --> READ
+    COLL -.->|"feed(tick), не блокирует"| SIG["signals/engine.py<br/>SignalEngine"]
+    SIG -->|"outbox"| SIGREPO["database.py<br/>SignalRepository"]
+    PUB["signals/publisher.py<br/>EventPublisher"] --> SIGREPO
+    PUB -->|"XADD cluster.events"| REDIS[("Redis робота")]
+    BOT -->|"Consumer Group"| REDIS
 ```
 
 ## 2.2. Модули
@@ -53,10 +58,13 @@ flowchart TB
 | Модуль | Ключевые объекты | Ответственность | Зависит от |
 |--------|------------------|-----------------|------------|
 | `config.py` | `AppConfig`, `BatchConfig`, `ArchiverConfig`, `Instrument`, `InstrumentType`, `Direction`, `FuturesMeta`, `nearest_contract`, `parse_direction` | Разбор `config.yaml`, доменная модель: правило `storage_name`, выбор активного контракта, нормализация направления | `pyyaml` |
-| `database.py` | `MarketDataRepository`, `IssTapeRepository`, `DataCorruptionError`, `HOT_RETENTION_DAYS = 7` | Единственная точка доступа к SQLite и Parquet: тики инструментов и лента Мосбиржи | `config`, `pandas`, `pyarrow`, `sqlite3` |
+| `database.py` | `MarketDataRepository`, `IssTapeRepository`, `SignalRepository`, `DataCorruptionError`, `HOT_RETENTION_DAYS = 7` | Единственная точка доступа к SQLite и Parquet: тики инструментов и лента Мосбиржи | `config`, `pandas`, `pyarrow`, `sqlite3` |
 | `iss.py` | `IssCollector`, `HttpIssClient`, `normalize_trades`, `trade_time_utc` | Сбор ленты Мосбиржи из ISS, смена дня, импорт этапа 1, проверка полноты ([SPEC-0003](specs/0003-iss-collection.md)) | `config`, `database`, `autoload._ssl_context`, `aiohttp` |
 | `collector.py` | `DataCollector`, `Tick`, `InstrumentNotFound`, `_to_dto` | Приём сделок инструмента (Producer `deliver`) и пакетная запись (Consumer), отметки неполных дней | `config`, `database` |
 | `final.py` | `run_final_check`, `fetch_totals`, `trading_spans` | Ночной вердикт торгового дня против эталона биржи ([SPEC-0006](specs/0006-final-day.md)) | `config`, `database`, `iss`, `autoload` |
+| `signals/engine.py` | `SignalEngine` | Разветвление потока, отсев по качеству, выдача и проверка сигналов за 20 минут ([SPEC-0008](specs/0008-volume-signals.md)) | `collector`, `database`, `quality`, `reconcile`, `signals.*` |
+| `signals/detectors.py`, `signals/baseline.py` | `LargeAggressorDetector`, `VolumeSpikeDetector`, `Norms`, `compute_norms`, `regime_of` | Детекторы MVP и нормы по окну `get_baseline_days` | `config`, `database`, `reader` |
+| `signals/publisher.py`, `signals/events.py` | `EventPublisher`, `envelope`, `event_id` | Outbox → Redis Stream `cluster.events` ([AsyncAPI](contracts/asyncapi/cluster-source-events.asyncapi.yaml)) | `database`, `redis` |
 | `reconcile.py` | `Reconciler`, `reconcile_minute`, `MinuteResult` | Сверка стрима с лентой ISS, дозаливка, вердикты минут ([SPEC-0005](specs/0005-iss-reconciliation.md)) | `config`, `database`, `quality` |
 | `quality.py` | `InstrumentQuality`, причины `REASON_*`, `is_normal_trading`, `minutes_between` | Условия деградации и отметки минут инструмента ([SPEC-0004](specs/0004-degradation-detectors.md)) | — |
 | `stream_hub.py` | `StreamHub`, `HubConnection`, `ConnectionFactory`, `subscription_ok` | Одно стрим-соединение на все инструменты: подписка, раздача сделок по FIGI, проверка подтверждений, переподключение ([SPEC-0009](specs/0009-single-market-data-stream.md)) | `collector`, `config` |

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -166,6 +167,76 @@ class IssConfig:
 
 
 @dataclass(frozen=True)
+class RedisConfig:
+    """Redis робота для событий ClusterSource (SPEC-0008). Пароль — только из
+    переменной окружения ``CLUSTER_SOURCE_REDIS_PASSWORD``."""
+
+    host: str = "127.0.0.1"
+    port: int = 6379
+    db: int = 0
+    stream: str = "cluster.events"
+    retention_days: int = 90
+
+
+#: Режимы торгов по рынкам: ``[начало, конец)`` МСК, ``HH:MM`` (SPEC-0008).
+#: Границы — по распределению сделок 13.10: основная сессия акций с 10:00,
+#: фьючерсов — с 09:00, вечерняя — с 19:00. Суббота и воскресенье — ``weekend``.
+DEFAULT_REGIMES: dict[str, dict[str, tuple[str, str]]] = {
+    "shares": {
+        "morning": ("06:50", "10:00"),
+        "main": ("10:00", "19:00"),
+        "evening": ("19:00", "24:00"),
+    },
+    "forts": {
+        "morning": ("06:50", "09:00"),
+        "main": ("09:00", "19:00"),
+        "evening": ("19:00", "24:00"),
+    },
+}
+
+
+@dataclass(frozen=True)
+class SignalsConfig:
+    """Сигналы по объёмам и их доставка роботу (SPEC-0008)."""
+
+    enabled: bool = False
+    redis: RedisConfig = field(default_factory=RedisConfig)
+    verify_deadline_min: float = 20.0
+    baseline_days: int = 20
+    baseline_min_days: int = 5
+    large_aggressor_percentile: float = 99.9
+    volume_spike_ratio: float = 5.0
+    volume_spike_percentile: float = 90.0
+    regimes: dict[str, dict[str, tuple[str, str]]] = field(
+        default_factory=lambda: {m: dict(r) for m, r in DEFAULT_REGIMES.items()}
+    )
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> SignalsConfig:
+        redis_raw = raw.get("redis", {}) or {}
+        regimes = {m: dict(r) for m, r in DEFAULT_REGIMES.items()}
+        for market, items in (raw.get("regimes", {}) or {}).items():
+            regimes[market] = {name: (str(v[0]), str(v[1])) for name, v in items.items()}
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            redis=RedisConfig(
+                host=str(redis_raw.get("host", "127.0.0.1")),
+                port=int(redis_raw.get("port", 6379)),
+                db=int(redis_raw.get("db", 0)),
+                stream=str(redis_raw.get("stream", "cluster.events")),
+                retention_days=int(redis_raw.get("retention_days", 90)),
+            ),
+            verify_deadline_min=float(raw.get("verify_deadline_min", 20.0)),
+            baseline_days=int(raw.get("baseline_days", 20)),
+            baseline_min_days=int(raw.get("baseline_min_days", 5)),
+            large_aggressor_percentile=float(raw.get("large_aggressor_percentile", 99.9)),
+            volume_spike_ratio=float(raw.get("volume_spike_ratio", 5.0)),
+            volume_spike_percentile=float(raw.get("volume_spike_percentile", 90.0)),
+            regimes=regimes,
+        )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     token: str
     data_dir: Path
@@ -176,6 +247,7 @@ class AppConfig:
     keep_awake: bool = True
     history_check_days: int = 14
     instruments: list[Instrument] = field(default_factory=list)
+    signals: SignalsConfig = field(default_factory=SignalsConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path, token: str | None = None) -> AppConfig:
@@ -226,6 +298,7 @@ class AppConfig:
             history_check_days=int(raw.get("history_check_days", 14)),
             keep_awake=bool(raw.get("keep_awake", True)),
             instruments=instruments,
+            signals=SignalsConfig.from_raw(raw.get("signals", {}) or {}),
         )
 
     @property

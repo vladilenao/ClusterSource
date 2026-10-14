@@ -1,0 +1,417 @@
+asyncapi: 3.0.0
+info:
+  title: ClusterSource events (Redis Stream cluster.events)
+  version: "1.0.0"
+  description: |
+    События ClusterSource для торгового робота (SPEC-0008, контракт сигнала —
+    SPEC-0001): сигналы по объёмам, итоги их проверки и смена качества данных
+    по инструменту.
+
+    Транспорт — Redis Stream `cluster.events` в Redis робота. Механика доставки
+    совпадает с `market.events` робота (My_roBot, AsyncAPI в
+    `openspec/changes/add-market-structure-patterns/proposal.md`, приложение A):
+
+    * издатель пишет событие в SQLite outbox до `XADD` и повторяет
+      недоставленные (at-least-once); повтор несёт тот же `event_id`,
+      `published_at` может отличаться;
+    * потребитель создаёт свою Consumer Group (`XGROUP CREATE cluster.events
+      <group> 0-0 MKSTREAM`), после рестарта читает свои pending с `0`, новые —
+      с `>`, делает `XACK` только после идемпотентной фиксации по `event_id`;
+      `NOACK` не используется;
+    * не реже раза в сутки издатель выполняет точный `XTRIM MINID` (время
+      Redis минус 90 суток); `MAXLEN` не применяется;
+    * Stream ID Redis — не бизнес-время; время рынка — `timestamp`.
+
+    Поля Redis Stream — строки. Числа и логические значения передаются
+    строками (`"1"`, `"true"`), объекты и массивы — JSON-строками. Схемы ниже
+    описывают значения после декодирования.
+
+    Порядок: итог (`signal_result`) публикуется после своего сигнала. Каждый
+    сигнал получает ровно один итог не позднее `verify_deadline`
+    (конец окна + 20 минут). `signal_revoked` значит «причина входа не
+    доказана», а не «сделка будет убыточной».
+servers:
+  redis:
+    host: "{redis_host}"
+    protocol: redis
+    description: Redis Streams с AOF `appendfsync always`; хранение 90 суток.
+    variables:
+      redis_host:
+        default: 127.0.0.1:6379
+
+channels:
+  clusterEvents:
+    address: cluster.events
+    description: Все события ClusterSource; фильтр — по `category` и `event_type`.
+    servers:
+      - $ref: "#/servers/redis"
+    messages:
+      signal:
+        $ref: "#/components/messages/Signal"
+      signalConfirmed:
+        $ref: "#/components/messages/SignalConfirmed"
+      signalRevoked:
+        $ref: "#/components/messages/SignalRevoked"
+      dataDegraded:
+        $ref: "#/components/messages/DataDegraded"
+      dataRestored:
+        $ref: "#/components/messages/DataRestored"
+
+operations:
+  publishEvents:
+    action: send
+    summary: ClusterSource публикует события (outbox → XADD).
+    channel:
+      $ref: "#/channels/clusterEvents"
+    messages:
+      - $ref: "#/channels/clusterEvents/messages/signal"
+      - $ref: "#/channels/clusterEvents/messages/signalConfirmed"
+      - $ref: "#/channels/clusterEvents/messages/signalRevoked"
+      - $ref: "#/channels/clusterEvents/messages/dataDegraded"
+      - $ref: "#/channels/clusterEvents/messages/dataRestored"
+  consumeEvents:
+    action: receive
+    summary: Робот читает события своей Consumer Group (например, robot-v1).
+    channel:
+      $ref: "#/channels/clusterEvents"
+    messages:
+      - $ref: "#/channels/clusterEvents/messages/signal"
+      - $ref: "#/channels/clusterEvents/messages/signalConfirmed"
+      - $ref: "#/channels/clusterEvents/messages/signalRevoked"
+      - $ref: "#/channels/clusterEvents/messages/dataDegraded"
+      - $ref: "#/channels/clusterEvents/messages/dataRestored"
+
+components:
+  messages:
+    Signal:
+      name: Signal
+      title: Сигнал по объёмам
+      summary: Выдан на данных PROVISIONAL; итог — отдельным событием до verify_deadline.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/SignalEvent"
+    SignalConfirmed:
+      name: SignalConfirmed
+      title: Сигнал подтверждён
+      summary: Окно сверено с лентой Мосбиржи (VERIFIED) или исправлено (REPAIRED) и сигнал сохранился.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/SignalConfirmedEvent"
+    SignalRevoked:
+      name: SignalRevoked
+      title: Сигнал отозван
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/SignalRevokedEvent"
+    DataDegraded:
+      name: DataDegraded
+      title: Данные инструмента деградировали (SPEC-0004)
+      summary: Пока инструмент DEGRADED, сигналов по нему нет (SPEC-0001 G-1).
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/DataDegradedEvent"
+    DataRestored:
+      name: DataRestored
+      title: Данные инструмента восстановлены
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/DataRestoredEvent"
+
+  schemas:
+    # ------------------------------------------------------------------ #
+    # Общий конверт
+    # ------------------------------------------------------------------ #
+    Envelope:
+      type: object
+      required: [schema_version, event_id, source, category, event_type, ticker, secid, timestamp, published_at]
+      properties:
+        schema_version:
+          type: integer
+          const: 1
+        event_id:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: >-
+            sha256 от cluster_source/1/{category}/{event_type}/{ticker}/{ключ}: ключ — окно и
+            направление сигнала, signal_id итога, время и причины события качества. Ключ
+            дедупликации у потребителя.
+        source:
+          type: string
+          const: cluster_source
+        category:
+          type: string
+          enum: [signal, signal_result, data_quality]
+        event_type:
+          type: string
+        ticker:
+          type: string
+          minLength: 1
+          description: Ключ хранения ClusterSource (SBER, Si_CONTINUOUS).
+          examples: [SBER, Si_CONTINUOUS]
+        secid:
+          type: string
+          minLength: 1
+          description: Тикер биржи; у непрерывного фьючерса — активный контракт.
+          examples: [SBER, SiZ6]
+        timestamp:
+          type: string
+          format: date-time
+          description: >-
+            Время рынка, UTC ISO 8601: момент события сигнала (время заявки large_aggressor,
+            конец закрытой минуты volume_spike); момент вердикта итога; момент смены качества.
+        published_at:
+          type: string
+          format: date-time
+          description: Redis TIME непосредственно перед успешной попыткой XADD, UTC ISO 8601.
+
+    # ------------------------------------------------------------------ #
+    # Сигнал
+    # ------------------------------------------------------------------ #
+    SignalEvent:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [signal_id, class, direction, timeframe, window_from, window_to, bar_closed, quality,
+                     baseline_quality, baseline_days, verify_deadline, payload]
+          properties:
+            category: {const: signal}
+            event_type:
+              enum: [large_aggressor, volume_spike, stacked_imbalance, absorption]
+            signal_id:
+              type: string
+              description: Равен event_id сигнала; по нему приходит итог.
+            class:
+              type: string
+              enum: [fast, level]
+              description: fast — живёт минуты (вход сразу, выход по revoked); level — ждать confirmed (SPEC-0001).
+            direction:
+              type: string
+              enum: [long, short, neutral]
+            timeframe:
+              type: string
+              enum: [tick, 1m, 5m]
+            window_from:
+              type: string
+              format: date-time
+            window_to:
+              type: string
+              format: date-time
+              description: Конец окна данных сигнала (не включительно).
+            bar_closed:
+              type: boolean
+            quality:
+              type: string
+              const: PROVISIONAL
+              description: Статус данных окна при выдаче (SPEC-0001).
+            baseline_quality:
+              type: string
+              enum: [pure, mixed]
+              description: pure — нормы только по FINAL-дням; mixed — в окне есть ARCHIVE_CONSISTENT (SPEC-0006).
+            baseline_days:
+              type: object
+              required: [final, archive]
+              properties:
+                final: {type: integer, minimum: 0}
+                archive: {type: integer, minimum: 0}
+            verify_deadline:
+              type: string
+              format: date-time
+              description: window_to + 20 минут — крайний срок итога.
+            payload:
+              type: object
+      oneOf:
+        - properties:
+            event_type: {const: large_aggressor}
+            class: {const: fast}
+            timeframe: {const: tick}
+            payload: {$ref: "#/components/schemas/LargeAggressorPayload"}
+        - properties:
+            event_type: {const: volume_spike}
+            class: {const: fast}
+            timeframe: {const: 1m}
+            payload: {$ref: "#/components/schemas/VolumeSpikePayload"}
+        - properties:
+            event_type: {const: stacked_imbalance}
+            class: {const: level}
+            payload: {$ref: "#/components/schemas/StackedImbalancePayload"}
+        - properties:
+            event_type: {const: absorption}
+            class: {const: level}
+            payload: {$ref: "#/components/schemas/AbsorptionPayload"}
+
+    Regime:
+      type: string
+      enum: [morning, main, evening, weekend]
+      description: Режим торгов, по которому взяты нормы.
+
+    LargeAggressorPayload:
+      type: object
+      additionalProperties: false
+      required: [trade_time, side, price_min, price_max, quantity, trades, size, size_unit, threshold, percentile, regime]
+      properties:
+        trade_time:
+          type: string
+          format: date-time
+          description: Время родительской заявки (до микросекунды).
+        side:
+          type: string
+          enum: [BUY, SELL]
+        price_min: {type: number}
+        price_max: {type: number}
+        quantity:
+          type: integer
+          description: Лоты (акции) или контракты (фьючерсы).
+        trades:
+          type: integer
+          description: Сделок в родительской заявке.
+        size:
+          type: number
+          description: Размер заявки в size_unit.
+        size_unit:
+          type: string
+          enum: [rub, contracts]
+        threshold:
+          type: number
+          description: Порог по нормам в size_unit.
+        percentile: {type: number}
+        regime: {$ref: "#/components/schemas/Regime"}
+
+    VolumeSpikePayload:
+      type: object
+      additionalProperties: false
+      required: [minute, volume, baseline_median, ratio, threshold_ratio, volume_p90, delta, regime]
+      properties:
+        minute:
+          type: string
+          format: date-time
+        volume:
+          type: number
+          description: Объём минуты (лоты / контракты).
+        baseline_median:
+          type: number
+          description: Медиана объёма этой же минуты дня по окну норм.
+        ratio: {type: number}
+        threshold_ratio: {type: number}
+        volume_p90:
+          type: number
+          description: Перцентиль 90 минутных объёмов по окну норм.
+        delta:
+          type: number
+          description: Покупки − продажи за минуту (аукционы не входят).
+        regime: {$ref: "#/components/schemas/Regime"}
+
+    BarSummary:
+      type: object
+      required: [open, high, low, close, volume, delta]
+      properties:
+        open: {type: number}
+        high: {type: number}
+        low: {type: number}
+        close: {type: number}
+        volume: {type: number}
+        delta: {type: number}
+
+    StackedImbalancePayload:
+      type: object
+      additionalProperties: false
+      required: [side, levels, ratio_min, bar]
+      properties:
+        side:
+          type: string
+          enum: [BUY, SELL]
+          description: Сторона, у которой дисбаланс.
+        levels:
+          type: array
+          minItems: 3
+          items:
+            type: object
+            required: [price, buy_volume, sell_volume, ratio]
+            properties:
+              price: {type: number}
+              buy_volume: {type: number}
+              sell_volume:
+                type: number
+                description: Объём противоположной стороны на соседнем по диагонали уровне.
+              ratio: {type: number}
+        ratio_min: {type: number}
+        bar: {$ref: "#/components/schemas/BarSummary"}
+
+    AbsorptionPayload:
+      type: object
+      additionalProperties: false
+      required: [level_price, absorbed_side, level_volume, threshold, close_distance_ticks, bar]
+      properties:
+        level_price: {type: number}
+        absorbed_side:
+          type: string
+          enum: [BUY, SELL]
+          description: Сторона агрессии, которую поглотили.
+        level_volume: {type: number}
+        threshold:
+          type: number
+          description: Перцентиль 99 объёма уровня по окну норм.
+        close_distance_ticks:
+          type: integer
+          description: Расстояние закрытия бара от экстремума, шагов цены.
+        bar: {$ref: "#/components/schemas/BarSummary"}
+
+    # ------------------------------------------------------------------ #
+    # Итог проверки
+    # ------------------------------------------------------------------ #
+    SignalConfirmedEvent:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [signal_id, outcome]
+          properties:
+            category: {const: signal_result}
+            event_type: {const: signal_confirmed}
+            signal_id: {type: string}
+            outcome:
+              type: string
+              enum: [VERIFIED, REPAIRED]
+              description: VERIFIED — окно совпало с лентой; REPAIRED — исправлено, сигнал пересчитан и сохранился.
+
+    SignalRevokedEvent:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [signal_id, reason]
+          properties:
+            category: {const: signal_result}
+            event_type: {const: signal_revoked}
+            signal_id: {type: string}
+            reason:
+              type: string
+              enum: [gap, repaired_changed_result, extra_trades, verification_unavailable]
+              description: >-
+                gap — потеря данных без исправления; repaired_changed_result — на
+                исправленных данных сигнала нет; extra_trades — в окне лишние сделки;
+                verification_unavailable — к сроку проверить нечем (в т. ч. хвост
+                вечерней сессии, SPEC-0011).
+
+    # ------------------------------------------------------------------ #
+    # Качество данных
+    # ------------------------------------------------------------------ #
+    DataDegradedEvent:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [reasons]
+          properties:
+            category: {const: data_quality}
+            event_type: {const: data_degraded}
+            reasons:
+              type: array
+              minItems: 1
+              items:
+                type: string
+                enum: [stream_gap, subscription_failed, stream_silence, latency, backlog, write_failure]
+
+    DataRestoredEvent:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            category: {const: data_quality}
+            event_type: {const: data_restored}

@@ -72,6 +72,40 @@
         }
       }
     },
+    "signals": {
+      "type": "object",
+      "description": "Сигналы по объёмам и их доставка роботу в Redis Stream (SPEC-0008).",
+      "properties": {
+        "enabled": {"type": "boolean", "default": false},
+        "redis": {
+          "type": "object",
+          "description": "Redis робота; пароль — только переменная окружения CLUSTER_SOURCE_REDIS_PASSWORD.",
+          "properties": {
+            "host": {"type": "string", "default": "127.0.0.1"},
+            "port": {"type": "integer", "default": 6379},
+            "db": {"type": "integer", "minimum": 0, "default": 0},
+            "stream": {"type": "string", "default": "cluster.events"},
+            "retention_days": {"type": "integer", "minimum": 1, "default": 90}
+          }
+        },
+        "verify_deadline_min": {"type": "number", "exclusiveMinimum": 0, "default": 20},
+        "baseline_days": {"type": "integer", "minimum": 1, "default": 20},
+        "baseline_min_days": {"type": "integer", "minimum": 1, "default": 5},
+        "large_aggressor_percentile": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "default": 99.9},
+        "volume_spike_ratio": {"type": "number", "exclusiveMinimum": 0, "default": 5},
+        "volume_spike_percentile": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "default": 90},
+        "regimes": {
+          "type": "object",
+          "description": "Режимы торгов по рынкам (shares, forts): {режим: [начало, конец]} МСК HH:MM.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array", "items": {"type": "string", "pattern": "^\\d{2}:\\d{2}$"}, "minItems": 2, "maxItems": 2
+            }
+          }
+        }
+      }
+    },
     "keep_awake": {
       "type": "boolean",
       "default": true,

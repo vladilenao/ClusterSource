@@ -38,6 +38,9 @@ REASON_DEALER_LEAK = "dealer_leak"
 #: отсутствие сделок подозрительно (G-4).
 NORMAL_TRADING = 5
 
+#: Сколько последних минут с отметками держать в памяти для отсева сигналов (SPEC-0008).
+RECENT_MARKS_KEEP = timedelta(hours=3)
+
 MinuteMark = tuple[str, str]  # (начало минуты ISO UTC, причина)
 QualityEvent = tuple[str, str, str]  # (момент ISO UTC, состояние, причины)
 
@@ -78,6 +81,8 @@ class InstrumentQuality:
         self._marked_upto: dict[str, datetime] = {}
         self._pending_minutes: set[MinuteMark] = set()
         self._pending_events: list[QualityEvent] = []
+        #: Недавние помеченные минуты — для отсева сигналов без чтения БД (SPEC-0008 G-3).
+        self._recent: dict[datetime, set[str]] = {}
 
     @property
     def state(self) -> str:
@@ -117,6 +122,20 @@ class InstrumentQuality:
         """Разовая отметка минут ``[start, end]`` без смены состояния."""
         for minute in minutes_between(start, end or start):
             self._pending_minutes.add((minute.isoformat(), reason))
+            self._recent.setdefault(minute, set()).add(reason)
+        if len(self._recent) > 1000:
+            newest = max(self._recent)
+            for old in [m for m in self._recent if newest - m > RECENT_MARKS_KEEP]:
+                del self._recent[old]
+
+    def marked_in(self, start: datetime, end: datetime) -> list[str]:
+        """Причины отметок минут, пересекающих ``[start, end)`` (последние часы, в памяти)."""
+        first, last = minute_floor(start), end
+        reasons: set[str] = set()
+        for minute, marks in self._recent.items():
+            if first <= minute < last:
+                reasons |= marks
+        return sorted(reasons)
 
     def tick(self, now: datetime) -> None:
         """Помечает текущие минуты всех активных условий (вызывает сторож хаба)."""
