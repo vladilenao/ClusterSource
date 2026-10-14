@@ -262,7 +262,8 @@ def evaluate_spike(
         "baseline_median": median,
         "ratio": round(ratio, 3),
         "threshold_ratio": config.volume_spike_ratio,
-        "volume_p90": pct,
+        "volume_pct": pct,
+        "volume_percentile": config.volume_spike_percentile,
         "delta": delta,
         "regime": regime,
     }
@@ -274,7 +275,8 @@ def recheck_volume_spike(payload: dict[str, Any], minute: pd.DataFrame, directio
     buys = minute.loc[minute["direction"] == Direction.BUY.value, "volume"].sum()
     sells = minute.loc[minute["direction"] == Direction.SELL.value, "volume"].sum()
     delta = float(buys - sells)
-    if volume < float(payload["volume_p90"]):
+    # ``volume_p90`` — имя поля в сигналах до 2026-10-15.
+    if volume < float(payload.get("volume_pct", payload.get("volume_p90", 0.0))):
         return False
     if volume / max(float(payload["baseline_median"]), 1.0) < float(payload["threshold_ratio"]):
         return False

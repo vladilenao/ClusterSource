@@ -23,7 +23,7 @@ import json
 import logging
 from collections import Counter
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
 
 import pandas as pd
@@ -65,6 +65,10 @@ STATUS_REVOKED = "REVOKED"
 SUPPRESS_DEGRADED = "degraded"
 SUPPRESS_DEGRADED_MINUTE = "degraded_minute"
 SUPPRESS_PAUSED = "signals_paused"
+
+
+def _counts(values: pd.Series) -> dict[str, int]:
+    return {str(k): int(v) for k, v in values.fillna("").value_counts().items()}
 
 
 class Detector(Protocol):
@@ -265,6 +269,44 @@ class SignalEngine:
             event["window_from"],
             event["window_to"],
             json.dumps(candidate.payload, ensure_ascii=False),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Статистика (режим наблюдения, SPEC-0001)
+    # ------------------------------------------------------------------ #
+    async def log_daily_stats(self, day: date) -> None:
+        """``SIGNAL_STATS`` за сутки UTC ``day``: выдано, итоги, отсеяно, задержка итога."""
+        start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+        df = await asyncio.to_thread(
+            self._repo.read_signals, ev.iso(start), ev.iso(start + timedelta(days=1))
+        )
+        if df.empty:
+            logger.info("SIGNAL_STATS %s: сигналов нет", day)
+            return
+        status = df["status"]
+        issued = df.loc[status != "SUPPRESSED"]
+        confirmed = df.loc[status == STATUS_CONFIRMED]
+        revoked = df.loc[status == STATUS_REVOKED]
+        resolved = df.loc[status.isin([STATUS_CONFIRMED, STATUS_REVOKED])]
+        delay = (
+            pd.to_datetime(resolved["resolved_at"], utc=True, format="ISO8601")
+            - pd.to_datetime(resolved["window_to"], utc=True, format="ISO8601")
+        ).dt.total_seconds() / 60.0
+        logger.info(
+            "SIGNAL_STATS %s: выдано %d %s, подтверждено %d %s, отозвано %d %s, без итога %d,"
+            " отсеяно %d %s; итог через %.1f мин (медиана), до %.1f мин",
+            day,
+            len(issued),
+            _counts(issued["event_type"]),
+            len(confirmed),
+            _counts(confirmed["outcome"]),
+            len(revoked),
+            _counts(revoked["reason"]),
+            int((status == "PENDING").sum()),
+            int((status == "SUPPRESSED").sum()),
+            _counts(df.loc[status == "SUPPRESSED", "reason"]),
+            float(delay.median()) if not delay.empty else 0.0,
+            float(delay.max()) if not delay.empty else 0.0,
         )
 
     # ------------------------------------------------------------------ #

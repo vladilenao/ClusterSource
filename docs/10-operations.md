@@ -161,6 +161,7 @@ docker exec redis redis-cli XREVRANGE cluster.events + - COUNT 3
 | `SIGNAL X type direction: окно …` | INFO | Сигнал выдан и записан в outbox (SPEC-0008) | — |
 | `SIGNAL_SUPPRESSED X type: причина` | INFO | Сигнал отсеян: `degraded`, `degraded_minute`, `signals_paused` | Много — смотреть `DATA_DEGRADED` |
 | `SIGNAL_CONFIRMED X id: VERIFIED/REPAIRED` / `SIGNAL_REVOKED X id: reason` | INFO / WARNING | Итог проверки сигнала | Доля отзывов — `reader.get_signal_stats` |
+| `SIGNAL_STATS D: выдано N {…}, подтверждено …, отозвано …, отсеяно …; итог через M мин` | INFO | Ежедневная сводка сигналов за сутки UTC после ночного обслуживания (режим наблюдения) | Растёт доля отзывов — разобрать причины (`reader.get_signal_stats`) |
 | `SIGNAL_DETECTOR_OFF X: в окне норм меньше N дней` | WARNING | Нет норм — сигналов по инструменту нет (G-6) | Ждать накопления FINAL/ARCHIVE_CONSISTENT-дней |
 | `SIGNALS_PAUSED X` | WARNING | Очередь детекторов переполнена; сбор не пострадал | Повторяется — проверить нагрузку CPU |
 | `EVENTS_PUBLISH_FAILED: …; в outbox N событий` | WARNING | Redis недоступен; события ждут в outbox (не чаще раза в минуту) | Запустить Redis (`docker start redis`) |

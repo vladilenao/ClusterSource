@@ -18,7 +18,7 @@ import signal
 import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -587,8 +587,9 @@ async def amain(config: AppConfig) -> int:
     async def nightly() -> None:
         async with maintenance_lock:
             await run_maintenance(config, repos, gate=archive_gate)
-            if engine is not None:  # SPEC-0008: нормы по новым FINAL-дням
+            if engine is not None:  # SPEC-0008: нормы по новым FINAL-дням и сводка за сутки
                 await engine.refresh_norms()
+                await engine.log_daily_stats(datetime.now(UTC).date() - timedelta(days=1))
         # Активный контракт непрерывного фьючерса мог смениться (экспирация).
         if any(c.instrument.is_continuous for c in collectors):
             hub.request_reconnect(resolve=True)

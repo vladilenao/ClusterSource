@@ -430,3 +430,26 @@ async def test_level_recheck_on_repaired(cfg: AppConfig) -> None:
     await engine.verify_once()
     row = signal_repo.read_signals("2000-01-01", "2100-01-01").iloc[0]
     assert (row["status"], row["reason"]) == ("REVOKED", "repaired_changed_result")
+
+
+async def test_daily_signal_stats(cfg: AppConfig, caplog: pytest.LogCaptureFixture) -> None:
+    """SPEC-0008: ежедневная сводка SIGNAL_STATS — выдано, итоги, отсеяно, задержка итога."""
+    now = [T0 + timedelta(seconds=6)]
+    engine, repos, _signal_repo = make_engine(cfg, now)
+    await engine.emit("SBER", candidate())
+    await engine.emit("SBER", candidate(T0 + timedelta(minutes=3)))
+    engine._pause("SBER", T0 + timedelta(minutes=10))
+    await engine.emit("SBER", candidate(T0 + timedelta(minutes=10, seconds=1)))  # отсеян
+    put_verdict(repos["SBER"], T0, "VERIFIED")
+    now[0] = T0 + timedelta(minutes=17)
+    await engine.verify_once()
+    now[0] = T0 + timedelta(minutes=25)
+    await engine.verify_once()  # второй — к сроку без вердикта
+    with caplog.at_level(logging.INFO):
+        await engine.log_daily_stats(T0.date())
+        await engine.log_daily_stats(T0.date() + timedelta(days=1))
+    assert (
+        "SIGNAL_STATS 2026-10-13: выдано 2 {'large_aggressor': 2}, подтверждено 1 {'VERIFIED': 1},"
+        " отозвано 1 {'verification_unavailable': 1}, без итога 0, отсеяно 1 {'signals_paused': 1}"
+    ) in caplog.text
+    assert "SIGNAL_STATS 2026-10-14: сигналов нет" in caplog.text

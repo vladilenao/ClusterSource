@@ -215,13 +215,14 @@ class SignalsConfig:
     verify_deadline_min: float = 20.0
     baseline_days: int = 20
     baseline_min_days: int = 5
-    large_aggressor_percentile: float = 99.9
+    #: Пороги по прогону 14.10 (SPEC-0008, 2026-10-15): ~2 450 сигналов в день вместо 11 800.
+    large_aggressor_percentile: float = 99.97
     volume_spike_ratio: float = 5.0
-    volume_spike_percentile: float = 90.0
+    volume_spike_percentile: float = 99.0
     #: Этап 2 (класс ``level``): бар, дисбаланс и поглощение.
     level_bar_minutes: int = 5
     stacked_ratio: float = 3.0
-    stacked_levels: int = 3
+    stacked_levels: int = 5
     stacked_level_percentile: float = 50.0
     absorption_percentile: float = 99.0
     absorption_close_ticks: int = 2
@@ -247,12 +248,12 @@ class SignalsConfig:
             verify_deadline_min=float(raw.get("verify_deadline_min", 20.0)),
             baseline_days=int(raw.get("baseline_days", 20)),
             baseline_min_days=int(raw.get("baseline_min_days", 5)),
-            large_aggressor_percentile=float(raw.get("large_aggressor_percentile", 99.9)),
+            large_aggressor_percentile=float(raw.get("large_aggressor_percentile", 99.97)),
             volume_spike_ratio=float(raw.get("volume_spike_ratio", 5.0)),
-            volume_spike_percentile=float(raw.get("volume_spike_percentile", 90.0)),
+            volume_spike_percentile=float(raw.get("volume_spike_percentile", 99.0)),
             level_bar_minutes=int(raw.get("level_bar_minutes", 5)),
             stacked_ratio=float(raw.get("stacked_ratio", 3.0)),
-            stacked_levels=int(raw.get("stacked_levels", 3)),
+            stacked_levels=int(raw.get("stacked_levels", 5)),
             stacked_level_percentile=float(raw.get("stacked_level_percentile", 50.0)),
             absorption_percentile=float(raw.get("absorption_percentile", 99.0)),
             absorption_close_ticks=int(raw.get("absorption_close_ticks", 2)),

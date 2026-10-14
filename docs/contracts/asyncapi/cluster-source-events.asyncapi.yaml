@@ -280,7 +280,7 @@ components:
     VolumeSpikePayload:
       type: object
       additionalProperties: false
-      required: [minute, volume, baseline_median, ratio, threshold_ratio, volume_p90, delta, regime]
+      required: [minute, volume, baseline_median, ratio, threshold_ratio, volume_pct, volume_percentile, delta, regime]
       properties:
         minute:
           type: string
@@ -293,9 +293,12 @@ components:
           description: Медиана объёма этой же минуты дня по окну норм.
         ratio: {type: number}
         threshold_ratio: {type: number}
-        volume_p90:
+        volume_pct:
           type: number
-          description: Перцентиль 90 минутных объёмов по окну норм.
+          description: Порог объёма — перцентиль volume_percentile минутных объёмов режима по окну норм.
+        volume_percentile:
+          type: number
+          description: Какой перцентиль (signals.volume_spike_percentile, по умолчанию 99).
         delta:
           type: number
           description: Покупки − продажи за минуту (аукционы не входят).
