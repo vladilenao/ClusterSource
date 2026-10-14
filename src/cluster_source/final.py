@@ -196,12 +196,24 @@ async def _check_instrument(
     previous = {str(row.trade_date): row for row in done.itertuples(index=False)}
     marks = await asyncio.to_thread(repo.days_to_refresh)
     for trade_date, span in spans.items():
-        if trade_date.isoformat() in final_days:
-            continue
         n, volume = 0, 0.0
         for day in span:
             dn, dv = await asyncio.to_thread(repo.day_totals, day.isoformat())
             n, volume = n + dn, volume + dv
+        if trade_date.isoformat() in final_days:
+            prev_row: Any = previous[trade_date.isoformat()]
+            stored_n, stored_volume = int(prev_row.ours_n), float(prev_row.ours_volume)
+            now_volume = volume * inst.lot_size if market == "shares" else volume
+            if stored_n == n and _close(stored_volume, now_volume):
+                continue
+            # SPEC-0006 G-6: данные дня изменились (перекачка, дозаливка) — вердикт устарел.
+            logger.info(
+                "DAY_DATA_CHANGED %s %s: в вердикте %d сделок, сейчас %d — проверяю заново",
+                inst.storage_name,
+                trade_date,
+                stored_n,
+                n,
+            )
         status: str | None
         if market == "shares":
             totals = await _totals(client, iss, market, trade_date, today)
@@ -279,18 +291,18 @@ async def _check_instrument(
     return stats
 
 
+def _close(a: float, b: float) -> bool:
+    return abs(a - b) <= _VOLUME_EPS * max(1.0, abs(b))
+
+
 def _same_verdict(prev: Any, ours: tuple[int, float], ref: tuple[int, float]) -> bool:
     """Прошлый вердикт дня — ``MISMATCH`` с теми же числами (наши и эталон)."""
-
-    def close(a: float, b: float) -> bool:
-        return abs(a - b) <= _VOLUME_EPS * max(1.0, abs(b))
-
     return (
         prev.status == STATUS_MISMATCH
         and int(prev.ours_n) == ours[0]
         and int(prev.ref_n) == ref[0]
-        and close(float(prev.ours_volume), ours[1])
-        and close(float(prev.ref_volume), ref[1])
+        and _close(float(prev.ours_volume), ours[1])
+        and _close(float(prev.ref_volume), ref[1])
     )
 
 

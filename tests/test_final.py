@@ -351,3 +351,30 @@ async def test_not_exhausted_while_refresh_pending(
     assert "DAY_NOT_FINAL GAZP 2026-10-13" in caplog.text
     assert not str(get_day_verdicts(repo)["detail"].iloc[0]).startswith(ARCHIVE_EXHAUSTED)
     assert repo.days_to_refresh() == {"2026-10-13": REFRESH_FINAL_MISMATCH}
+
+
+async def test_settled_verdict_rechecked_when_day_data_changed(
+    cfg: AppConfig, repos: Any, iss: IssTapeRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SPEC-0006 A-11 (G-6): данные дня (в т. ч. его выходных) изменились — вердикт
+    пересчитывается; без изменений — не трогается."""
+    fri, sun, mon = date(2026, 10, 9), date(2026, 10, 11), date(2026, 10, 12)
+    repo = repos["GAZP"]
+    repo.insert_ticks(ticks("GAZP", fri, 3) + ticks("GAZP", mon, 4))
+    fake = FakeIss(
+        {("shares", fri.isoformat()): {"GAZP": (3, 30.0)},
+         ("shares", mon.isoformat()): {"GAZP": (6, 60.0)}}  # с воскресной сессией
+    )  # fmt: skip
+    await check(cfg, repos, iss, fake)
+    assert status_of(repo, "2026-10-12") == STATUS_MISMATCH  # 4 из 6: нет воскресенья
+    repo.set_day_verdict("2026-10-12", STATUS_FINAL, (4, 40.0), (4, 40.0), "iss_totals", "")
+    stats = await check(cfg, repos, iss, fake)
+    assert not stats  # FINAL с прежними данными не перепроверяется
+
+    repo.insert_ticks(ticks("GAZP", sun, 2))  # перекачано воскресенье
+    with caplog.at_level(logging.INFO):
+        await check(cfg, repos, iss, fake)
+    assert "DAY_DATA_CHANGED GAZP 2026-10-12: в вердикте 4 сделок, сейчас 6" in caplog.text
+    row = get_day_verdicts(repo).set_index("trade_date").loc["2026-10-12"]
+    assert (row["status"], row["ours_n"]) == (STATUS_FINAL, 6)
+    assert "DAY_DATA_CHANGED GAZP 2026-10-09" not in caplog.text
