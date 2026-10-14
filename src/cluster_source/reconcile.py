@@ -168,13 +168,22 @@ class Reconciler:
             await asyncio.sleep(RECONCILE_INTERVAL_SEC)
 
     async def run_once(self) -> None:
+        # Границы лент — один раз за проход на рынок (SPEC-0005: проход должен
+        # укладываться в секунды, иначе минуты не успевают к сроку SPEC-0001 G-2).
+        bounds: dict[str, tuple[datetime, datetime] | None] = {}
+        for market in {market_of(i) for i in self._config.instruments}:
+            bounds[market] = await asyncio.to_thread(self._iss.feed_bounds, market)
         for instrument in self._config.instruments:
             try:
-                await asyncio.to_thread(self.reconcile_instrument, instrument)
+                await asyncio.to_thread(self.reconcile_instrument, instrument, bounds)
             except Exception as exc:  # noqa: BLE001 - один инструмент не роняет сверку
                 logger.error("Ошибка сверки %s: %s", instrument.id, exc)
 
-    def reconcile_instrument(self, instrument: Instrument) -> Counter[str]:
+    def reconcile_instrument(
+        self,
+        instrument: Instrument,
+        bounds: dict[str, tuple[datetime, datetime] | None] | None = None,
+    ) -> Counter[str]:
         """Сверяет готовые минуты инструмента; возвращает счётчик вердиктов."""
         stats: Counter[str] = Counter()
         name = instrument.storage_name
@@ -182,10 +191,12 @@ class Reconciler:
         if ticker is None or self._is_blocked(name):
             return stats
         market = market_of(instrument)
-        bounds = self._iss.feed_bounds(market)
-        if bounds is None:
+        feed = bounds[market] if bounds is not None and market in bounds else None
+        if bounds is None or market not in bounds:
+            feed = self._iss.feed_bounds(market)
+        if feed is None:
             return stats
-        feed_start, feed_last = bounds
+        feed_start, feed_last = feed
         end_minute = minute_floor(min(feed_last - ISS_EDGE, self._now() - SETTLE))
         repo = self._repos[name]
         stored = repo.verified_until()

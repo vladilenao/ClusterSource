@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 
 from cluster_source.config import AppConfig, Instrument, InstrumentType
@@ -228,3 +230,54 @@ def test_legacy_hot_store_migrated(share_config: AppConfig) -> None:
     repo = MarketDataRepository(share_config.storage_root, SBER)
     df = stored(repo)
     assert list(df["origin"]) == ["stream"] and df["exchange_trade_no"].isna().all()
+
+
+async def test_pass_reads_feed_bounds_once_per_market(
+    env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC-0005 A-9: границы ленты — один раз за проход на рынок, а не на инструмент
+    (14.10 вечером проход по 56 инструментам занимал до 4,5 мин и срывал срок G-2)."""
+    repo, iss, rec = env
+    repo.insert_ticks([tick(1)])
+    iss.stage_rows([iss_row(10, 1)])
+    calls: list[str] = []
+    original = iss.feed_bounds
+
+    def counting(market: str) -> Any:
+        calls.append(market)
+        return original(market)
+
+    monkeypatch.setattr(iss, "feed_bounds", counting)
+    monkeypatch.setattr(rec, "_config", replace(rec._config, instruments=[SBER, SBER, SBER]))
+    await rec.run_once()
+    assert calls == ["shares"]
+    assert stored(repo)["exchange_trade_no"].tolist() == [10]
+
+
+def test_feed_bounds_and_old_feeds_skipped(env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SPEC-0005 A-9: границы ленты — по индексу; Parquet прошлого дня ленты для окна
+    после его конца не читается."""
+    _repo, iss, _rec = env
+    assert iss.feed_bounds("shares") == (M0 - timedelta(seconds=60), M0 + timedelta(minutes=20))
+    with iss.session() as conn:
+        plan = " ".join(
+            str(r) for r in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT timestamp FROM iss_trades WHERE market = 'shares'"
+                " AND feed_date = '2026-10-13' ORDER BY timestamp DESC LIMIT 1"
+            ).fetchall()
+        )  # fmt: skip
+    assert "idx_iss_feed_ts" in plan
+    iss.stage_rows([{**iss_row(5, 1), "feed_date": "2026-10-12"}])
+    iss.finalize_feed_day("shares", "2026-10-12")
+    read: list[str] = []
+    real = pq.read_table
+
+    def spy(path: Any, *a: Any, **k: Any) -> Any:
+        read.append(str(path))
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(pq, "read_table", spy)
+    iss.read_trades("shares", "SBER", "TQBR", M0, M0 + timedelta(minutes=1))  # 13.10 — после 12.10
+    assert read == []
+    iss.read_trades("shares", "SBER", "TQBR", M0 - timedelta(days=1), M0)  # окно 12.10
+    assert len(read) == 1

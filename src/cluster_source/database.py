@@ -832,6 +832,11 @@ class IssTapeRepository:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_iss_secid_ts ON iss_trades (market, secid, timestamp)"
         )
+        # SPEC-0005: границы текущей ленты — точечно по индексу, а не перебором миллионов строк.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_iss_feed_ts"
+            " ON iss_trades (market, feed_date, timestamp)"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS iss_feed_state (
@@ -1117,17 +1122,19 @@ class IssTapeRepository:
         state = self.feed_state(market)
         if state is None:
             return None
+        sql = (
+            "SELECT timestamp FROM iss_trades WHERE market = ? AND feed_date = ?"
+            " ORDER BY timestamp {} LIMIT 1"
+        )
+        params = (market, state["feed_date"])
         with self.session() as conn:
-            row = conn.execute(
-                "SELECT MIN(timestamp), MAX(timestamp) FROM iss_trades"
-                " WHERE market = ? AND feed_date = ?",
-                (market, state["feed_date"]),
-            ).fetchone()
-        if row is None or row[0] is None:
+            first = conn.execute(sql.format("ASC"), params).fetchone()
+            last = conn.execute(sql.format("DESC"), params).fetchone()
+        if first is None or last is None:
             return None
         return (
-            datetime.fromisoformat(str(row[0])).astimezone(UTC),
-            datetime.fromisoformat(str(row[1])).astimezone(UTC),
+            datetime.fromisoformat(str(first[0])).astimezone(UTC),
+            datetime.fromisoformat(str(last[0])).astimezone(UTC),
         )
 
     def read_trades(
@@ -1151,6 +1158,11 @@ class IssTapeRepository:
             )
         days = {(start + pd.Timedelta(days=k)).strftime("%Y-%m-%d") for k in (-3, -2, -1, 0, 1)}
         for feed_date in sorted(days & self.parquet_feed_dates(market)):
+            # В ленте дня D только сделки до конца D по МСК: окно позже — файл не нужен
+            # (SPEC-0005: сверка не должна перечитывать Parquet на каждом проходе).
+            feed_end = pd.Timestamp(feed_date, tz="Europe/Moscow") + pd.Timedelta(days=1)
+            if start >= feed_end:
+                continue
             table = pq.read_table(
                 self.parquet_path(market, feed_date),
                 columns=["tradeno", "timestamp", "price", "quantity", "direction"],
