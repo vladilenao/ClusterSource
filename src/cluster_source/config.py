@@ -127,6 +127,14 @@ class FuturesMeta:
     class_code: str
     expiration: date
     figi: str = ""
+    #: Последний день торгов (``last_trade_date``); раньше ``expiration`` на день и
+    #: больше (SPEC-0013).
+    last_trade: date | None = None
+
+    @property
+    def active_until(self) -> date:
+        """Последний день, когда контракт активен для склейки (SPEC-0013 G-1)."""
+        return self.last_trade if self.last_trade is not None else self.expiration
 
 
 def nearest_contract(
@@ -134,16 +142,17 @@ def nearest_contract(
 ) -> FuturesMeta | None:
     """Контракт непрерывного фьючерса, активный в ``day``.
 
-    Активным считается контракт этого базового актива с ближайшей
-    экспирацией в ``day`` или позже. ``None``, если такого контракта нет.
-    Одно правило используется и для стрима, и для догрузки истории.
+    Активным считается контракт этого базового актива с ближайшим последним
+    днём торгов (``last_trade_date``) в ``day`` или позже — не дата исполнения:
+    между ними контракт уже не торгуется (SPEC-0013 G-1). ``None``, если такого
+    контракта нет. Одно правило для стрима, догрузки, FINAL и сверки.
     """
     eligible = [
-        m for m in futures if instrument.is_contract_ticker(m.ticker) and m.expiration >= day
+        m for m in futures if instrument.is_contract_ticker(m.ticker) and m.active_until >= day
     ]
     if not eligible:
         return None
-    return min(eligible, key=lambda m: m.expiration)
+    return min(eligible, key=lambda m: m.active_until)
 
 
 @dataclass(frozen=True)

@@ -147,10 +147,10 @@ async def _resolve_stream_figi(
                     f"для непрерывного инструмента {instrument.id}"
                 )
             logger.info(
-                "Непрерывный %s -> активный контракт %s (истекает %s)",
+                "Непрерывный %s -> активный контракт %s (последний день торгов %s)",
                 instrument.id,
                 active.ticker,
-                active.expiration,
+                active.active_until,
             )
             uid = next((str(f.uid) for f in futures if f.figi == active.figi), "")
             return active.figi, active.ticker, uid
@@ -375,6 +375,19 @@ async def run_maintenance(
     SPEC-0011 G-5) и ежесуточно по расписанию ``config.archiver``. Ошибки
     этапов логируются и не прерывают работу коллекторов.
     """
+    # SPEC-0012/0013: календарь и пропуски торговых дней — до догрузки, чтобы
+    # найденные дни перекачались этим же обслуживанием.
+    await refresh_calendar(config)
+    try:
+        await asyncio.to_thread(
+            schedule_mod.mark_calendar_gaps,
+            config,
+            repos,
+            IssTapeRepository(config.storage_root),
+            datetime.now(UTC).date(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Ошибка проверки пропусков по календарю: %s", exc)
     logger.info(
         "Проверка автозагрузки/догрузки истории (последние %d дней)",
         config.history_check_days,
@@ -391,7 +404,6 @@ async def run_maintenance(
         logger.error("Ошибка сверки архиватора: %s", exc)
 
     await run_final_check_safely(config, repos)
-    await refresh_calendar(config)
 
 
 async def refresh_calendar(config: AppConfig) -> None:

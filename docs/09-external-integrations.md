@@ -36,7 +36,7 @@ grpc-gateway над тем же protobuf-контрактом `tinkoff.public.in
 |---------------------------|---------------------------|-----------------------------|--------------------|---------------------------|
 | `share` | `INSTRUMENT_TYPE_SHARE` (2) | `2` | `TQBR`, `SPBXM` | `FindInstrument`, точный тикер, приоритет `TQBR` → `SPBXM` |
 | `futures_contract` | — (берётся из `Futures`) | — | `class_code` из справочника, иначе `SPBFUT` | `Futures`, точный тикер |
-| `continuous_futures` | — (берётся из `Futures`) | — | `class_code` контракта, активного в день | `Futures`, `nearest_contract`: шаблон `{id}{месяц}{год}`, экспирация ≥ сегодня, минимальная |
+| `continuous_futures` | — (берётся из `Futures`) | — | `class_code` контракта, активного в день | `Futures`, `nearest_contract`: шаблон `{id}{месяц}{год}`, `last_trade_date` ≥ дня, минимальная (SPEC-0013) |
 
 Статус инструментов для `Futures`: стрим — `INSTRUMENT_STATUS_BASE` (REST `1`, торгуемые); догрузка — `INSTRUMENT_STATUS_ALL` (REST `2`, включая истёкшие контракты для прошедших дней).
 

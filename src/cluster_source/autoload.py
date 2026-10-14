@@ -88,6 +88,10 @@ REFRESH_DEALER_CLEANUP = "dealer_cleanup"
 #: SPEC-0006: день не совпал с эталоном биржи — перекачать из архива независимо от
 #: давности (окно ``history_check_days`` на эту отметку не действует).
 REFRESH_FINAL_MISMATCH = "final_mismatch"
+#: SPEC-0013: торговый по календарю ISS день без данных; окном не ограничена.
+REFRESH_CALENDAR_GAP = "calendar_gap"
+#: Отметки, которые окно ``history_check_days`` не снимает.
+WINDOW_EXEMPT = frozenset({REFRESH_FINAL_MISMATCH, REFRESH_CALENDAR_GAP})
 DEALER_CLEANUP_META_KEY = "spec0002_dealer_cleanup_scheduled"
 #: Архив за день гарантированно опубликован через столько суток: 404 по отметке
 #: чистки тогда означает, что биржевых сделок за день не было.
@@ -225,7 +229,8 @@ def refresh_days(
 
     * ``cleanup=False`` — все отметки, кроме ``dealer_cleanup``, внутри окна
       ``history_check_days``; отметки старше окна снимаются с предупреждением,
-      кроме ``final_mismatch`` (SPEC-0006) — она окном не ограничена.
+      кроме ``final_mismatch`` (SPEC-0006) и ``calendar_gap`` (SPEC-0013) — они
+      окном не ограничены.
     * ``cleanup=True`` — только отметки ``dealer_cleanup`` без ограничения
       окном (SPEC-0002 G-4), от новых дней к старым.
     """
@@ -237,7 +242,7 @@ def refresh_days(
         is_cleanup = reason == REFRESH_DEALER_CLEANUP
         if is_cleanup != cleanup or day_str >= today_str:
             continue
-        if not cleanup and day_str < window_start and reason != REFRESH_FINAL_MISMATCH:
+        if not cleanup and day_str < window_start and reason not in WINDOW_EXEMPT:
             logger.warning(
                 "Отметка перекачки %s за %s (%s) вышла за окно %d дней — снята без перекачки",
                 repo.instrument.storage_name,
@@ -937,6 +942,13 @@ async def _fetch_futures_grpc(
     return futures_from_sdk(resp.instruments or [])
 
 
+def _last_trade(last_trade: date | None, expiration: date) -> date | None:
+    """Последний день торгов; пустое значение API (1970-01-01) — ``None`` (SPEC-0013)."""
+    if last_trade is None or last_trade.year < 2000 or last_trade > expiration:
+        return None
+    return last_trade
+
+
 def futures_from_sdk(items: Iterable[Any]) -> dict[str, FuturesMeta]:
     """Преобразует SDK-объекты ``Future`` в справочник ``{ticker: FuturesMeta}``."""
     metas: dict[str, FuturesMeta] = {}
@@ -950,6 +962,7 @@ def futures_from_sdk(items: Iterable[Any]) -> dict[str, FuturesMeta]:
             class_code=str(getattr(item, "class_code", "SPBFUT") or "SPBFUT"),
             expiration=exp,
             figi=str(getattr(item, "figi", "") or ""),
+            last_trade=_last_trade(_as_date(getattr(item, "last_trade_date", None)), exp),
         )
     return metas
 
@@ -978,5 +991,6 @@ async def _fetch_futures_rest(session: aiohttp.ClientSession, token: str) -> dic
             class_code=str(item.get("classCode", "SPBFUT") or "SPBFUT"),
             expiration=exp,
             figi=str(item.get("figi", "") or ""),
+            last_trade=_last_trade(_as_date(item.get("lastTradeDate")), exp),
         )
     return metas

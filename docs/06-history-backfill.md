@@ -53,6 +53,7 @@ flowchart TD
 | `partial_backfill` | догрузка | Сегодняшний день записан из `GetLastTrades` |
 | `dealer_cleanup` | `schedule_dealer_cleanup` (однократно) | День сохранён до введения биржевого фильтра (SPEC-0002 G-4) |
 | `final_mismatch` | ночная проверка FINAL | День не совпал с эталоном биржи (SPEC-0006); окном `history_check_days` не ограничена |
+| `calendar_gap` | начало обслуживания | Торговый по календарю ISS день без данных (SPEC-0013); окном не ограничена; ERROR `TRADING_DAY_MISSING` |
 
 `refresh_days(config, repo)` возвращает отмеченные дни раньше сегодняшнего
 внутри окна `history_check_days`, кроме отметок `dealer_cleanup`;
@@ -160,9 +161,11 @@ FIGI для сегодняшнего дня (`current_figi`):
 | `futures_contract` | `{id}_{class_code}` | справочник фьючерсов, иначе `SPBFUT` |
 | `continuous_futures` | `{ticker}_{class_code}` контракта `nearest_contract(instrument, futures, day)` | справочник фьючерсов; нет контракта — ключей нет, итог `FAILED` |
 
-`nearest_contract` — общее правило для стрима и догрузки: контракты этого
-базового актива (шаблон `{id}{код месяца}{год}`) с экспирацией в день `day`
-или позже, из них — с минимальной экспирацией.
+`nearest_contract` — общее правило для стрима, догрузки, FINAL и сверки:
+контракты этого базового актива (шаблон `{id}{код месяца}{год}`) с последним
+днём торгов (`last_trade_date`) в день `day` или позже, из них — с минимальным.
+Не дата исполнения (`expiration_date`): она позже на день и больше, и в эти
+дни контракт уже не торгуется ([SPEC-0013](specs/0013-active-contract-last-trade.md)).
 
 Пример: справочник `{SRU6: 2026-09-17, SiU6: 2026-09-18, SiZ6: 2026-12-17}`,
 инструмент `Si`.
