@@ -44,6 +44,13 @@ from cluster_source.signals.detectors import (
     recheck_large_aggressor,
     recheck_volume_spike,
 )
+from cluster_source.signals.levels import (
+    ABSORPTION,
+    STACKED_IMBALANCE,
+    Bar,
+    LevelDetector,
+    recheck_level,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +151,7 @@ class SignalEngine:
             self._detectors[name] = [
                 LargeAggressorDetector(instrument, norms, self._signals),
                 VolumeSpikeDetector(instrument, norms, self._signals),
+                LevelDetector(instrument, norms, self._signals),
             ]
         logger.info(
             "Нормы сигналов: детекторы включены у %d из %d инструментов",
@@ -320,6 +328,13 @@ class SignalEngine:
             if ticks.empty:
                 ticks = pd.DataFrame(columns=["volume", "direction"])
             return recheck_volume_spike(payload, ticks, signal["direction"])
+        if signal["event_type"] in (STACKED_IMBALANCE, ABSORPTION):
+            start = ev.parse_iso(signal["window_from"])
+            end = ev.parse_iso(signal["window_to"])
+            bar = Bar.from_frame(
+                start, repo.read_ticks(start, end), self._instruments[name].tick_size
+            )
+            return recheck_level(signal["event_type"], signal["direction"], payload, bar)
         return False
 
     async def _resolve(

@@ -94,6 +94,12 @@
         "large_aggressor_percentile": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "default": 99.9},
         "volume_spike_ratio": {"type": "number", "exclusiveMinimum": 0, "default": 5},
         "volume_spike_percentile": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "default": 90},
+        "level_bar_minutes": {"type": "integer", "minimum": 1, "default": 5},
+        "stacked_ratio": {"type": "number", "exclusiveMinimum": 0, "default": 3},
+        "stacked_levels": {"type": "integer", "minimum": 1, "default": 3},
+        "stacked_level_percentile": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "default": 50},
+        "absorption_percentile": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "default": 99},
+        "absorption_close_ticks": {"type": "integer", "minimum": 0, "default": 2},
         "regimes": {
           "type": "object",
           "description": "Режимы торгов по рынкам (shares, forts): {режим: [начало, конец]} МСК HH:MM.",

@@ -14,7 +14,8 @@ from test_signals import NORMS, SBER, T0, candidate, cfg, make_engine, tick  # n
 
 from cluster_source.config import AppConfig
 from cluster_source.signals import events as ev
-from cluster_source.signals.detectors import VolumeSpikeDetector
+from cluster_source.signals.detectors import Candidate, VolumeSpikeDetector
+from cluster_source.signals.levels import Bar, absorptions, stacked_imbalances
 from cluster_source.signals.publisher import EventPublisher
 
 UTC = UTC
@@ -113,8 +114,20 @@ async def test_messages_match_asyncapi_schema(cfg: AppConfig) -> None:  # noqa: 
     fut = engine.build_signal("Si_CONTINUOUS", candidate())
     assert fut["secid"] == "SiZ6" and fut["baseline_quality"] == "mixed"
 
+    levels = []
+    bar = Bar(T0, 0.01)
+    for price, volume, side in [(300.05, 10, "BUY"), (300.00, 700, "SELL"), (300.03, 20, "BUY"),
+                                (300.01, 60, "BUY"), (300.02, 40, "BUY")]:  # fmt: skip
+        bar.add(price, volume, side)
+    for event_type, direction, payload in [*absorptions(bar, 500.0, 2),
+                                           *stacked_imbalances(bar, 3.0, 2, 10.0)]:  # fmt: skip
+        levels.append(engine.build_signal("SBER", Candidate(
+            event_type, "level", direction, "5m", T0, T0 + timedelta(minutes=5), True,
+            T0 + timedelta(minutes=5), "", {**payload, "regime": "main"})))  # fmt: skip
+    assert {e["event_type"] for e in levels} == {"absorption", "stacked_imbalance"}
+
     signal_schema = _validator("SignalEvent")
-    for event in (large, spike, fut):
+    for event in (large, spike, fut, *levels):
         signal_schema.validate(_published(event))
     with pytest.raises(Exception):  # noqa: B017 - любая ошибка схемы
         signal_schema.validate(_published({**large, "class": "level"}))  # large_aggressor — fast

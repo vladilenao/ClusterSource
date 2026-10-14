@@ -28,6 +28,8 @@ WEEKEND = "weekend"
 MIN_PARENT_ORDERS = 200
 #: Меньше стольких минут со сделками в режиме — перцентиль минутного объёма не считается.
 MIN_MINUTES = 30
+#: Меньше стольких уровней баров в режиме — пороги кластерных сигналов не считаются.
+MIN_LEVELS = 200
 
 
 def market_of(instrument: Instrument) -> str:
@@ -109,6 +111,10 @@ class Norms:
     minute_median: dict[str, float] = field(default_factory=dict)
     #: Перцентиль ``volume_spike_percentile`` минутных объёмов по режиму.
     minute_volume_pct: dict[str, float] = field(default_factory=dict)
+    #: Этап 2: перцентиль ``stacked_level_percentile`` объёмов уровня бара по режиму.
+    level_volume_pct: dict[str, float] = field(default_factory=dict)
+    #: Этап 2: перцентиль ``absorption_percentile`` агрессивного объёма стороны на уровне.
+    absorption_threshold: dict[str, float] = field(default_factory=dict)
 
     @property
     def days(self) -> int:
@@ -149,6 +155,8 @@ def compute_norms(
     sizes: dict[str, list[np.ndarray]] = defaultdict(list)
     minute_volumes: dict[str, list[np.ndarray]] = defaultdict(list)
     per_slot: dict[str, list[float]] = defaultdict(list)
+    level_totals: dict[str, list[np.ndarray]] = defaultdict(list)
+    level_sides: dict[str, list[np.ndarray]] = defaultdict(list)
     day_kinds: dict[str, int] = defaultdict(int)
     for trade_date, _status in window:
         for day in _calendar_days(trade_date):
@@ -174,6 +182,11 @@ def compute_norms(
             ).to_numpy(dtype=str)
             for slot, volume in zip(slots, volumes, strict=True):
                 per_slot[str(slot)].append(float(volume))
+            totals, sides = _level_volumes(df, instrument, config, market)
+            for regime, values in totals.items():
+                level_totals[regime].append(values)
+            for regime, values in sides.items():
+                level_sides[regime].append(values)
     thresholds = {
         regime: float(np.percentile(np.concatenate(parts), config.large_aggressor_percentile))
         for regime, parts in sizes.items()
@@ -189,5 +202,42 @@ def compute_norms(
         days_of_kind = day_kinds[slot.split(" ", 1)[0]]
         padded = slot_volumes + [0.0] * max(0, days_of_kind - len(slot_volumes))  # без сделок
         medians[slot] = float(np.median(padded))
+    level_pct = _percentiles(level_totals, config.stacked_level_percentile, MIN_LEVELS)
+    absorption = _percentiles(level_sides, config.absorption_percentile, MIN_LEVELS)
     final = sum(1 for _, status in window if status == "FINAL")
-    return Norms(final, len(window) - final, thresholds, medians, pct)
+    return Norms(final, len(window) - final, thresholds, medians, pct, level_pct, absorption)
+
+
+def _percentiles(
+    parts: dict[str, list[np.ndarray]], percentile: float, minimum: int
+) -> dict[str, float]:
+    return {
+        regime: float(np.percentile(np.concatenate(chunks), percentile))
+        for regime, chunks in parts.items()
+        if sum(len(c) for c in chunks) >= minimum
+    }
+
+
+def _level_volumes(
+    df: pd.DataFrame, instrument: Instrument, config: SignalsConfig, market: str
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Объёмы уровней баров ``level_bar_minutes`` по режиму: всего на уровне и
+    агрессивный объём каждой стороны (ненулевой) — для этапа 2 SPEC-0008."""
+    bars = df["timestamp"].dt.floor(f"{config.level_bar_minutes}min")
+    level = (df["price"] / instrument.tick_size).round().astype("int64")
+    buy = df["volume"].where(df["direction"] == Direction.BUY.value, 0.0)
+    sell = df["volume"].where(df["direction"] == Direction.SELL.value, 0.0)
+    frame = pd.DataFrame({"bar": bars, "level": level, "total": df["volume"], "buy": buy,
+                          "sell": sell})  # fmt: skip
+    cells = frame.groupby(["bar", "level"], sort=False).sum().reset_index()
+    labels = regimes_of(cells["bar"], market, config)
+    totals: dict[str, np.ndarray] = {}
+    sides: dict[str, np.ndarray] = {}
+    for regime in set(labels) - {""}:
+        part = cells.loc[labels == regime]
+        totals[str(regime)] = part["total"].to_numpy(dtype=float)
+        both = np.concatenate(
+            [part["buy"].to_numpy(dtype=float), part["sell"].to_numpy(dtype=float)]
+        )
+        sides[str(regime)] = both[both > 0]
+    return totals, sides

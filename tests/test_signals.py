@@ -27,6 +27,14 @@ from cluster_source.signals.detectors import (
     recheck_large_aggressor,
 )
 from cluster_source.signals.engine import SignalEngine
+from cluster_source.signals.levels import (
+    ABSORPTION,
+    STACKED_IMBALANCE,
+    Bar,
+    LevelDetector,
+    absorptions,
+    stacked_imbalances,
+)
 
 UTC = UTC
 SBER = Instrument(id="SBER", type=InstrumentType.SHARE, tick_size=0.01, lot_size=10)
@@ -304,3 +312,121 @@ async def test_detector_off_without_baseline(
     assert (norms.baseline_days, norms.quality) == ({"final": 4, "archive": 1}, "mixed")
     assert set(norms.aggressor_threshold) == {"main"}  # 300 заявок основной сессии
     assert norms.minute_median["weekday 11:00"] > 0
+
+
+# --------------------------------------------------------------------------- #
+# Этап 2: кластерные сигналы (A-11)
+# --------------------------------------------------------------------------- #
+LEVEL_NORMS = replace(NORMS, level_volume_pct={"main": 10.0}, absorption_threshold={"main": 500.0})
+
+
+def bar_of(trades: list[tuple[float, float, str]], start: datetime = T0) -> Bar:
+    bar = Bar(start, 0.01)
+    for price, volume, side in trades:
+        bar.add(price, volume, side)
+    return bar
+
+
+def test_stacked_imbalance(cfg: AppConfig) -> None:
+    """SPEC-0008 A-11: диагональ 3:1 на 3+ уровнях подряд, малые уровни не считаются."""
+    bar = bar_of(
+        [
+            (300.00, 20, "SELL"), (300.01, 60, "BUY"),  # 60 против 20 — 3:1
+            (300.01, 5, "SELL"), (300.02, 40, "BUY"),  # 40 против 5
+            (300.02, 1, "SELL"), (300.03, 30, "BUY"),  # 30 против 1
+            (300.04, 8, "BUY"),  # 8 < level_min — серия обрывается
+        ]
+    )  # fmt: skip
+    found = stacked_imbalances(bar, 3.0, 3, 10.0)
+    assert [(t, d) for t, d, _ in found] == [(STACKED_IMBALANCE, "long")]
+    payload = found[0][2]
+    assert [lv["price"] for lv in payload["levels"]] == [300.01, 300.02, 300.03]
+    assert [lv["ratio"] for lv in payload["levels"]] == [3.0, 8.0, 30.0]
+    assert stacked_imbalances(bar, 3.0, 4, 10.0) == []  # нужно 4 уровня
+    assert (
+        stacked_imbalances(bar_of([(300.00, 25, "SELL"), (300.01, 60, "BUY")]), 3.0, 1, 10.0) == []
+    )
+
+    sells = bar_of([(300.10, 50, "SELL"), (300.09, 50, "SELL"), (300.08, 50, "SELL")])
+    assert [(t, d) for t, d, _ in stacked_imbalances(sells, 3.0, 3, 10.0)] == [
+        (STACKED_IMBALANCE, "short")
+    ]
+
+
+def test_absorption(cfg: AppConfig) -> None:
+    """SPEC-0008 A-11: крупные продажи на минимуме бара и закрытие выше — long."""
+    trades = [(300.05, 10, "BUY"), (300.00, 700, "SELL"), (300.01, 50, "SELL"),
+              (300.03, 20, "BUY")]  # fmt: skip
+    found = absorptions(bar_of(trades), 500.0, 2)
+    assert [(t, d) for t, d, _ in found] == [(ABSORPTION, "long")]
+    payload = found[0][2]
+    assert (payload["level_price"], payload["absorbed_side"], payload["level_volume"]) == (
+        300.0, "SELL", 700.0,
+    )  # fmt: skip
+    assert payload["close_distance_ticks"] == 3
+    assert absorptions(bar_of(trades), 800.0, 2) == []  # ниже порога нормы
+    assert absorptions(bar_of([*trades, (300.01, 1, "BUY")]), 500.0, 2) == []  # закрытие у минимума
+    away = [(300.05, 10, "BUY"), (300.00, 1, "SELL"), (300.02, 700, "SELL"), (300.05, 1, "BUY")]
+    assert absorptions(bar_of(away), 500.0, 2) == []  # максимум продаж не на минимуме
+
+
+def test_level_detector_on_bar_close(cfg: AppConfig) -> None:
+    """SPEC-0008 A-11: сигналы на закрытии 5-минутного бара; окно — бар."""
+    det = LevelDetector(SBER, LEVEL_NORMS, cfg.signals)
+    start = T0.replace(minute=30)  # бар 10:30–10:35 МСК
+    for i, (price, volume, side) in enumerate(
+        [(300.05, 10, "BUY"), (300.00, 700, "SELL"), (300.03, 20, "BUY")]
+    ):
+        det.on_tick(tick(start + timedelta(seconds=i), volume, side, price), start)
+    assert det.flush(start + timedelta(minutes=4)) == []  # бар не закрыт
+    (cand,) = det.flush(start + timedelta(minutes=5, seconds=3))
+    assert (cand.event_type, cand.cls, cand.timeframe, cand.bar_closed) == (
+        ABSORPTION, "level", "5m", True,
+    )  # fmt: skip
+    assert (cand.window_from, cand.window_to) == (start, start + timedelta(minutes=5))
+    assert cand.payload["regime"] == "main"
+
+
+async def test_level_recheck_on_repaired(cfg: AppConfig) -> None:
+    """SPEC-0008 A-11/A-5: кластерный сигнал пересчитывается по сделкам бара в хранилище."""
+    now = [T0]
+    engine, repos, signal_repo = make_engine(cfg, now)
+    engine._norms = {"SBER": LEVEL_NORMS}
+    start = T0.replace(minute=30)
+    trades = [(300.05, 10, "BUY"), (300.00, 700, "SELL"), (300.03, 20, "BUY")]
+    (finding,) = absorptions(bar_of(trades, start), 500.0, 2)
+    cand = Candidate(
+        ABSORPTION,
+        "level",
+        "long",
+        "5m",
+        start,
+        start + timedelta(minutes=5),
+        True,
+        start + timedelta(minutes=5),
+        "",
+        {**finding[2], "regime": "main"},
+    )
+    now[0] = start + timedelta(minutes=5, seconds=3)
+    await engine.emit("SBER", cand)
+    rows = [
+        {
+            "ticker": "SBER",
+            "timestamp": start + timedelta(seconds=i),
+            "price": p,
+            "volume": v,
+            "direction": s,
+            "trade_id": f"s{i}",
+        }
+        for i, (p, v, s) in enumerate(trades)
+    ]
+    rows.append({"ticker": "SBER", "timestamp": start + timedelta(minutes=4), "price": 300.00,
+                 "volume": 5, "direction": "BUY", "trade_id": "x9", "origin": "iss"})  # fmt: skip
+    repos["SBER"].insert_ticks(rows)  # дозалита сделка закрытия у минимума — отскока нет
+    for minute in range(5):
+        put_verdict(repos["SBER"], start + timedelta(minutes=minute), "REPAIRED" if minute == 4
+                    else "VERIFIED")  # fmt: skip
+    now[0] = start + timedelta(minutes=22)
+    await engine.verify_once()
+    row = signal_repo.read_signals("2000-01-01", "2100-01-01").iloc[0]
+    assert (row["status"], row["reason"]) == ("REVOKED", "repaired_changed_result")

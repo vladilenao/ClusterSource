@@ -189,7 +189,8 @@ components:
               enum: [long, short, neutral]
             timeframe:
               type: string
-              enum: [tick, 1m, 5m]
+              pattern: "^(tick|[1-9][0-9]*m)$"
+              description: tick — заявка; 1m — минута; Nm — бар кластерных сигналов (signals.level_bar_minutes, по умолчанию 5m).
             window_from:
               type: string
               format: date-time
@@ -314,7 +315,7 @@ components:
     StackedImbalancePayload:
       type: object
       additionalProperties: false
-      required: [side, levels, ratio_min, bar]
+      required: [side, levels, ratio_min, level_min, bar, regime]
       properties:
         side:
           type: string
@@ -322,7 +323,8 @@ components:
           description: Сторона, у которой дисбаланс.
         levels:
           type: array
-          minItems: 3
+          minItems: 1
+          description: Серия соседних уровней с дисбалансом; не короче signals.stacked_levels (по умолчанию 3).
           items:
             type: object
             required: [price, buy_volume, sell_volume, ratio]
@@ -332,14 +334,20 @@ components:
               sell_volume:
                 type: number
                 description: Объём противоположной стороны на соседнем по диагонали уровне.
-              ratio: {type: number}
+              ratio:
+                type: number
+                description: Отношение объёмов; знаменатель не меньше 1 лота (встречных сделок нет).
         ratio_min: {type: number}
+        level_min:
+          type: number
+          description: Минимальный доминирующий объём уровня — перцентиль объёмов уровня по нормам.
         bar: {$ref: "#/components/schemas/BarSummary"}
+        regime: {$ref: "#/components/schemas/Regime"}
 
     AbsorptionPayload:
       type: object
       additionalProperties: false
-      required: [level_price, absorbed_side, level_volume, threshold, close_distance_ticks, bar]
+      required: [level_price, absorbed_side, level_volume, threshold, close_distance_ticks, min_close_ticks, bar, regime]
       properties:
         level_price: {type: number}
         absorbed_side:
@@ -353,7 +361,11 @@ components:
         close_distance_ticks:
           type: integer
           description: Расстояние закрытия бара от экстремума, шагов цены.
+        min_close_ticks:
+          type: integer
+          description: Порог расстояния закрытия (signals.absorption_close_ticks).
         bar: {$ref: "#/components/schemas/BarSummary"}
+        regime: {$ref: "#/components/schemas/Regime"}
 
     # ------------------------------------------------------------------ #
     # Итог проверки
