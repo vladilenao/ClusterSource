@@ -61,7 +61,7 @@ class FakeIss:
                     "data": [
                         [lo, hi, hi, lo, 0, v, begin, begin[:17] + "59"]
                         for begin, v, hi, lo in self.candles.get(secid, [])
-                        if begin >= params["from"]
+                        if params["from"] <= begin[:16] <= params.get("till", "9999")
                     ],
                 }
             }

@@ -317,3 +317,115 @@ def test_unpublished_archive_message(
         caplog.text
     )
     assert day_str in repo.days_to_refresh()
+
+
+# --------------------------------------------------------------------------- #
+# A-11: хвост внутри торгового дня (праздник с вечерней сессией)
+# --------------------------------------------------------------------------- #
+def _utc(day: str, hhmmss: str) -> datetime:
+    return datetime.fromisoformat(f"{day}T{hhmmss}+00:00")
+
+
+def _tape(no: int, moment: datetime, feed_date: str, trade_date: str) -> dict[str, object]:
+    row = tape_row("forts", "SiZ6", "RFUD", no, moment)
+    row.update(feed_date=feed_date, trade_date=trade_date)
+    return row
+
+
+CandleRow = tuple[str, float, float, float]
+
+
+def _evening(day: str) -> tuple[list[datetime], datetime, list[datetime], list[CandleRow]]:
+    """Голова, срез ленты 23:44:37 МСК, наш хвост и свечи хвоста за календарный день."""
+    head = [_utc(day, "17:00:00"), _utc(day, "17:00:01"), _utc(day, "17:00:02")]
+    cutoff = _utc(day, "20:44:37")
+    tail = [cutoff, _utc(day, "20:46:10"), _utc(day, "20:49:50")]
+    candles = [(f"{day} 23:{m}:00", 1.0, 100.0, 100.0) for m in ("44", "46", "49")]
+    return head, cutoff, tail, candles
+
+
+async def test_forts_final_with_tail_inside_trading_day(
+    cfg: AppConfig,  # noqa: F811
+    repos: Any,  # noqa: F811
+    iss: IssTapeRepository,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SPEC-0011 A-11 (G-1): праздник 04.11 с вечерней сессией входит в торговый день 05.11 —
+    лента обрывается в 23:44 МСК дважды; оба хвоста сверяются со свечами → FINAL."""
+    repo = repos["Si_CONTINUOUS"]
+    tape: list[dict[str, object]] = []
+    candles: list[tuple[str, float, float, float]] = []
+    for day in ("2026-11-04", "2026-11-05"):
+        head, cutoff, tail, day_candles = _evening(day)
+        repo.insert_ticks([tick("Si_CONTINUOUS", m) for m in [*head, *tail]])
+        start = len(tape) + 1
+        tape += [_tape(start + k, m, day, "2026-11-05") for k, m in enumerate([*head, cutoff])]
+        candles += day_candles
+    iss.stage_rows(tape)
+    totals = {("forts", "2026-11-05"): {"SiZ6": (12, 12.0)}}
+    with caplog.at_level(logging.INFO):
+        await check(cfg, repos, iss, FakeIss(totals, {"SiZ6": candles}), today=date(2026, 11, 6))
+    row = get_day_verdicts(repo).iloc[0]
+    assert (row["trade_date"], row["status"], row["reference"]) == (
+        "2026-11-05",
+        STATUS_FINAL,
+        "iss_tape",
+    )
+    assert (row["ours_n"], row["ref_n"]) == (12, 12)
+    assert "хвост по свечам 04.11 с 23:44 МСК: 3 сделок / 3" in row["detail"]
+    assert "хвост по свечам с 23:44 МСК: 3 сделок / 3" in row["detail"]
+    assert "TAIL Si_CONTINUOUS 2026-11-05: хвост с 04.11 23:44 МСК, минут 3" in caplog.text
+    mv = repo.read_minute_verdicts(_utc("2026-11-04", "00:00:00"), _utc("2026-11-06", "00:00:00"))
+    assert list(mv["status"]) == [MINUTE_CANDLE_VERIFIED] * 6
+
+
+async def test_weekend_day_without_break_has_no_tail(
+    cfg: AppConfig,  # noqa: F811
+    repos: Any,  # noqa: F811
+    iss: IssTapeRepository,  # noqa: F811
+) -> None:
+    """SPEC-0011 A-11: сессия субботы кончается в 19:00 МСК, лента покрывает её целиком —
+    хвоста у субботы нет; копия субботней сделки в ленте понедельника не мешает (SPEC-0003 G-4)."""
+    repo = repos["Si_CONTINUOUS"]
+    sat = [_utc("2026-11-07", "06:59:19"), _utc("2026-11-07", "12:00:00"),
+           _utc("2026-11-07", "15:59:30")]  # fmt: skip
+    head, cutoff, tail, candles = _evening("2026-11-09")
+    repo.insert_ticks([tick("Si_CONTINUOUS", m) for m in [*sat, *head, *tail]])
+    iss.stage_rows([_tape(k + 1, m, "2026-11-07", "2026-11-09") for k, m in enumerate(sat)])
+    iss.finalize_feed_day("forts", "2026-11-07")
+    iss.stage_rows(
+        [_tape(1, sat[0], "2026-11-09", "2026-11-09")]  # ISS повторил открытие субботы
+        + [_tape(k + 10, m, "2026-11-09", "2026-11-09") for k, m in enumerate([*head, cutoff])]
+    )
+    totals = {("forts", "2026-11-09"): {"SiZ6": (9, 9.0)}}
+    await check(cfg, repos, iss, FakeIss(totals, {"SiZ6": candles}), today=date(2026, 11, 10))
+    row = get_day_verdicts(repo).iloc[0]
+    assert (row["trade_date"], row["status"]) == ("2026-11-09", STATUS_FINAL)
+    assert (row["ours_n"], row["ref_n"]) == (9, 9)
+    assert "07.11" not in row["detail"]
+    mv = repo.read_minute_verdicts(_utc("2026-11-07", "00:00:00"), _utc("2026-11-10", "00:00:00"))
+    assert len(mv) == 3  # только хвост понедельника
+
+
+async def test_tail_inside_trading_day_in_cutoff_minute(
+    cfg: AppConfig,  # noqa: F811
+    repos: Any,  # noqa: F811
+    iss: IssTapeRepository,  # noqa: F811
+) -> None:
+    """SPEC-0011 A-11: наши сделки позже среза, но в той же минуте (RM 04.11: срез 23:44:16,
+    сделки 23:44:41–42) — тоже хвост дня; без него голова не сходится с лентой."""
+    repo = repos["Si_CONTINUOUS"]
+    head, cutoff, _, _ = _evening("2026-11-04")
+    late = [cutoff, cutoff + timedelta(seconds=20)]  # обе — в минуте среза 23:44
+    repo.insert_ticks([tick("Si_CONTINUOUS", m) for m in [*head, *late]])
+    tape = [_tape(k + 1, m, "2026-11-04", "2026-11-05") for k, m in enumerate([*head, cutoff])]
+    head5, cutoff5, tail5, candles5 = _evening("2026-11-05")
+    repo.insert_ticks([tick("Si_CONTINUOUS", m) for m in [*head5, *tail5]])
+    tape += [_tape(k + 10, m, "2026-11-05", "2026-11-05") for k, m in enumerate([*head5, cutoff5])]
+    iss.stage_rows(tape)
+    candles = [("2026-11-04 23:44:00", 2.0, 100.0, 100.0), *candles5]
+    totals = {("forts", "2026-11-05"): {"SiZ6": (11, 11.0)}}
+    await check(cfg, repos, iss, FakeIss(totals, {"SiZ6": candles}), today=date(2026, 11, 6))
+    row = get_day_verdicts(repo).iloc[0]
+    assert (row["status"], row["ours_n"], row["ref_n"]) == (STATUS_FINAL, 11, 11)
+    assert "хвост по свечам 04.11 с 23:44 МСК: 2 сделок / 2" in row["detail"]

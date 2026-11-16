@@ -315,6 +315,63 @@ def test_restaging_and_refinalizing_do_not_duplicate(iss_repo: IssTapeRepository
     assert str(table.schema.field("timestamp").type) == "timestamp[us, tz=UTC]"
 
 
+def weekend_fut(no: int, day: str, tradetime: str, session_date: str) -> list[object]:
+    """Сделка FORTS сессии выходного дня: торговый день — следующий будний."""
+    row = fut(no, tradetime=tradetime, day=day)
+    row[-1] = session_date
+    return row
+
+
+def _forts_feed(repo: IssTapeRepository, feed_date: str, rows: list[list[object]]) -> None:
+    repo.stage_rows(normalize_trades("forts", feed_date, FORTS_COLUMNS, rows))
+
+
+def test_tape_reads_count_cross_feed_duplicates_once(iss_repo: IssTapeRepository) -> None:
+    """SPEC-0003 A-6 (G-4): ISS повторяет сделку открытия субботы в лентах воскресенья и
+    понедельника — она в двух Parquet и в SQLite, а каждое чтение учитывает её один раз."""
+    sat = weekend_fut(1, "2026-11-07", "09:59:19", "2026-11-09")
+    sun = weekend_fut(2, "2026-11-08", "10:00:05", "2026-11-09")
+    mon = fut(3, tradetime="10:00:00", day="2026-11-09")
+    _forts_feed(iss_repo, "2026-11-07", [sat])
+    iss_repo.finalize_feed_day("forts", "2026-11-07")
+    _forts_feed(iss_repo, "2026-11-08", [sat, sun])  # копия субботней сделки
+    iss_repo.finalize_feed_day("forts", "2026-11-08")
+    _forts_feed(iss_repo, "2026-11-09", [sat, mon])  # текущая лента, ещё в SQLite
+    copies = sum(
+        pq.read_table(iss_repo.parquet_path("forts", d)).num_rows
+        for d in ("2026-11-07", "2026-11-08")
+    ) + staged(iss_repo, "forts")
+    assert copies == 5  # сделка 1 сохранена трижды — дубли есть в хранилище
+
+    assert iss_repo.tape_day("forts", "SiZ6", "RFUD", "2026-11-09") == (3, 9.0)
+    assert iss_repo.count_trades("forts", "2026-11-09", "RFUD", "2026-11-01") == {"SiZ6": 3}
+    start = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)
+    end = datetime(2026, 11, 7, 8, 0, tzinfo=UTC)
+    assert [r[0] for r in iss_repo.read_trades("forts", "SiZ6", "RFUD", start, end)] == [1]
+    assert len(iss_repo.read_oi_trades("SiZ6", start, end)) == 1
+
+
+async def test_verify_ignores_cross_feed_duplicates(
+    share_config: AppConfig, iss_repo: IssTapeRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SPEC-0003 A-6 (G-4): копии сделок выходного дня не дают «лента больше итогов»."""
+    sat = [weekend_fut(k, "2026-11-07", "10:00:00", "2026-11-09") for k in range(1, 4)]
+    _forts_feed(iss_repo, "2026-11-07", sat)
+    iss_repo.finalize_feed_day("forts", "2026-11-07")
+    mon = [fut(k, day="2026-11-09") for k in range(4, 99)]
+    mon.append(fut(99, tradetime="23:44:37", day="2026-11-09"))  # срез ленты ISS
+    _forts_feed(iss_repo, "2026-11-09", [*sat, *mon])  # ISS повторил открытие субботы
+    iss_repo.finalize_feed_day("forts", "2026-11-09")
+    fake = FakeIss()
+    fake.history[("forts", "2026-11-09")] = {"SiZ6": 99}
+    with caplog.at_level(logging.INFO):
+        await collector(
+            share_config, iss_repo, fake, now=datetime(2026, 11, 10, 6, 0, tzinfo=UTC)
+        ).verify_pending()
+    assert iss_repo.day_status("forts", "2026-11-09", KIND_TRADE_DATE) == STATUS_COMPLETE
+    assert "лента больше итогов" not in caplog.text
+
+
 # --------------------------------------------------------------------------- #
 # Импорт сырых файлов этапа 1
 # --------------------------------------------------------------------------- #

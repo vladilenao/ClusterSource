@@ -20,7 +20,7 @@ import asyncio
 import logging
 from collections import Counter
 from collections.abc import Mapping
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from cluster_source.autoload import REFRESH_FINAL_MISMATCH
@@ -65,7 +65,8 @@ BOARDS = {"shares": "TQBR", "forts": "RFUD"}
 #: Итоги за дату точно опубликованы через столько суток: пустой ответ — неторговая дата.
 TOTALS_PUBLISHED_AFTER_DAYS = 3
 _VOLUME_EPS = 1e-6
-Cutoffs = dict[tuple[str, str], datetime | None]
+#: Срез ленты по календарным дням МСК на (рынок, торговый день) — один раз за проход.
+Cutoffs = dict[tuple[str, str], dict[str, datetime]]
 
 
 def market_of(instrument: Instrument) -> str:
@@ -222,11 +223,11 @@ async def _check_instrument(
             status = None if n == 0 and ref[0] == 0 else verdict(ours, ref)
             reference, detail = "iss_totals", ""
             if status is not None:  # SPEC-0011: хвост — для минутных вердиктов и справки
-                tail = await _tail(
+                tails = await _tails(
                     inst, repo, iss, client, market, inst.id, trade_date, span, cutoffs
                 )
-                if tail is not None and tail.status != TAIL_UNAVAILABLE:
-                    detail = tail.label
+                checked = [t for t in tails or [] if t.status != TAIL_UNAVAILABLE]
+                detail = _tail_labels(checked, trade_date)
         else:
             ours = (n, volume)
             status, ref, reference, detail = await _forts_verdict(
@@ -306,7 +307,7 @@ def _same_verdict(prev: Any, ours: tuple[int, float], ref: tuple[int, float]) ->
     )
 
 
-async def _tail(
+async def _tails(
     inst: Instrument,
     repo: MarketDataRepository,
     iss: IssTapeRepository,
@@ -316,23 +317,55 @@ async def _tail(
     trade_date: date,
     span: list[date],
     cutoffs: Cutoffs,
-) -> TailCheck | None:
-    """Сверяет хвост дня со свечами ISS и пишет вердикты его минут (SPEC-0011).
+) -> list[TailCheck] | None:
+    """Сверяет со свечами ISS хвосты торгового дня и пишет вердикты их минут (SPEC-0011).
 
-    ``None`` — у дня нет ленты или хвост длиннее :data:`TAIL_MAX`: тогда лента
-    не покрывает день, и свечами его не подтвердить (SPEC-0011 G-2).
+    Хвост есть у последнего календарного дня и у каждого прежнего дня торгового
+    дня, где наши сделки идут позже минуты среза ленты этого дня (праздник с
+    вечерней сессией). ``None`` — лента не покрывает день: её нет или хвост длиннее
+    :data:`TAIL_MAX` (SPEC-0011 G-2).
     """
     key = (market, trade_date.isoformat())
     if key not in cutoffs:
-        cutoffs[key] = await asyncio.to_thread(iss.tape_cutoff, *key)
-    cutoff = cutoffs[key]
-    if cutoff is None:
+        cutoffs[key] = await asyncio.to_thread(iss.tape_cutoffs, *key)
+    day_cutoffs = cutoffs[key]
+    if not day_cutoffs:
         return None
-    start = minute_floor(cutoff)
-    ticks = await asyncio.to_thread(repo.read_day, span[-1].isoformat())
-    if not ticks.empty and ticks["timestamp"].max() - start > TAIL_MAX:
-        return None  # SPEC-0011 G-2: не разрыв публикации, а отставание ленты
     lot = inst.lot_size if market == "shares" else 1
+    tails: list[TailCheck] = []
+    for day in span:
+        last_day = day == span[-1]
+        ticks = await asyncio.to_thread(repo.read_day, day.isoformat())
+        cutoff = day_cutoffs.get(day.isoformat())
+        if last_day and cutoff is None:
+            cutoff = max(day_cutoffs.values())  # лента дня кончилась раньше — хвост длинный
+        if cutoff is None or ticks.empty and not last_day:
+            continue
+        start = minute_floor(cutoff)
+        if not last_day and ticks["timestamp"].max() <= cutoff:
+            continue  # SPEC-0011 G-1: лента покрывает день целиком (сессия выходного дня)
+        if not ticks.empty and ticks["timestamp"].max() - start > TAIL_MAX:
+            return None  # SPEC-0011 G-2: не разрыв публикации, а отставание ленты
+        tails.append(
+            await _check_tail_minutes(
+                inst, repo, client, market, secid, trade_date, ticks, start, lot
+            )
+        )
+    return tails
+
+
+async def _check_tail_minutes(
+    inst: Instrument,
+    repo: MarketDataRepository,
+    client: IssClient,
+    market: str,
+    secid: str,
+    trade_date: date,
+    ticks: Any,
+    start: datetime,
+    lot: int,
+) -> TailCheck:
+    """Один хвост против свечей: вердикты минут и лог (SPEC-0011)."""
     tail = await check_tail(client, market, secid, ticks, start, lot)
     name = inst.storage_name
     if tail.status == TAIL_UNAVAILABLE:
@@ -341,17 +374,31 @@ async def _tail(
         )
         return tail
     await asyncio.to_thread(repo.save_minute_verdicts, tail.minutes)
+    when = f"{tail.start.astimezone(MSK):%H:%M}"
+    if tail.start.astimezone(MSK).date() != trade_date:
+        when = f"{tail.start.astimezone(MSK):%d.%m} {when}"
     if tail.status == TAIL_VERIFIED:
         logger.info(
             "TAIL %s %s: хвост с %s МСК, минут %d — совпал со свечами",
             name,
             trade_date,
-            f"{tail.start.astimezone(MSK):%H:%M}",
+            when,
             len(tail.minutes),
         )
     else:
         logger.error("TAIL_MISMATCH %s %s: минуты %s", name, trade_date, ", ".join(tail.bad))
     return tail
+
+
+def _tail_labels(tails: list[TailCheck], trade_date: date) -> str:
+    """Справка дня по хвостам; у хвоста другого календарного дня — с датой."""
+    labels = []
+    for tail in tails:
+        if tail.start.astimezone(MSK).date() == trade_date:
+            labels.append(tail.label)
+        else:
+            labels.append(tail.label.replace(" с ", f" {tail.start.astimezone(MSK):%d.%m} с ", 1))
+    return "; ".join(labels)
 
 
 async def _forts_verdict(
@@ -395,22 +442,37 @@ async def _forts_verdict(
         f" / {official[1] - tape[1]:.0f}"
     )
     if tape[0] > 0 and feed_status != STATUS_INCOMPLETE:
-        tail = await _tail(inst, repo, iss, client, "forts", secid, trade_date, span, cutoffs)
-        if tail is not None and tail.status == TAIL_UNAVAILABLE:
-            if (today - trade_date).days < TAIL_RETRY_DAYS:
-                return None, (0, 0.0), "", ""  # SPEC-0011 G-3: повтор следующей ночью
-        elif tail is not None:
-            head_ref = await asyncio.to_thread(
-                iss.tape_day, "forts", secid, BOARDS["forts"], trade_date.isoformat(), tail.start
-            )
-            head_ours = (ours[0] - tail.n, ours[1] - tail.volume)
-            ref = (head_ref[0] + tail.n, head_ref[1] + tail.volume)
+        tails = await _tails(inst, repo, iss, client, "forts", secid, trade_date, span, cutoffs)
+        unavailable = tails is not None and any(t.status == TAIL_UNAVAILABLE for t in tails)
+        if unavailable and (today - trade_date).days < TAIL_RETRY_DAYS:
+            return None, (0, 0.0), "", ""  # SPEC-0011 G-3: повтор следующей ночью
+        if tails is not None and not unavailable:
+            # Голова — всё вне хвостов; хвост дня C — [начало, полночь МСК после C).
+            head_ref = tape
+            for tail in tails:
+                midnight = datetime.combine(
+                    tail.start.astimezone(MSK).date() + timedelta(days=1), time(), MSK
+                )
+                in_tail = await asyncio.to_thread(
+                    iss.tape_day,
+                    "forts",
+                    secid,
+                    BOARDS["forts"],
+                    trade_date.isoformat(),
+                    midnight,
+                    tail.start,
+                )
+                head_ref = (head_ref[0] - in_tail[0], head_ref[1] - in_tail[1])
+            tail_n = sum(t.n for t in tails)
+            tail_volume = sum(t.volume for t in tails)
+            head_ours = (ours[0] - tail_n, ours[1] - tail_volume)
+            ref = (head_ref[0] + tail_n, head_ref[1] + tail_volume)
             head_ok = verdict(head_ours, head_ref) == STATUS_FINAL
-            detail = f"{tail.label}; {outside}"
+            detail = f"{_tail_labels(tails, trade_date)}; {outside}"
             if not head_ok:
                 detail += f"; до среза у нас {head_ours[0]} сделок, в ленте {head_ref[0]}"
-            # SPEC-0011 G-1: голова — сделка в сделку по ленте, хвост — по свечам.
-            ok = head_ok and tail.status == TAIL_VERIFIED
+            # SPEC-0011 G-1: голова — сделка в сделку по ленте, каждый хвост — по свечам.
+            ok = head_ok and all(t.status == TAIL_VERIFIED for t in tails)
             return (STATUS_FINAL if ok else STATUS_MISMATCH), ref, "iss_tape", detail
     if official[0] == 0:
         return STATUS_UNVERIFIABLE, official, "none", f"{secid}: нет итогов ISS за день"

@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import pandas as pd
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -26,11 +26,29 @@ HOT_RETENTION_DAYS = 7
 #: Ключ курсора сверки с ISS в ``meta`` (SPEC-0005).
 RECON_CURSOR_KEY = "recon_verified_until"
 
+_Row = TypeVar("_Row")
+
 
 def _opt_int(value: object) -> int | None:
     if value is None or (isinstance(value, float) and value != value):  # NaN из pandas
         return None
     return int(str(value)) if not isinstance(value, int | float) else int(value)
+
+
+def _first_per_tradeno(rows: Iterable[_Row], key: Callable[[_Row], int]) -> list[_Row]:
+    """Первая копия каждой сделки бумаги, порядок сохраняется.
+
+    SPEC-0003 G-4: с новой датой ISS повторяет сделки открытия сессий выходного
+    дня, и сделка оказывается в лентах нескольких дат.
+    """
+    seen: set[int] = set()
+    out: list[_Row] = []
+    for row in rows:
+        k = key(row)
+        if k not in seen:
+            seen.add(k)
+            out.append(row)
+    return out
 
 
 class DataCorruptionError(RuntimeError):
@@ -1111,25 +1129,32 @@ class IssTapeRepository:
         return dates
 
     def count_trades(self, market: str, trade_date: str, board: str, since: str) -> dict[str, int]:
-        """Число сделок по бумагам за торговый день в режиме ``board`` (лента + Parquet)."""
-        counts: dict[str, int] = {}
+        """Число сделок по бумагам за торговый день в режиме ``board`` (лента + Parquet).
+
+        Сделка из лент нескольких дат считается один раз (SPEC-0003 G-4).
+        """
+        frames: list[pd.DataFrame] = []
         for path in self._parquet_paths_since(market, since):
             table = pq.read_table(
                 path,
-                columns=["secid"],
+                columns=["secid", "tradeno"],
                 filters=[("trade_date", "=", trade_date), ("board", "=", board)],
             )
-            for secid, n in pd.Series(table.column("secid").to_pylist()).value_counts().items():
-                counts[str(secid)] = counts.get(str(secid), 0) + int(n)
+            frames.append(table.to_pandas())
         with self.session() as conn:
-            cur = conn.execute(
-                "SELECT secid, COUNT(*) FROM iss_trades"
-                " WHERE market = ? AND trade_date = ? AND board = ? GROUP BY secid",
+            rows = conn.execute(
+                "SELECT secid, tradeno FROM iss_trades"
+                " WHERE market = ? AND trade_date = ? AND board = ?",
                 (market, trade_date, board),
-            )
-            for secid, n in cur.fetchall():
-                counts[str(secid)] = counts.get(str(secid), 0) + int(n)
-        return counts
+            ).fetchall()
+        frames.append(pd.DataFrame(rows, columns=["secid", "tradeno"]))
+        frames = [f for f in frames if not f.empty]
+        if not frames:
+            return {}
+        # SPEC-0003 G-4: ключ (secid, tradeno) — во всей ленте рынка, не только в ленте даты.
+        trades = pd.concat(frames, ignore_index=True).astype({"secid": str, "tradeno": "int64"})
+        trades = trades.drop_duplicates(["secid", "tradeno"])
+        return {str(k): int(v) for k, v in trades["secid"].value_counts().items()}
 
     # ------------------------------------------------------------------ #
     # Чтение для сверки (SPEC-0005)
@@ -1160,7 +1185,8 @@ class IssTapeRepository:
         """Сделки бумаги за [start, end): ``(TRADENO, время, цена, количество, сторона)``.
 
         Читается SQLite (текущая лента) и Parquet лент, выгруженных за
-        соседние дни (после смены дня в ISS).
+        соседние дни (после смены дня в ISS). Сделка из лент нескольких дат —
+        один раз (SPEC-0003 G-4).
         """
         out: list[tuple[int, str, float, int, str]] = []
         with self.session() as conn:
@@ -1197,7 +1223,7 @@ class IssTapeRepository:
                             str(rec["direction"]),
                         )
                     )
-        return out
+        return _first_per_tradeno(out, key=lambda row: row[0])
 
     # ------------------------------------------------------------------ #
     # Открытый интерес по ленте FORTS (SPEC-0007)
@@ -1210,37 +1236,39 @@ class IssTapeRepository:
 
         Порядок — ``RECNO``; у строк до появления колонки — порядок вставки
         (лента читается последовательно). Parquet — порядок строк файла.
+        Сделка из лент нескольких дат — один раз (SPEC-0003 G-4).
         """
-        out: list[tuple[str, int, int]] = []
+        rows: list[tuple[int, str, int, int]] = []
         days = {(start + pd.Timedelta(days=k)).strftime("%Y-%m-%d") for k in range(-1, 2)}
         for feed_date in sorted(days & self.parquet_feed_dates("forts")):
             table = pq.read_table(
                 self.parquet_path("forts", feed_date),
-                columns=["timestamp", "quantity", "open_position"],
+                columns=["tradeno", "timestamp", "quantity", "open_position"],
                 filters=[("secid", "=", secid), ("board", "=", "RFUD")],
             )
             for rec in table.to_pylist():
                 ts = rec["timestamp"]
                 if start <= ts < end and rec["open_position"] is not None:
-                    out.append(
+                    rows.append(
                         (
+                            int(rec["tradeno"]),
                             ts.isoformat(timespec="microseconds"),
                             int(rec["quantity"]),
                             int(rec["open_position"]),
                         )
                     )
         with self.session() as conn:
-            out.extend(
-                (str(r[0]), int(r[1]), int(r[2]))
+            rows.extend(
+                (int(r[0]), str(r[1]), int(r[2]), int(r[3]))
                 for r in conn.execute(
-                    "SELECT timestamp, quantity, open_position FROM iss_trades"
+                    "SELECT tradeno, timestamp, quantity, open_position FROM iss_trades"
                     " WHERE market = 'forts' AND secid = ? AND board = 'RFUD'"
                     " AND timestamp >= ? AND timestamp < ? AND open_position IS NOT NULL"
                     " ORDER BY COALESCE(recno, rowid)",
                     (secid, start.isoformat(), end.isoformat()),
                 ).fetchall()
             )
-        return out
+        return [(ts, qty, oi) for _, ts, qty, oi in _first_per_tradeno(rows, key=lambda r: r[0])]
 
     # ------------------------------------------------------------------ #
     # Дневные итоги биржи и лента торгового дня (SPEC-0006)
@@ -1289,35 +1317,46 @@ class IssTapeRepository:
         board: str,
         trade_date: str,
         before: datetime | None = None,
+        since: datetime | None = None,
     ) -> tuple[int, float]:
         """Число сделок и объём бумаги в ленте ISS за торговый день (``trade_date``).
 
-        ``before`` — только сделки раньше этого момента (голова дня, SPEC-0011).
+        ``before`` / ``since`` — только сделки в [since, before) (голова дня и
+        хвосты, SPEC-0011). Сделка из лент нескольких дат — один раз (SPEC-0003 G-4).
         """
-        n, volume = 0, 0.0
         sql = (
-            "SELECT COUNT(*), COALESCE(SUM(quantity), 0) FROM iss_trades"
+            "SELECT tradeno, quantity FROM iss_trades"
             " WHERE market = ? AND secid = ? AND board = ? AND trade_date = ?"
         )
         params: list[object] = [market, secid, board, trade_date]
-        if before is not None:
-            sql += " AND timestamp < ?"
-            params.append(before.astimezone(UTC).isoformat(timespec="microseconds"))
-        with self.session() as conn:
-            row = conn.execute(sql, params).fetchone()
-            n, volume = int(row[0]), float(row[1])
         filters: list[tuple[str, str, object]] = [
             ("secid", "=", secid),
             ("board", "=", board),
             ("trade_date", "=", trade_date),
         ]
         if before is not None:
+            sql += " AND timestamp < ?"
+            params.append(before.astimezone(UTC).isoformat(timespec="microseconds"))
             filters.append(("timestamp", "<", pd.Timestamp(before).tz_convert("UTC")))
+        if since is not None:
+            sql += " AND timestamp >= ?"
+            params.append(since.astimezone(UTC).isoformat(timespec="microseconds"))
+            filters.append(("timestamp", ">=", pd.Timestamp(since).tz_convert("UTC")))
+        rows: list[tuple[int, int]] = []
         for path in self._near_feed_paths(market, trade_date):
-            table = pq.read_table(path, columns=["quantity"], filters=filters)
-            n += table.num_rows
-            volume += float(sum(v or 0 for v in table.column("quantity").to_pylist()))
-        return n, volume
+            table = pq.read_table(path, columns=["tradeno", "quantity"], filters=filters)
+            rows.extend(
+                (int(t), int(q or 0))
+                for t, q in zip(
+                    table.column("tradeno").to_pylist(),
+                    table.column("quantity").to_pylist(),
+                    strict=True,
+                )
+            )
+        with self.session() as conn:
+            rows.extend((int(r[0]), int(r[1] or 0)) for r in conn.execute(sql, params).fetchall())
+        unique = _first_per_tradeno(rows, key=lambda r: r[0])
+        return len(unique), float(sum(q for _, q in unique))
 
     def tape_cutoff(self, market: str, trade_date: str) -> datetime | None:
         """Срез ленты рынка за торговый день: время последней сделки с этим ``trade_date``.
@@ -1325,21 +1364,42 @@ class IssTapeRepository:
         Бесплатный ISS после полуночи не публикует последние минуты вечерней
         сессии (SPEC-0011), поэтому лента дня кончается раньше торгов.
         """
-        found: list[datetime] = []
+        cutoffs = self.tape_cutoffs(market, trade_date)
+        return max(cutoffs.values()) if cutoffs else None
+
+    def tape_cutoffs(self, market: str, trade_date: str) -> dict[str, datetime]:
+        """Срез ленты рынка за торговый день по календарным дням МСК:
+        ``{день МСК: время последней сделки с этим trade_date в этот день}``.
+
+        Торговый день FORTS включает сессии выходного и праздничного дня; если
+        такая сессия идёт до полуночи, лента обрывается и внутри торгового дня
+        (SPEC-0011, хвост внутри торгового дня).
+        """
+        out: dict[str, datetime] = {}
+
+        def keep(day: str, ts: datetime) -> None:
+            if day not in out or ts > out[day]:
+                out[day] = ts
+
         with self.session() as conn:
-            row = conn.execute(
-                "SELECT MAX(timestamp) FROM iss_trades WHERE market = ? AND trade_date = ?",
+            # МСК = UTC+3 круглый год (без перехода на летнее время с 2014).
+            for day, last in conn.execute(
+                "SELECT date(timestamp, '+3 hours'), MAX(timestamp) FROM iss_trades"
+                " WHERE market = ? AND trade_date = ? GROUP BY 1",
                 (market, trade_date),
-            ).fetchone()
-        if row is not None and row[0] is not None:
-            found.append(datetime.fromisoformat(str(row[0])).astimezone(UTC))
+            ).fetchall():
+                keep(str(day), datetime.fromisoformat(str(last)).astimezone(UTC))
         for path in self._near_feed_paths(market, trade_date):
             table = pq.read_table(
                 path, columns=["timestamp"], filters=[("trade_date", "=", trade_date)]
             )
-            if table.num_rows:
-                found.append(max(table.column("timestamp").to_pylist()).astimezone(UTC))
-        return max(found) if found else None
+            if not table.num_rows:
+                continue
+            ts = pd.to_datetime(table.column("timestamp").to_pandas(), utc=True)
+            last = ts.groupby(ts.dt.tz_convert("Europe/Moscow").dt.date).max()
+            for day, value in last.items():
+                keep(str(day), pd.Timestamp(value).to_pydatetime().astimezone(UTC))
+        return out
 
     def _near_feed_paths(self, market: str, trade_date: str) -> list[Path]:
         """Parquet лент, где могут быть сделки торгового дня (выходные — в ленте понедельника)."""
