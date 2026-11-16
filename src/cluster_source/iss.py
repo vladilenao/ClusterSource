@@ -88,6 +88,8 @@ VERIFY_GIVE_UP_DAYS = 3
 #: SPEC-0011: ISS не публикует хвост вечерней сессии (с ~23:45 МСК), поэтому лента
 #: дня неполна всегда; полна она «до среза». Срез раньше этого времени — потеря дня.
 TAPE_CUTOFF_NOT_BEFORE = time(23, 30)
+#: Хвост, который ISS не публикует, — не длиннее этого от конца последней сессии.
+TAPE_TAIL_MAX = timedelta(minutes=20)
 #: Недостача ленты против итогов рынка (хвост + сделки вне анонимной ленты):
 #: 13.10 — 0,16% у акций, 0,37% у FORTS. Больше — лента потеряла часть дня.
 TAPE_DEFICIT_MAX_SHARE = 0.02
@@ -514,6 +516,13 @@ class IssCollector:
         missing = sum(max(n - ours.get(s, 0), 0) for s, n in exchange.items())
         cutoff = await asyncio.to_thread(self._repo.tape_cutoff, market, trade_date)
         cutoff_msk = None if cutoff is None else cutoff.astimezone(MSK)
+        # SPEC-0012: конец последней сессии дня — из расписания, иначе постоянная граница.
+        session_end = await asyncio.to_thread(self._repo.session_end, market, trade_date)
+        not_before = (
+            datetime.combine(day, TAPE_CUTOFF_NOT_BEFORE, MSK)
+            if session_end is None
+            else session_end.astimezone(MSK) - TAPE_TAIL_MAX
+        )
         problems: list[str] = []
         if over:
             worst = sorted(over.items(), key=lambda kv: kv[1][1] - kv[1][0])[:10]
@@ -523,7 +532,7 @@ class IssCollector:
             )
         if missing > TAPE_DEFICIT_MAX_SHARE * total:
             problems.append(f"не в ленте {missing} из {total} сделок")
-        if cutoff_msk is None or cutoff_msk < datetime.combine(day, TAPE_CUTOFF_NOT_BEFORE, MSK):
+        if cutoff_msk is None or cutoff_msk < not_before:
             problems.append(
                 "лента обрывается в " + ("—" if cutoff_msk is None else f"{cutoff_msk:%H:%M} МСК")
             )

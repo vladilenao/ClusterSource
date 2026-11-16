@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,6 +41,7 @@ from cluster_source.database import IssTapeRepository, MarketDataRepository, Sig
 from cluster_source.iss import MSK, HttpIssClient, IssCollector
 from cluster_source.quality import REASON_BACKLOG, REASON_WRITE_FAILURE
 from cluster_source.reconcile import Reconciler
+from cluster_source.schedule import Regimes
 from cluster_source.signals.engine import SignalEngine
 from cluster_source.signals.publisher import EventPublisher
 from cluster_source.stream_hub import (
@@ -413,11 +415,66 @@ async def refresh_calendar(config: AppConfig) -> None:
             connector=aiohttp.TCPConnector(ssl=autoload._ssl_context()),
             timeout=aiohttp.ClientTimeout(total=60),
         ) as session:
-            await schedule_mod.load_iss_calendar(
-                HttpIssClient(session), IssTapeRepository(config.storage_root)
-            )
+            client = HttpIssClient(session)
+            iss_repo = IssTapeRepository(config.storage_root)
+            await schedule_mod.load_iss_calendar(client, iss_repo)
+            await refresh_schedule(config, iss_repo)
+            if any(i.type != InstrumentType.SHARE for i in config.instruments):
+                today = datetime.now(MSK).date()
+                await schedule_mod.check_iss_session_schedule(client, iss_repo, today)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Ошибка загрузки календаря ISS: %s", exc)
+
+
+async def refresh_schedule(config: AppConfig, iss_repo: IssTapeRepository) -> None:
+    """SPEC-0012 этап 2: расписание T-Invest на неделю по расписаниям наших инструментов."""
+    if not _has_sdk:
+        return
+    sdk_client = AsyncClient(config.token)
+    services = await sdk_client.__aenter__()
+    try:
+        exchanges = await _schedule_exchanges(config, services.instruments)
+        await schedule_mod.load_tinvest_schedule(
+            services.instruments, iss_repo, exchanges, datetime.now(MSK).date()
+        )
+    except Exception as exc:  # noqa: BLE001 - SPEC-0012 G-2
+        logger.warning("Ошибка загрузки расписания T-Invest: %s", exc)
+    finally:
+        await sdk_client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+
+
+async def _schedule_exchanges(config: AppConfig, instruments_service: Any) -> dict[str, str]:
+    """Расписание (поле ``exchange``) каждого рынка — самое частое среди наших инструментов."""
+    found: dict[str, Counter[str]] = {"shares": Counter(), "forts": Counter()}
+    shares = {i.id for i in config.instruments if i.type == InstrumentType.SHARE}
+    if shares:
+        response = await instruments_service.shares(
+            instrument_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_BASE
+        )
+        for item in response.instruments:
+            if item.ticker in shares and item.class_code == "TQBR" and item.exchange:
+                found["shares"][str(item.exchange)] += 1
+    futures = [i for i in config.instruments if i.type != InstrumentType.SHARE]
+    if futures:
+        response = await instruments_service.futures(
+            instrument_status=_SdkInstrumentStatus.INSTRUMENT_STATUS_BASE
+        )
+        for item in response.instruments:
+            if item.exchange and any(
+                i.is_contract_ticker(item.ticker) or item.ticker == i.id for i in futures
+            ):
+                found["forts"][str(item.exchange)] += 1
+    exchanges: dict[str, str] = {}
+    for market, counter in found.items():
+        if not counter:
+            continue
+        exchange, _n = counter.most_common(1)[0]
+        if len(counter) > 1:
+            logger.warning(
+                "Расписания %s различаются: %s — беру %s", market, dict(counter), exchange
+            )
+        exchanges[market] = exchange
+    return exchanges
 
 
 async def startup_maintenance(
@@ -555,6 +612,7 @@ async def amain(config: AppConfig) -> int:
             {c.instrument.storage_name: c for c in collectors},
             signal_repo,
             secid_of,
+            regimes=Regimes(config.signals, IssTapeRepository(config.storage_root)),
         )
         for collector in collectors:
             collector.tick_listener = engine.feed  # SPEC-0008 G-2: не блокирует сбор

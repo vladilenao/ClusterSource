@@ -166,6 +166,8 @@ docker exec redis redis-cli XREVRANGE cluster.events + - COUNT 3
 | `SIGNALS_PAUSED X` | WARNING | Очередь детекторов переполнена; сбор не пострадал | Повторяется — проверить нагрузку CPU |
 | `EVENTS_PUBLISH_FAILED: …; в outbox N событий` | WARNING | Redis недоступен; события ждут в outbox (не чаще раза в минуту) | Запустить Redis (`docker start redis`) |
 | `TRADING_DAY_MISSING X D: торговый день по календарю ISS, данных нет` | ERROR | День будет перекачан этим же обслуживанием (SPEC-0013) | Повторяется каждую ночь — архива за день нет: разобрать вручную |
+| `SCHEDULE market exchange: дней N, с D по D` | INFO | Расписание T-Invest загружено (SPEC-0012) | — |
+| `SCHEDULE_MISMATCH forts D: сессия S — T-Invest HH:MM, ISS HH:MM` | WARNING | Начала сессий FORTS в T-Invest и ISS расходятся; в работе — T-Invest | Сверить с сайтом Мосбиржи |
 | `ISS_CALENDAR market: дат N (неторговых a, торговых-исключений b), с D` | INFO | Календарь торговых дней ISS обновлён (SPEC-0012) | — |
 | `Ошибка загрузки календаря ISS …` | WARNING | ISS не ответил; остался прежний календарь | Самовосстановление при следующем обслуживании |
 | `Нормы сигналов: детекторы включены у N из M инструментов` | INFO | Нормы пересчитаны (старт, ночь) | — |

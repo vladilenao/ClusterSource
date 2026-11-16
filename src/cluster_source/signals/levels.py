@@ -28,7 +28,7 @@ import pandas as pd
 from cluster_source.collector import Tick
 from cluster_source.config import Direction, Instrument, SignalsConfig
 from cluster_source.quality import minute_floor
-from cluster_source.signals.baseline import Norms, market_of, regime_of
+from cluster_source.signals.baseline import Norms, Regimes, market_of
 from cluster_source.signals.detectors import MINUTE_GRACE, Candidate
 
 STACKED_IMBALANCE = "stacked_imbalance"
@@ -184,9 +184,15 @@ def absorptions(bar: Bar, threshold: float, close_ticks: int) -> list[Finding]:
     return found
 
 
-def evaluate_bar(bar: Bar, norms: Norms, config: SignalsConfig, market: str) -> list[Finding]:
+def evaluate_bar(
+    bar: Bar,
+    norms: Norms,
+    config: SignalsConfig,
+    market: str,
+    regimes: Regimes | None = None,
+) -> list[Finding]:
     """Сигналы закрытого бара по нормам режима (нет нормы — детектор режима молчит)."""
-    regime = regime_of(bar.start, market, config) or ""
+    regime = (regimes or Regimes(config)).regime(bar.start, market) or ""
     found: list[Finding] = []
     level_min = norms.level_volume_pct.get(regime)
     if level_min is not None:
@@ -216,10 +222,17 @@ def recheck_level(event_type: str, direction: str, payload: dict[str, Any], bar:
 class LevelDetector:
     """Кластерные сигналы на закрытии бара ``level_bar_minutes``."""
 
-    def __init__(self, instrument: Instrument, norms: Norms, config: SignalsConfig) -> None:
+    def __init__(
+        self,
+        instrument: Instrument,
+        norms: Norms,
+        config: SignalsConfig,
+        regimes: Regimes | None = None,
+    ) -> None:
         self._instrument = instrument
         self._norms = norms
         self._config = config
+        self._regimes = regimes or Regimes(config)
         self._market = market_of(instrument)
         self._minutes = config.level_bar_minutes
         self.reset()
@@ -265,6 +278,6 @@ class LevelDetector:
                 payload=payload,
             )
             for event_type, direction, payload in evaluate_bar(
-                bar, self._norms, self._config, self._market
+                bar, self._norms, self._config, self._market, self._regimes
             )
         ]

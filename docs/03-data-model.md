@@ -426,3 +426,11 @@ is_work_day, start_time, stop_time, loaded_at)` — исключения по д
 дни в праздники) и `iss_week_timetable (market, week_day, is_work_day, …)` —
 недельный шаблон. Торговый ли день — `schedule.is_trading_day`: исключение
 важнее шаблона. Времена — часы торговой системы, не сессий.
+
+`trading_sessions (market, day, kind, regime, start_utc, end_utc, source,
+exchange, loaded_at)` — интервалы сессий по дням (этап 2): `source = tinvest`
+(расписание T-Invest на 7 дней, копится каждый день) или `iss` (сессии FORTS
+на сегодня, для сверки); `regime` — `auction` / `morning` / `main` / `evening`
+/ `weekend` / NULL (пауза). Конец интервала включает его последнюю минуту.
+Режимы для норм и сигналов — `schedule.Regimes`; конец торгового дня —
+`IssTapeRepository.session_end`.

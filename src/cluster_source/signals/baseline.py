@@ -20,10 +20,12 @@ from cluster_source.config import Direction, Instrument, InstrumentType, Signals
 from cluster_source.database import MarketDataRepository
 from cluster_source.iss import MSK
 from cluster_source.reader import get_baseline_days
+from cluster_source.schedule import WEEKEND, Regimes, regime_of, regimes_of
+
+__all__ = ["WEEKEND", "Regimes", "regime_of", "regimes_of"]
 
 logger = logging.getLogger(__name__)
 
-WEEKEND = "weekend"
 #: Меньше стольких родительских заявок режима — порог не считается (детектор режима выключен).
 MIN_PARENT_ORDERS = 200
 #: Меньше стольких минут со сделками в режиме — перцентиль минутного объёма не считается.
@@ -34,34 +36,6 @@ MIN_LEVELS = 200
 
 def market_of(instrument: Instrument) -> str:
     return "shares" if instrument.type == InstrumentType.SHARE else "forts"
-
-
-def _hhmm(value: str) -> int:
-    hours, minutes = value.split(":")
-    return int(hours) * 60 + int(minutes)
-
-
-def regime_of(moment: datetime, market: str, config: SignalsConfig) -> str | None:
-    """Режим торгов момента (МСК); ``None`` — вне всех режимов (пауза, клиринг)."""
-    local = moment.astimezone(MSK)
-    if local.weekday() >= 5:
-        return WEEKEND
-    minute = local.hour * 60 + local.minute
-    for name, (start, end) in config.regimes[market].items():
-        if _hhmm(start) <= minute < _hhmm(end):
-            return name
-    return None
-
-
-def regimes_of(stamps: pd.Series, market: str, config: SignalsConfig) -> np.ndarray:
-    """Режимы торгов для серии моментов (векторно); ``""`` — вне режимов."""
-    local = pd.to_datetime(stamps, utc=True).dt.tz_convert(MSK)
-    minute = (local.dt.hour * 60 + local.dt.minute).to_numpy()
-    labels = np.full(len(local), "", dtype=object)
-    for name, (start, end) in config.regimes[market].items():
-        labels[(minute >= _hhmm(start)) & (minute < _hhmm(end))] = name
-    labels[(local.dt.weekday >= 5).to_numpy()] = WEEKEND
-    return labels
 
 
 def minute_slot(moment: datetime) -> str:
@@ -141,7 +115,10 @@ def _calendar_days(trade_date: date) -> list[date]:
 
 
 def compute_norms(
-    repo: MarketDataRepository, instrument: Instrument, config: SignalsConfig
+    repo: MarketDataRepository,
+    instrument: Instrument,
+    config: SignalsConfig,
+    regimes: Regimes | None = None,
 ) -> Norms | None:
     """Нормы по окну ``get_baseline_days`` (блокирующий вызов — через ``to_thread``).
 
@@ -152,6 +129,7 @@ def compute_norms(
     if len(window) < config.baseline_min_days:
         return None
     market = market_of(instrument)
+    regime_map = regimes or Regimes(config)  # SPEC-0012 G-3: режим — по расписанию дня
     sizes: dict[str, list[np.ndarray]] = defaultdict(list)
     minute_volumes: dict[str, list[np.ndarray]] = defaultdict(list)
     per_slot: dict[str, list[float]] = defaultdict(list)
@@ -166,13 +144,13 @@ def compute_norms(
             kind = WEEKEND if day.weekday() >= 5 else "weekday"
             day_kinds[kind] += 1
             parents = parent_sizes(df, instrument)
-            labels = regimes_of(parents["timestamp"], market, config)
+            labels = regime_map.labels(parents["timestamp"], market)
             values = parents["size"].to_numpy(dtype=float)
             for regime in set(labels) - {""}:
                 sizes[str(regime)].append(values[labels == regime])
             minutes = df.groupby(df["timestamp"].dt.floor("min"))["volume"].sum()
             stamps = pd.Series(minutes.index)
-            minute_labels = regimes_of(stamps, market, config)
+            minute_labels = regime_map.labels(stamps, market)
             volumes = minutes.to_numpy(dtype=float)
             for regime in set(minute_labels) - {""}:
                 minute_volumes[str(regime)].append(volumes[minute_labels == regime])
@@ -182,7 +160,7 @@ def compute_norms(
             ).to_numpy(dtype=str)
             for slot, volume in zip(slots, volumes, strict=True):
                 per_slot[str(slot)].append(float(volume))
-            totals, sides = _level_volumes(df, instrument, config, market)
+            totals, sides = _level_volumes(df, instrument, config, market, regime_map)
             for regime, values in totals.items():
                 level_totals[regime].append(values)
             for regime, values in sides.items():
@@ -219,7 +197,11 @@ def _percentiles(
 
 
 def _level_volumes(
-    df: pd.DataFrame, instrument: Instrument, config: SignalsConfig, market: str
+    df: pd.DataFrame,
+    instrument: Instrument,
+    config: SignalsConfig,
+    market: str,
+    regime_map: Regimes,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Объёмы уровней баров ``level_bar_minutes`` по режиму: всего на уровне и
     агрессивный объём каждой стороны (ненулевой) — для этапа 2 SPEC-0008."""
@@ -230,7 +212,7 @@ def _level_volumes(
     frame = pd.DataFrame({"bar": bars, "level": level, "total": df["volume"], "buy": buy,
                           "sell": sell})  # fmt: skip
     cells = frame.groupby(["bar", "level"], sort=False).sum().reset_index()
-    labels = regimes_of(cells["bar"], market, config)
+    labels = regime_map.labels(cells["bar"], market)
     totals: dict[str, np.ndarray] = {}
     sides: dict[str, np.ndarray] = {}
     for regime in set(labels) - {""}:

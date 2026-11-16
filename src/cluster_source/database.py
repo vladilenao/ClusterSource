@@ -901,6 +901,23 @@ class IssTapeRepository:
             )
             """
         )
+        # SPEC-0012 этап 2: интервалы сессий по дням (T-Invest и ISS).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trading_sessions (
+                market      TEXT NOT NULL,
+                day         TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                regime      TEXT,
+                start_utc   TEXT NOT NULL,
+                end_utc     TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                exchange    TEXT NOT NULL,
+                loaded_at   TEXT NOT NULL,
+                PRIMARY KEY (market, day, source, kind, start_utc)
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS iss_week_timetable (
@@ -1368,6 +1385,64 @@ class IssTapeRepository:
             except Exception:
                 conn.rollback()
                 raise
+
+    def replace_sessions(
+        self,
+        market: str,
+        day: str,
+        source: str,
+        exchange: str,
+        rows: Sequence[tuple[str, str | None, datetime, datetime]],
+        loaded_at: str,
+    ) -> None:
+        """Интервалы дня ``(kind, regime, начало, конец)`` источника — заменяют прежние."""
+        with self.session() as conn:
+            conn.execute("BEGIN TRANSACTION;")
+            try:
+                conn.execute(
+                    "DELETE FROM trading_sessions WHERE market = ? AND day = ? AND source = ?",
+                    (market, day, source),
+                )
+                conn.executemany(
+                    "INSERT OR REPLACE INTO trading_sessions (market, day, kind, regime,"
+                    " start_utc, end_utc, source, exchange, loaded_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (market, day, kind, regime, start.astimezone(UTC).isoformat(),
+                         end.astimezone(UTC).isoformat(), source, exchange, loaded_at)
+                        for kind, regime, start, end in rows
+                    ],
+                )  # fmt: skip
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def sessions(
+        self, market: str, day: str, source: str = "tinvest"
+    ) -> list[tuple[str, str | None, datetime, datetime]]:
+        """Интервалы дня источника: ``(kind, regime, начало, конец)`` по времени начала."""
+        with self.session() as conn:
+            rows = conn.execute(
+                "SELECT kind, regime, start_utc, end_utc FROM trading_sessions"
+                " WHERE market = ? AND day = ? AND source = ? ORDER BY start_utc",
+                (market, day, source),
+            ).fetchall()
+        return [
+            (str(k), None if r is None else str(r), datetime.fromisoformat(str(a)),
+             datetime.fromisoformat(str(b)))
+            for k, r, a, b in rows
+        ]  # fmt: skip
+
+    def session_end(self, market: str, day: str) -> datetime | None:
+        """Конец последней торговой сессии дня по расписанию T-Invest (SPEC-0012)."""
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT MAX(end_utc) FROM trading_sessions WHERE market = ? AND day = ?"
+                " AND source = 'tinvest' AND regime IS NOT NULL AND regime != 'auction'",
+                (market, day),
+            ).fetchone()
+        return None if row is None or row[0] is None else datetime.fromisoformat(str(row[0]))
 
     def calendar_day(self, market: str, day: str) -> int | None:
         """``is_work_day`` исключения за дату или ``None``."""

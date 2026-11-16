@@ -487,3 +487,33 @@ async def test_verify_tolerates_session_tail_and_spreads(
         ).verify_pending()
     assert iss_repo.day_status("forts", "2026-10-13", KIND_TRADE_DATE) == STATUS_INCOMPLETE
     assert "лента обрывается в 10:00 МСК" in caplog.text
+
+
+async def test_verify_cutoff_uses_schedule_end(
+    share_config: AppConfig, iss_repo: IssTapeRepository
+) -> None:
+    """SPEC-0012 A-7: в сокращённый день (сессия до 19:00) срез 18:45 — лента полна;
+    без расписания тот же срез — обрыв (граница 23:30)."""
+    from cluster_source.iss import MSK
+
+    rows = [fut(k, day="2026-10-12") for k in range(1, 99)]
+    rows.append(fut(99, tradetime="18:45:00", day="2026-10-12"))
+    iss_repo.stage_rows(normalize_trades("forts", "2026-10-12", FORTS_COLUMNS, rows))
+    iss_repo.finalize_feed_day("forts", "2026-10-12")
+    fake = FakeIss()
+    fake.history[("forts", "2026-10-12")] = {"SiZ6": 100}
+    now = datetime(2026, 10, 13, 6, 0, tzinfo=UTC)
+    await collector(share_config, iss_repo, fake, now=now).verify_pending()
+    assert iss_repo.day_status("forts", "2026-10-12", KIND_TRADE_DATE) == STATUS_INCOMPLETE
+
+    with iss_repo.session() as conn:
+        conn.execute("DELETE FROM iss_day_status")
+        conn.commit()
+    start = datetime(2026, 10, 12, 10, 0, tzinfo=MSK)
+    end = datetime(2026, 10, 12, 18, 59, tzinfo=MSK)
+    iss_repo.replace_sessions(
+        "forts", "2026-10-12", "tinvest", "x", [("holiday_trading_session_morning", "weekend",
+                                                 start, end)], "now"
+    )  # fmt: skip
+    await collector(share_config, iss_repo, fake, now=now).verify_pending()
+    assert iss_repo.day_status("forts", "2026-10-12", KIND_TRADE_DATE) == STATUS_COMPLETE

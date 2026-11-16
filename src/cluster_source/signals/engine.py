@@ -34,7 +34,7 @@ from cluster_source.database import MarketDataRepository, SignalRepository
 from cluster_source.quality import STATE_DEGRADED, minute_floor
 from cluster_source.reconcile import STATUS_GAP, STATUS_REPAIRED
 from cluster_source.signals import events as ev
-from cluster_source.signals.baseline import Norms, compute_norms
+from cluster_source.signals.baseline import Norms, Regimes, compute_norms
 from cluster_source.signals.detectors import (
     LARGE_AGGRESSOR,
     VOLUME_SPIKE,
@@ -89,6 +89,7 @@ class SignalEngine:
         secid_of: Callable[[str], str | None],
         *,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        regimes: Regimes | None = None,
     ) -> None:
         self._config = config
         self._signals = config.signals
@@ -97,6 +98,8 @@ class SignalEngine:
         self._repo = signal_repo
         self._secid_of = secid_of
         self._now = now
+        #: SPEC-0012 G-3: режимы торгов по расписанию дня (иначе — по конфигурации).
+        self._regimes = regimes or Regimes(config.signals)
         self._instruments: dict[str, Instrument] = {
             i.storage_name: i for i in config.instruments if i.storage_name in collectors
         }
@@ -133,10 +136,11 @@ class SignalEngine:
     # ------------------------------------------------------------------ #
     async def refresh_norms(self) -> None:
         """Пересчитывает нормы и детекторы (при старте и после ночной проверки FINAL)."""
+        self._regimes.clear()  # расписание могло обновиться в обслуживании
         for name, instrument in self._instruments.items():
             try:
                 norms = await asyncio.to_thread(
-                    compute_norms, self._repos[name], instrument, self._signals
+                    compute_norms, self._repos[name], instrument, self._signals, self._regimes
                 )
             except Exception as exc:  # noqa: BLE001 - один инструмент не роняет движок
                 logger.error("Ошибка расчёта норм %s: %s", name, exc)
@@ -153,9 +157,9 @@ class SignalEngine:
                 continue
             self._norms[name] = norms
             self._detectors[name] = [
-                LargeAggressorDetector(instrument, norms, self._signals),
-                VolumeSpikeDetector(instrument, norms, self._signals),
-                LevelDetector(instrument, norms, self._signals),
+                LargeAggressorDetector(instrument, norms, self._signals, self._regimes),
+                VolumeSpikeDetector(instrument, norms, self._signals, self._regimes),
+                LevelDetector(instrument, norms, self._signals, self._regimes),
             ]
         logger.info(
             "Нормы сигналов: детекторы включены у %d из %d инструментов",

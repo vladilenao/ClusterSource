@@ -24,7 +24,7 @@ import pandas as pd
 from cluster_source.collector import Tick
 from cluster_source.config import Direction, Instrument, InstrumentType, SignalsConfig
 from cluster_source.quality import minute_floor
-from cluster_source.signals.baseline import Norms, market_of, minute_slot, regime_of
+from cluster_source.signals.baseline import Norms, Regimes, market_of, minute_slot
 from cluster_source.signals.events import iso
 
 LARGE_AGGRESSOR = "large_aggressor"
@@ -69,10 +69,17 @@ def _size(price_volume: float, volume: float, instrument: Instrument) -> float:
 class LargeAggressorDetector:
     """Крупная агрессивная заявка (родительская заявка по времени и стороне)."""
 
-    def __init__(self, instrument: Instrument, norms: Norms, config: SignalsConfig) -> None:
+    def __init__(
+        self,
+        instrument: Instrument,
+        norms: Norms,
+        config: SignalsConfig,
+        regimes: Regimes | None = None,
+    ) -> None:
         self._instrument = instrument
         self._norms = norms
         self._config = config
+        self._regimes = regimes or Regimes(config)
         self._market = market_of(instrument)
         self.reset()
 
@@ -116,7 +123,7 @@ class LargeAggressorDetector:
             return []
         moment, side = self._key
         self._key = None
-        regime = regime_of(moment, self._market, self._config)
+        regime = self._regimes.regime(moment, self._market)
         threshold = self._norms.aggressor_threshold.get(regime or "")
         size = _size(self._notional, self._volume, self._instrument)
         if threshold is None or size < threshold:
@@ -173,10 +180,17 @@ def recheck_large_aggressor(
 class VolumeSpikeDetector:
     """Всплеск объёма минуты относительно той же минуты дня (RVOL)."""
 
-    def __init__(self, instrument: Instrument, norms: Norms, config: SignalsConfig) -> None:
+    def __init__(
+        self,
+        instrument: Instrument,
+        norms: Norms,
+        config: SignalsConfig,
+        regimes: Regimes | None = None,
+    ) -> None:
         self._instrument = instrument
         self._norms = norms
         self._config = config
+        self._regimes = regimes or Regimes(config)
         self._market = market_of(instrument)
         self.reset()
 
@@ -212,7 +226,9 @@ class VolumeSpikeDetector:
             return []
         minute, volume, delta = self._minute, self._volume, self._buy - self._sell
         self._minute = None
-        spike = evaluate_spike(minute, volume, delta, self._norms, self._config, self._market)
+        spike = evaluate_spike(
+            minute, volume, delta, self._norms, self._config, self._market, self._regimes
+        )
         if spike is None:
             return []
         direction, payload = spike
@@ -246,9 +262,10 @@ def evaluate_spike(
     norms: Norms,
     config: SignalsConfig,
     market: str,
+    regimes: Regimes | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     """Правило ``volume_spike``: ``(направление, payload)`` или ``None``."""
-    regime = regime_of(minute, market, config)
+    regime = (regimes or Regimes(config)).regime(minute, market)
     pct = norms.minute_volume_pct.get(regime or "")
     median = norms.minute_median.get(minute_slot(minute))
     if pct is None or median is None or volume < pct:
