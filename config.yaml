@@ -233,6 +233,10 @@ tickers:
     type: "continuous_futures"  # Природный газ
     tick_size: 0.001
     lot_size: 100
+  - id: "SR"
+    type: "continuous_futures"  # Сбербанк (SBRF), цена в рублях за 100 акций
+    tick_size: 1.0
+    lot_size: 100
   - id: "GD"
     type: "continuous_futures"  # Золото (цена в долларах за тройскую унцию)
     tick_size: 0.1
