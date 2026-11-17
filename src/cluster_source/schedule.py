@@ -110,12 +110,39 @@ def _days(start: date, end: date) -> list[date]:
     return [start + timedelta(days=k) for k in range((end - start).days + 1)]
 
 
+#: Сколько дней вперёд искать торговый день, в итоги которого входит сессия выходного.
+_FOLD_DAYS = 6
+
+
+def _session_totals(
+    iss: IssTapeRepository, market: str, day: date
+) -> dict[str, tuple[int, float]] | None:
+    """Итоги ISS торгового дня, в который входят сделки календарного дня ``day``.
+
+    У будня со своими итогами — они сами. Суббота, воскресенье и день, для
+    которого ISS вернул пустые итоги (праздник с сессией, 04.11), своих итогов
+    не имеют: их сессия входит в итоги следующего торгового дня. Итогов в кэше
+    нет (или цепочка до торгового дня не доказана) — ``None``.
+    """
+    probe = day
+    for _ in range(_FOLD_DAYS):
+        totals = iss.cached_totals(market, probe.isoformat())
+        if totals:
+            return totals
+        if totals is None and probe.weekday() < 5:
+            return None  # будний день без итогов в кэше — не знаем, торговый ли он сам
+        probe += timedelta(days=1)
+    return None
+
+
 def _confirmed_no_trades(iss: IssTapeRepository, instrument: Instrument, day: date) -> bool:
-    """Будний день с итогами ISS в кэше, где у инструмента (у фьючерса — у всех
-    контрактов актива) 0 сделок: торгов действительно не было."""
-    if day.weekday() >= 5:  # итоги выходных входят в понедельник
-        return False
-    totals = iss.cached_totals(_market(instrument), day.isoformat())
+    """SPEC-0013 G-2: в итогах ISS торгового дня, куда входит ``day``, у инструмента
+    (у фьючерса — у всех контрактов актива) 0 сделок: торгов действительно не было.
+
+    Для сессии выходного или праздника это итоги следующего торгового дня: 0 сделок
+    за торговый день — 0 и в любой его сессии.
+    """
+    totals = _session_totals(iss, _market(instrument), day)
     if not totals:
         return False
     if instrument.type == InstrumentType.SHARE:

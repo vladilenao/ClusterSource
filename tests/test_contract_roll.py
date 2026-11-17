@@ -131,6 +131,25 @@ def test_calendar_gap_marked(cfg: AppConfig, caplog: pytest.LogCaptureFixture) -
     assert repos["Si_CONTINUOUS"].days_to_refresh()["2026-09-18"] == REFRESH_CALENDAR_GAP
 
 
+def test_calendar_gap_weekend_by_next_trading_day(cfg: AppConfig) -> None:
+    """SPEC-0013 A-5 (G-2): сессия выходного или праздника без своих итогов — по итогам
+    торгового дня, в который она входит: 0 сделок — не пропуск; сделки есть или итогов
+    в кэше нет — пропуск (PIKK, торги приостановлены с 16.10)."""
+    repos = {i.storage_name: MarketDataRepository(cfg.storage_root, i) for i in cfg.instruments}
+    iss = IssTapeRepository(cfg.storage_root)
+    setup_calendar(iss)  # 13.09 (вс) — неторговый
+    store_days(repos["SBER"], ["2026-09-11", "2026-09-29"])
+    iss.save_totals("shares", "2026-09-14", {"GAZP": (10, 1.0)})  # пн: у SBER 0 — и в сб 12.09
+    iss.save_totals("shares", "2026-09-16", {})  # ср: праздник, своих итогов у ISS нет
+    iss.save_totals("shares", "2026-09-17", {"GAZP": (10, 1.0)})  # чт: в итогах и сессия 16.09
+    iss.save_totals("shares", "2026-09-21", {"SBER": (5, 1.0)})  # пн: SBER торговался
+    gaps = {d.isoformat() for d in find_calendar_gaps(cfg, repos, iss, date(2026, 9, 30))["SBER"]}
+    assert not gaps & {"2026-09-12", "2026-09-14", "2026-09-16", "2026-09-17"}
+    assert {"2026-09-19", "2026-09-20", "2026-09-21"} <= gaps  # выходные торгового дня со сделками
+    assert {"2026-09-15", "2026-09-18"} <= gaps  # будни без итогов в кэше
+    assert {"2026-09-26", "2026-09-27"} <= gaps  # выходные, итогов понедельника нет
+
+
 def test_calendar_gap_not_limited_by_window(cfg: AppConfig) -> None:
     """SPEC-0013 A-3: отметка calendar_gap старше окна history_check_days не снимается."""
     repo = MarketDataRepository(cfg.storage_root, SI)
