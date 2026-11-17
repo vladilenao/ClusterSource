@@ -72,6 +72,10 @@ class HubConnection:
     tickers: dict[str, str] = field(default_factory=dict)
     #: ``{instrument_uid: storage_name}`` — маршрут сообщений ОИ (в них нет FIGI).
     uids: dict[str, str] = field(default_factory=dict)
+    #: SPEC-0014 G-3: ``{storage_name: [другие хранилища того же FIGI]}`` — сделки,
+    #: ОИ и статусы маршрута доставляются и в них (активный контракт непрерывного
+    #: фьючерса и его хранилище).
+    mirrors: dict[str, list[str]] = field(default_factory=dict)
 
 
 ConnectionFactory = Callable[[Sequence[Instrument], bool], Awaitable[HubConnection]]
@@ -108,6 +112,7 @@ class StreamHub:
         self._resolve_requested = True  # первое соединение разрешает FIGI
         self._unknown_routes: set[str] = set()
         self._routes: dict[str, str] = {}
+        self._mirrors: dict[str, list[str]] = {}
         self._figis: dict[str, str] = {}  # storage_name -> FIGI (для ролловера)
         self._connected = False
         self._last_frame_at: datetime | None = None
@@ -128,6 +133,19 @@ class StreamHub:
     async def shutdown(self) -> None:
         self._running = False
 
+    def set_collectors(self, collectors: Sequence[DataCollector]) -> None:
+        """Заменяет набор собираемых инструментов (SPEC-0014: окна хранилищ контрактов).
+
+        Новый набор подписывается при следующем открытии соединения; вызывающий
+        просит переподключение с ``resolve=True``.
+        """
+        self._collectors = {c.instrument.storage_name: c for c in collectors}
+
+    def _targets(self, name: str) -> list[DataCollector]:
+        """Хранилище маршрута и его зеркала (SPEC-0014 G-3)."""
+        names = [name, *self._mirrors.get(name, [])]
+        return [self._collectors[n] for n in names if n in self._collectors]
+
     async def run(self) -> None:
         """Держит соединение открытым; переподключается с экспоненциальной задержкой."""
         self._running = True
@@ -139,10 +157,10 @@ class StreamHub:
             watchdog.cancel()
 
     async def _connection_loop(self) -> None:
-        instruments = [c.instrument for c in self._collectors.values()]
         loop = asyncio.get_running_loop()
         delay = 0.0
         while self._running:
+            instruments = [c.instrument for c in self._collectors.values()]
             resolve = self._resolve_requested
             self._reconnect_requested = False
             try:
@@ -199,11 +217,15 @@ class StreamHub:
 
     def _on_opened(self, conn: HubConnection) -> None:
         now = self._now()
-        subscribed = sorted(set(conn.routes.values()))
+        mirrored = {m: p for p, ms in conn.mirrors.items() for m in ms}
+        subscribed = sorted(set(conn.routes.values()) | set(mirrored))
         for name in conn.not_found:
             logger.warning("Инструмент %s не найден у провайдера — не собирается", name)
         figis = {name: key for key, name in conn.routes.items()}
+        figis.update({m: figis[p] for m, p in mirrored.items() if p in figis})
         for name in subscribed:
+            if name not in self._collectors:
+                continue
             collector = self._collectors[name]
             # SPEC-0009 G-2: сделки до (пере)открытия не получены у всех инструментов.
             collector.on_stream_opened()
@@ -215,6 +237,7 @@ class StreamHub:
         self._figis.update(figis)
         self.tickers.update(conn.tickers)
         self._routes = dict(conn.routes)
+        self._mirrors = {p: list(ms) for p, ms in conn.mirrors.items()}
         self._connected = True
         self._last_frame_at = now
         self.failed_subscriptions.clear()
@@ -268,7 +291,8 @@ class StreamHub:
             if oi is not None:
                 name = conn.uids.get(str(getattr(oi, "instrument_uid", "")))
                 if name is not None:  # SPEC-0007
-                    self._collectors[name].deliver_open_interest(oi)
+                    for target in self._targets(name):
+                        target.deliver_open_interest(oi)
 
     def _resolve_route(self, payload: Any, routes: dict[str, str]) -> str | None:
         for key in (getattr(payload, "figi", None), getattr(payload, "instrument_uid", None)):
@@ -285,8 +309,9 @@ class StreamHub:
                 logger.warning("Сделка по неподписанному инструменту %s — пропущена", figi)
             return
         self._observe_lag(trade)
-        self._end_gap(name)  # сделка доказывает, что подписка работает
-        await self._collectors[name].deliver(trade)
+        for target in self._targets(name):
+            self._end_gap(target.instrument.storage_name)  # подписка работает
+            await target.deliver(trade)
 
     def _on_trading_status(self, status: Any, routes: dict[str, str]) -> None:
         name = self._resolve_route(status, routes)
@@ -294,7 +319,8 @@ class StreamHub:
             return
         moment = getattr(status, "time", None)
         since = moment.astimezone(UTC) if isinstance(moment, datetime) else None
-        self._collectors[name].set_trading_status(getattr(status, "trading_status", None), since)
+        for target in self._targets(name):
+            target.set_trading_status(getattr(status, "trading_status", None), since)
 
     def _observe_lag(self, trade: Any) -> None:
         moment = getattr(trade, "time", None)
@@ -315,16 +341,16 @@ class StreamHub:
             key = str(getattr(sub, "figi", "") or getattr(sub, "instrument_uid", ""))
             storage = routes.get(key, key)
             if subscription_ok(status):
-                self._end_gap(storage)
+                for target in [storage, *self._mirrors.get(storage, [])]:
+                    self._end_gap(target)
                 continue
             name = getattr(status, "name", None) or str(status)
             self.failed_subscriptions.add(storage)
             logger.error("STREAM_SUBSCRIPTION_FAILED %s (%s): статус %s", storage, key, name)
-            if storage in self._collectors:
-                collector = self._collectors[storage]
+            for collector in self._targets(storage):
                 collector.on_stream_opened()
                 collector.quality.begin(REASON_SUBSCRIPTION_FAILED, now, now)
-                self._end_gap(storage)
+                self._end_gap(collector.instrument.storage_name)
 
     # ------------------------------------------------------------------ #
     # Сторож SPEC-0004
@@ -341,8 +367,15 @@ class StreamHub:
         """Один проход сторожа: отставание, тишина, мёртвое соединение, отметки минут."""
         if self._connected:
             self._check_latency(now)
+            routed = set(self._routes.values())
+            mirrored = {m for ms in self._mirrors.values() for m in ms}
             for collector in self._collectors.values():
-                if collector.instrument.storage_name in self._routes.values():
+                name = collector.instrument.storage_name
+                # SPEC-0014 G-5: у неактивного контракта долгие паузы — норма, не тишина;
+                # активный (зеркало непрерывного) проверяется как обычно.
+                if collector.instrument.is_contract_storage and name not in mirrored:
+                    continue
+                if name in routed or name in mirrored:
                     collector.check_silence(now)
             self._check_dead_stream(now)
         for collector in self._collectors.values():

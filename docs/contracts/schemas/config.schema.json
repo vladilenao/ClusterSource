@@ -123,6 +123,13 @@
       "default": 14,
       "description": "Окно в днях (включая сегодняшний) для догрузки отсутствующих и перекачки отмеченных дней."
     },
+    "futures_contracts": {
+      "type": "integer",
+      "minimum": 0,
+      "not": {"const": 1},
+      "default": 2,
+      "description": "SPEC-0014: сколько ближайших контрактов каждого непрерывного фьючерса хранить отдельно (0 — не хранить; 1 недопустимо)."
+    },
     "tickers": {
       "type": "array",
       "default": [],
@@ -170,6 +177,12 @@
           "minimum": 1,
           "default": 1,
           "description": "Размер лота. Справочное поле (L-09)."
+        },
+        "contracts": {
+          "type": "integer",
+          "minimum": 0,
+          "not": {"const": 1},
+          "description": "SPEC-0014, только continuous_futures: число хранимых ближайших контрактов актива; важнее futures_contracts."
         }
       }
     }

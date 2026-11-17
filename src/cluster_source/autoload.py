@@ -92,6 +92,12 @@ REFRESH_FINAL_MISMATCH = "final_mismatch"
 REFRESH_CALENDAR_GAP = "calendar_gap"
 #: SPEC-0014 G-4: контракт дня по новому правилу ролла другой — перекачать.
 REFRESH_ROLL_RULE = "roll_rule"
+#: SPEC-0014: первичная догрузка окна хранилища контракта — фоновым проходом.
+REFRESH_CONTRACT_BACKFILL = "contract_backfill"
+#: Отметки фонового прохода (``cleanup=True``): окном не ограничены, ночное
+#: обслуживание их не ждёт.
+BACKGROUND_REASONS = frozenset({REFRESH_DEALER_CLEANUP, REFRESH_CONTRACT_BACKFILL})
+CONTRACT_BACKFILL_META_KEY = "spec0014_contract_backfill_scheduled"
 #: Отметки, которые окно ``history_check_days`` не снимает.
 WINDOW_EXEMPT = frozenset({REFRESH_FINAL_MISMATCH, REFRESH_CALENDAR_GAP, REFRESH_ROLL_RULE})
 DEALER_CLEANUP_META_KEY = "spec0002_dealer_cleanup_scheduled"
@@ -210,6 +216,14 @@ def days_to_load(
     открытый стрим, а пропущенное до старта дозаливает сверка (SPEC-0011 G-5).
     """
     missing = [] if cleanup else missing_days(config, repo)
+    # SPEC-0014: у хранилища контракта вне окна данных нет и пропуски не ищутся;
+    # дни с отметкой первичной догрузки обрабатывает фоновый проход.
+    background = {d for d, r in repo.days_to_refresh().items() if r in BACKGROUND_REASONS}
+    missing = [
+        d
+        for d in missing
+        if repo.instrument.in_window(d.date()) and d.strftime("%Y-%m-%d") not in background
+    ]
     if not include_today:
         today = _utc_today().date()
         missing = [d for d in missing if d.date() < today]
@@ -233,15 +247,16 @@ def refresh_days(
       ``history_check_days``; отметки старше окна снимаются с предупреждением,
       кроме ``final_mismatch`` (SPEC-0006) и ``calendar_gap`` (SPEC-0013) — они
       окном не ограничены.
-    * ``cleanup=True`` — только отметки ``dealer_cleanup`` без ограничения
-      окном (SPEC-0002 G-4), от новых дней к старым.
+    * ``cleanup=True`` — только отметки фонового прохода (``dealer_cleanup``,
+      SPEC-0002 G-4; ``contract_backfill``, SPEC-0014) без ограничения окном, от
+      новых дней к старым.
     """
     today = _utc_today()
     window_start = (today - timedelta(days=config.history_check_days - 1)).strftime("%Y-%m-%d")
     today_str = today.strftime("%Y-%m-%d")
     days: list[datetime] = []
     for day_str, reason in sorted(repo.days_to_refresh().items(), reverse=cleanup):
-        is_cleanup = reason == REFRESH_DEALER_CLEANUP
+        is_cleanup = reason in BACKGROUND_REASONS
         if is_cleanup != cleanup or day_str >= today_str:
             continue
         if not cleanup and day_str < window_start and reason not in WINDOW_EXEMPT:
@@ -278,6 +293,40 @@ def schedule_dealer_cleanup(repo: MarketDataRepository) -> int:
         repo.instrument.storage_name,
         len(days),
     )
+    return len(days)
+
+
+def schedule_contract_backfill(repo: MarketDataRepository) -> int:
+    """Однократно отмечает прошедшие дни окна хранилища контракта без данных (SPEC-0014).
+
+    Окно за ~100 дней — тысячи файлов архива на все хранилища: их перекачивает
+    фоновый проход, а не ночное обслуживание. Повторный вызов ничего не делает
+    (флаг в ``meta``); возвращает число отмеченных дней.
+    """
+    window = repo.instrument.window
+    if window is None or repo.get_meta(CONTRACT_BACKFILL_META_KEY) is not None:
+        return 0
+    today = _utc_today().date()
+    have = repo.available_days()
+    days: list[str] = []
+    day = window[0]
+    while day <= min(window[1], today - timedelta(days=1)):
+        if day.isoformat() not in have:
+            days.append(day.isoformat())
+        day += timedelta(days=1)
+    repo.mark_days_for_refresh(days, REFRESH_CONTRACT_BACKFILL)
+    # Данные хранилища контракта — только с биржевым фильтром (SPEC-0002): чистка не нужна.
+    if not have and repo.get_meta(DEALER_CLEANUP_META_KEY) is None:
+        repo.set_meta(DEALER_CLEANUP_META_KEY, datetime.now(UTC).isoformat())
+    repo.set_meta(CONTRACT_BACKFILL_META_KEY, datetime.now(UTC).isoformat())
+    if days:
+        logger.info(
+            "CONTRACT_BACKFILL %s: окно %s…%s, к догрузке дней %d",
+            repo.instrument.storage_name,
+            window[0],
+            window[1],
+            len(days),
+        )
     return len(days)
 
 

@@ -283,6 +283,9 @@ async def test_stream_opens_before_startup_maintenance(
         def request_reconnect(self, resolve: bool = False) -> None:
             pass
 
+        def set_collectors(self, _collectors: Any) -> None:
+            pass
+
     async def fake_maintenance(*_: Any, include_today: bool = True, **__: Any) -> None:
         events.append(f"maintenance include_today={include_today}")
 

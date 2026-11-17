@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from cluster_source.autoload import REFRESH_FINAL_MISMATCH
+from cluster_source.autoload import REFRESH_CONTRACT_BACKFILL, REFRESH_FINAL_MISMATCH
 from cluster_source.config import (
     AppConfig,
     FuturesMeta,
@@ -197,6 +197,11 @@ async def _check_instrument(
     previous = {str(row.trade_date): row for row in done.itertuples(index=False)}
     marks = await asyncio.to_thread(repo.days_to_refresh)
     for trade_date, span in spans.items():
+        if inst.is_contract_storage and (
+            not inst.in_window(trade_date)
+            or any(marks.get(d.isoformat()) == REFRESH_CONTRACT_BACKFILL for d in span)
+        ):
+            continue  # SPEC-0014: вне окна контракта; окно ещё догружается
         n, volume = 0, 0.0
         for day in span:
             dn, dv = await asyncio.to_thread(repo.day_totals, day.isoformat())
@@ -233,6 +238,13 @@ async def _check_instrument(
             status, ref, reference, detail = await _forts_verdict(
                 inst, repo, iss, client, futures, trade_date, span, ours, today, cutoffs
             )
+            if status is None and inst.is_contract_storage and n == 0:
+                # SPEC-0014 G-5: ни у нас, ни у биржи сделок нет — день итоговый.
+                totals = await _totals(client, iss, market, trade_date, today)
+                published = (today - trade_date).days >= TOTALS_PUBLISHED_AFTER_DAYS
+                if totals and published and totals.get(inst.id, (0, 0.0))[0] == 0:
+                    status, ref = STATUS_FINAL, (0, 0.0)
+                    reference, detail = "iss_totals", f"{inst.id}: сделок не было"
         if status is None:
             continue
         span_days = [d.isoformat() for d in span]

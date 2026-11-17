@@ -36,6 +36,10 @@ keep_awake: true
 # History completeness window (days)
 history_check_days: 32
 
+# SPEC-0014: store this many nearest contracts of every continuous future
+# separately (0 = none, otherwise >= 2); per-ticker `contracts` overrides it.
+futures_contracts: 2
+
 # List of instruments to monitor
 tickers:
   # --- Акции базы индекса РТС/IMOEX (обыкновенные, секции TQBR) ---
@@ -229,10 +233,12 @@ tickers:
     type: "continuous_futures"  # Нефть марки Brent
     tick_size: 0.01
     lot_size: 10
+    contracts: 3  # месячные контракты: третий ещё торгуется (SPEC-0014)
   - id: "NG"
     type: "continuous_futures"  # Природный газ
     tick_size: 0.001
     lot_size: 100
+    contracts: 3  # месячные контракты: третий ещё торгуется (SPEC-0014)
   - id: "SR"
     type: "continuous_futures"  # Сбербанк (SBRF), цена в рублях за 100 акций
     tick_size: 1.0

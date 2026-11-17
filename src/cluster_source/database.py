@@ -1446,25 +1446,43 @@ class IssTapeRepository:
                 keep(str(day), pd.Timestamp(value).to_pydatetime().astimezone(UTC))
         return out
 
-    def tape_volumes(self, market: str, board: str, trade_date: str) -> dict[str, float]:
+    def tape_volumes(
+        self,
+        market: str,
+        board: str,
+        trade_date: str,
+        since: datetime | None = None,
+        before: datetime | None = None,
+    ) -> dict[str, float]:
         """Объём ленты ISS по бумагам за торговый день (``{secid: контрактов}``, SPEC-0014).
 
-        Сделка из лент нескольких дат считается один раз (SPEC-0003 G-4).
+        ``since`` / ``before`` — только сделки в [since, before) (календарный день
+        внутри торгового). Сделка из лент нескольких дат считается один раз
+        (SPEC-0003 G-4).
         """
+        filters: list[tuple[str, str, object]] = [
+            ("trade_date", "=", trade_date),
+            ("board", "=", board),
+        ]
+        sql = (
+            "SELECT secid, tradeno, quantity FROM iss_trades"
+            " WHERE market = ? AND trade_date = ? AND board = ?"
+        )
+        params: list[object] = [market, trade_date, board]
+        if since is not None:
+            filters.append(("timestamp", ">=", pd.Timestamp(since).tz_convert("UTC")))
+            sql += " AND timestamp >= ?"
+            params.append(since.astimezone(UTC).isoformat(timespec="microseconds"))
+        if before is not None:
+            filters.append(("timestamp", "<", pd.Timestamp(before).tz_convert("UTC")))
+            sql += " AND timestamp < ?"
+            params.append(before.astimezone(UTC).isoformat(timespec="microseconds"))
         frames: list[pd.DataFrame] = []
         for path in self._near_feed_paths(market, trade_date):
-            table = pq.read_table(
-                path,
-                columns=["secid", "tradeno", "quantity"],
-                filters=[("trade_date", "=", trade_date), ("board", "=", board)],
-            )
+            table = pq.read_table(path, columns=["secid", "tradeno", "quantity"], filters=filters)
             frames.append(table.to_pandas())
         with self.session() as conn:
-            rows = conn.execute(
-                "SELECT secid, tradeno, quantity FROM iss_trades"
-                " WHERE market = ? AND trade_date = ? AND board = ?",
-                (market, trade_date, board),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         frames.append(pd.DataFrame(rows, columns=["secid", "tradeno", "quantity"]))
         frames = [f for f in frames if not f.empty]
         if not frames:

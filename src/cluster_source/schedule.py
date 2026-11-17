@@ -106,6 +106,10 @@ def _market(instrument: Instrument) -> str:
     return "shares" if instrument.type == InstrumentType.SHARE else "forts"
 
 
+def _days(start: date, end: date) -> list[date]:
+    return [start + timedelta(days=k) for k in range((end - start).days + 1)]
+
+
 def _confirmed_no_trades(iss: IssTapeRepository, instrument: Instrument, day: date) -> bool:
     """Будний день с итогами ISS в кэше, где у инструмента (у фьючерса — у всех
     контрактов актива) 0 сделок: торгов действительно не было."""
@@ -121,6 +125,35 @@ def _confirmed_no_trades(iss: IssTapeRepository, instrument: Instrument, day: da
     return trades == 0
 
 
+def _contract_traded(
+    iss: IssTapeRepository,
+    instrument: Instrument,
+    day: date,
+    tape_cache: dict[date, dict[str, float]],
+) -> bool:
+    """SPEC-0014 G-5: у контракта за календарный день были сделки по данным ISS.
+
+    Будний день с итогами — по итогам ``secid``; выходной или праздник (итогов
+    своих нет) — по ленте ISS торгового дня, сделки которой пришлись на этот
+    календарный день (``tape_cache`` — одна выборка на день для всех
+    хранилищ). Нет ни итогов, ни ленты — доказательства нет: не пропуск.
+    """
+    totals = iss.cached_totals("forts", day.isoformat())
+    if totals:
+        return totals.get(instrument.id, (0, 0.0))[0] > 0
+    if day not in tape_cache:
+        start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+        trading = day
+        for offset in range(1, 6):  # торговый день, к которому относится выходной
+            trading = day + timedelta(days=offset)
+            if iss.cached_totals("forts", trading.isoformat()):
+                break
+        tape_cache[day] = iss.tape_volumes(
+            "forts", "RFUD", trading.isoformat(), since=start, before=start + timedelta(days=1)
+        )
+    return tape_cache[day].get(instrument.id, 0.0) > 0
+
+
 def find_calendar_gaps(
     config: AppConfig,
     repos: Mapping[str, MarketDataRepository],
@@ -129,13 +162,29 @@ def find_calendar_gaps(
 ) -> dict[str, list[date]]:
     """Торговые по календарю ISS дни без данных — от первого сохранённого дня до вчера."""
     gaps: dict[str, list[date]] = {}
+    tape_cache: dict[date, dict[str, float]] = {}
     for instrument in config.instruments:
         repo = repos[instrument.storage_name]
         have = repo.available_days()
+        if instrument.is_contract_storage and instrument.window is not None:
+            # SPEC-0014 G-5: только окно контракта; день без сделок по ISS — не пропуск;
+            # дни первичной догрузки ещё не обработаны фоновым проходом.
+            pending = set(repo.days_to_refresh())
+            found = [
+                day
+                for day in _days(instrument.window[0], min(instrument.window[1], today))
+                if day < today
+                and day.isoformat() not in have
+                and day.isoformat() not in pending
+                and _contract_traded(iss, instrument, day, tape_cache)
+            ]
+            if found:
+                gaps[instrument.storage_name] = found
+            continue
         if not have:
             continue
         day = min(date.fromisoformat(d) for d in have)
-        found: list[date] = []
+        found = []
         while day < today:
             if (
                 day.isoformat() not in have

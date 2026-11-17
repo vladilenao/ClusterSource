@@ -164,6 +164,10 @@ class Reconciler:
         self._is_blocked = is_blocked
         self._now = now
 
+    def set_config(self, config: AppConfig) -> None:
+        """Новый набор инструментов (SPEC-0014: окна хранилищ контрактов меняются ночью)."""
+        self._config = config
+
     async def run(self) -> None:
         while True:
             await self.run_once()

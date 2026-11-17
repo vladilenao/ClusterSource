@@ -93,6 +93,22 @@ class Instrument:
     type: InstrumentType
     tick_size: float
     lot_size: int
+    #: SPEC-0014: число хранимых ближайших контрактов (``continuous_futures``);
+    #: ``None`` — общий ``AppConfig.futures_contracts``.
+    contracts: int | None = None
+    #: SPEC-0014: хранилище контракта, порождённое непрерывным фьючерсом ``underlying``
+    #: (его ``id``); ``window`` — дни, когда контракт среди ближайших (включительно).
+    underlying: str | None = None
+    window: tuple[date, date] | None = None
+
+    @property
+    def is_contract_storage(self) -> bool:
+        """Хранилище контракта непрерывного фьючерса (SPEC-0014), не из config.yaml."""
+        return self.underlying is not None
+
+    def in_window(self, day: date) -> bool:
+        """День в окне хранилища контракта; у остальных инструментов — всегда."""
+        return self.window is None or self.window[0] <= day <= self.window[1]
 
     @property
     def is_continuous(self) -> bool:
@@ -273,6 +289,15 @@ class AppConfig:
     history_check_days: int = 14
     instruments: list[Instrument] = field(default_factory=list)
     signals: SignalsConfig = field(default_factory=SignalsConfig)
+    #: SPEC-0014: сколько ближайших контрактов непрерывного фьючерса хранить отдельно
+    #: (0 — не хранить); ``contracts`` инструмента важнее.
+    futures_contracts: int = 2
+
+    def contracts_of(self, instrument: Instrument) -> int:
+        """Число хранимых контрактов актива (SPEC-0014)."""
+        if instrument.contracts is not None:
+            return instrument.contracts
+        return self.futures_contracts
 
     @classmethod
     def from_yaml(cls, path: str | Path, token: str | None = None) -> AppConfig:
@@ -297,9 +322,19 @@ class AppConfig:
                 type=InstrumentType(item["type"]),
                 tick_size=float(item.get("tick_size", 0.01)),
                 lot_size=int(item.get("lot_size", 1)),
+                contracts=int(item["contracts"]) if item.get("contracts") is not None else None,
             )
             for item in raw.get("tickers", [])
         ]
+        futures_contracts = int(raw.get("futures_contracts", 2))
+        for value, where in [(futures_contracts, "futures_contracts")] + [
+            (i.contracts, f"tickers.{i.id}.contracts")
+            for i in instruments
+            if i.contracts is not None
+        ]:
+            # SPEC-0014: 1 — нельзя, активный контракт бывает вторым ближайшим.
+            if value is not None and (value < 0 or value == 1):
+                raise ValueError(f"{where}: {value} — допустимо 0 или не меньше 2 (SPEC-0014)")
 
         batch_raw = raw.get("batch", {})
         arch_raw = raw.get("archiver", {})
@@ -324,6 +359,7 @@ class AppConfig:
             keep_awake=bool(raw.get("keep_awake", True)),
             instruments=instruments,
             signals=SignalsConfig.from_raw(raw.get("signals", {}) or {}),
+            futures_contracts=futures_contracts,
         )
 
     @property

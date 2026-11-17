@@ -19,7 +19,7 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ import aiohttp
 
 from cluster_source import archiver as archiver_mod
 from cluster_source import autoload
+from cluster_source import contracts as contracts_mod
 from cluster_source import final as final_mod
 from cluster_source import roll as roll_mod
 from cluster_source import schedule as schedule_mod
@@ -105,6 +106,8 @@ except ImportError:  # pragma: no cover
 CLEANUP_RETRY_SEC = 1800.0
 #: Не больше стольких проходов чистки за запуск (~сутки); остаток — при следующем запуске.
 CLEANUP_MAX_PASSES = 48
+#: SPEC-0014: справочник фьючерсов для хранилищ контрактов при запуске — не дольше.
+STORAGES_TIMEOUT_SEC = 20.0
 
 
 def setup_logging() -> None:
@@ -333,15 +336,11 @@ def make_connection_factory(
                     f"({MAX_SUBSCRIPTIONS_PER_STREAM})"
                 )
             routes: dict[str, str] = {}
+            mirrors: dict[str, list[str]] = {}
             for name, figi in figis.items():
                 if figi in routes:
-                    logger.error(
-                        "FIGI %s у %s и %s: сделки получит только %s",
-                        figi,
-                        routes[figi],
-                        name,
-                        routes[figi],
-                    )
+                    # SPEC-0014 G-3: активный контракт — и в непрерывный, и в своё хранилище.
+                    mirrors.setdefault(routes[figi], []).append(name)
                     continue
                 routes[figi] = name
             stream = services.create_market_data_stream()
@@ -365,6 +364,7 @@ def make_connection_factory(
             not_found=list(not_found),
             tickers=dict(tickers),
             uids={uid: name for name, uid in uids.items() if name in routes.values()},
+            mirrors=mirrors,
         )
 
     return factory
@@ -636,9 +636,9 @@ async def run_dealer_cleanup(
                 await asyncio.to_thread(autoload.refresh_days, config, repo, cleanup=True)
             )
         if not pending:
-            logger.info("Чистка от дилерских сделок завершена")
+            logger.info("Фоновая перекачка (чистка SPEC-0002, хранилища SPEC-0014) завершена")
             return
-        logger.info("Чистка от дилерских сделок: проход %d, осталось дней %d", attempt, pending)
+        logger.info("Фоновая перекачка: проход %d, осталось дней %d", attempt, pending)
         try:
             await _run_backfill(config, repos, gate=gate, lock=lock, cleanup=True)
         except Exception as exc:  # noqa: BLE001
@@ -665,6 +665,36 @@ async def run_scheduler(config: AppConfig, job: Callable[[], Awaitable[None]]) -
         await job()
 
 
+async def fetch_all_futures(config: AppConfig) -> dict[str, FuturesMeta]:
+    """Справочник фьючерсов с истёкшими контрактами (SDK); без SDK — пустой."""
+    if not _has_sdk or not any(i.type != InstrumentType.SHARE for i in config.instruments):
+        return {}
+    sdk_client = AsyncClient(config.token)
+    services = await sdk_client.__aenter__()
+    try:
+        return await autoload._fetch_futures_grpc(
+            services.instruments, _SdkInstrumentStatus.INSTRUMENT_STATUS_ALL
+        )
+    finally:
+        await sdk_client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+
+
+async def resolve_contract_storages(
+    config: AppConfig,
+    repos: Mapping[str, MarketDataRepository],
+    futures: Mapping[str, FuturesMeta],
+    today: date,
+) -> list[Instrument]:
+    """SPEC-0014 G-3: хранилища контрактов с окнами от первого дня актива по сегодня."""
+    first_days: dict[str, date] = {}
+    for instrument in config.instruments:
+        if instrument.is_continuous and instrument.storage_name in repos:
+            have = await asyncio.to_thread(repos[instrument.storage_name].available_days)
+            if have:
+                first_days[instrument.storage_name] = date.fromisoformat(min(have))
+    return contracts_mod.contract_storages(config, futures.values(), first_days, today)
+
+
 async def amain(config: AppConfig) -> int:
     repos: dict[str, MarketDataRepository] = {}
     for instrument in config.instruments:
@@ -677,21 +707,74 @@ async def amain(config: AppConfig) -> int:
         DataCollector(config, instrument, repos[instrument.storage_name])
         for instrument in config.instruments
     ]
+    # SPEC-0014 G-3: хранилища ближайших контрактов — до открытия стрима (один запрос
+    # справочника); сеть недоступна — без них, повтор в ночном обслуживании.
+    storage_collectors: dict[str, DataCollector] = {}
+    storage_tasks: list[asyncio.Task[None]] = []
+    state: dict[str, AppConfig] = {"config": config}
+    try:
+        startup_storages = await asyncio.wait_for(
+            resolve_contract_storages(
+                config, repos, await fetch_all_futures(config), datetime.now(UTC).date()
+            ),
+            timeout=STORAGES_TIMEOUT_SEC,
+        )
+    except ValueError:
+        raise  # конфликт с явным futures_contract — ошибка конфига (SPEC-0014 A-8)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Хранилища контрактов не определены при запуске: %s", exc)
+        startup_storages = []
+
     # SPEC-0009: одно стрим-соединение на все инструменты (лимит T-Invest — 16).
     hub = StreamHub(collectors, make_connection_factory(config, repos))
+    reconciler: Reconciler | None = None
+
+    async def apply_storages(storages: list[Instrument]) -> None:
+        """Репозитории, коллекторы, подписка и сверка для хранилищ контрактов."""
+        today = datetime.now(UTC).date()
+        extended = contracts_mod.with_storages(config, storages)
+        for instrument in storages:
+            if instrument.storage_name not in repos:
+                repos[instrument.storage_name] = MarketDataRepository(
+                    config.storage_root, instrument
+                )
+            await asyncio.to_thread(
+                autoload.schedule_contract_backfill, repos[instrument.storage_name]
+            )
+        active = [i for i in storages if i.in_window(today)]
+        for instrument in active:
+            if instrument.storage_name not in storage_collectors:
+                collector = DataCollector(config, instrument, repos[instrument.storage_name])
+                storage_collectors[instrument.storage_name] = collector
+                storage_tasks.append(asyncio.create_task(collector.run()))
+        hub.set_collectors([*collectors, *(storage_collectors[i.storage_name] for i in active)])
+        if reconciler is not None:
+            reconciler.set_config(extended)
+        state["config"] = extended
+        logger.info(
+            "CONTRACT_WINDOW: хранилищ %d, собираются %d (%s)",
+            len(storages),
+            len(active),
+            ", ".join(i.storage_name for i in active),
+        )
+
+    await apply_storages(startup_storages)
 
     engine: SignalEngine | None = None
     signal_tasks: list[Coroutine[Any, Any, None]] = []
     if config.signals.enabled:
         # SPEC-0008: сигналы по объёмам и доставка роботу (Redis Stream cluster.events).
         signal_repo = SignalRepository(config.storage_root)
+        # SPEC-0014: сигналы и события качества — только инструменты config.yaml,
+        # не хранилища контрактов.
+        base_repos = {i.storage_name: repos[i.storage_name] for i in config.instruments}
 
         def secid_of(name: str) -> str | None:
             return hub.tickers.get(name)
 
         engine = SignalEngine(
             config,
-            repos,
+            base_repos,
             {c.instrument.storage_name: c for c in collectors},
             signal_repo,
             secid_of,
@@ -699,7 +782,7 @@ async def amain(config: AppConfig) -> int:
         )
         for collector in collectors:
             collector.tick_listener = engine.feed  # SPEC-0008 G-2: не блокирует сбор
-        publisher = EventPublisher(config, signal_repo, repos, secid_of)
+        publisher = EventPublisher(config, signal_repo, base_repos, secid_of)
 
         async def signal_norms(eng: SignalEngine = engine) -> None:
             # Нормы — после стартового обслуживания (FINAL-дни), под тем же замком.
@@ -725,26 +808,46 @@ async def amain(config: AppConfig) -> int:
     collector_tasks = [asyncio.create_task(c.run()) for c in collectors]
     hub_task = asyncio.create_task(hub.run())
 
+    background_refresh: list[asyncio.Task[None]] = []
+
+    def start_background_refresh() -> None:
+        """Фоновая перекачка (чистка SPEC-0002, догрузка хранилищ SPEC-0014) — одна за раз."""
+        if background_refresh and not background_refresh[-1].done():
+            return
+        background_refresh.append(
+            asyncio.create_task(
+                run_dealer_cleanup(state["config"], repos, gate=archive_gate, lock=maintenance_lock)
+            )
+        )
+
     async def nightly() -> None:
         async with maintenance_lock:
-            await run_maintenance(config, repos, gate=archive_gate)
+            await run_maintenance(state["config"], repos, gate=archive_gate)
             if engine is not None:  # SPEC-0008: нормы по новым FINAL-дням и сводка за сутки
                 await engine.refresh_norms()
                 await engine.log_daily_stats(datetime.now(UTC).date() - timedelta(days=1))
+        # SPEC-0014: окна хранилищ контрактов сдвигаются (экспирация, новый контракт).
+        try:
+            storages = await resolve_contract_storages(
+                config, repos, await fetch_all_futures(config), datetime.now(UTC).date()
+            )
+            await apply_storages(storages)
+            start_background_refresh()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка обновления хранилищ контрактов: %s", exc)
         # Активный контракт непрерывного фьючерса мог смениться (экспирация).
         if any(c.instrument.is_continuous for c in collectors):
             hub.request_reconnect(resolve=True)
 
     scheduler_task = asyncio.create_task(run_scheduler(config, nightly))
-    cleanup_task = asyncio.create_task(
-        run_dealer_cleanup(config, repos, gate=archive_gate, lock=maintenance_lock)
-    )
+    start_background_refresh()
 
     background = [
         hub_task,
         scheduler_task,
-        cleanup_task,
-        asyncio.create_task(startup_maintenance(config, repos, archive_gate, maintenance_lock)),
+        asyncio.create_task(
+            startup_maintenance(state["config"], repos, archive_gate, maintenance_lock)
+        ),
         *(asyncio.create_task(task) for task in signal_tasks),
     ]
     if config.iss.enabled:
@@ -752,18 +855,27 @@ async def amain(config: AppConfig) -> int:
         iss_repo = IssTapeRepository(config.storage_root)
         iss_collector = IssCollector(config, iss_repo)
         background.append(asyncio.create_task(iss_collector.run()))
-        # SPEC-0005: сверка стрима с лентой ISS и дозаливка.
-        by_name = {c.instrument.storage_name: c for c in collectors}
 
+        # SPEC-0005: сверка стрима с лентой ISS и дозаливка.
         def blocked(name: str) -> bool:
-            quality = by_name[name].quality
+            collector = next(
+                (c for c in [*collectors, *storage_collectors.values()]
+                 if c.instrument.storage_name == name),
+                None,
+            )  # fmt: skip
+            if collector is None:  # хранилище вне окна: стрим в него не пишет
+                return False
+            quality = collector.quality
             return quality.is_active(REASON_BACKLOG) or quality.is_active(REASON_WRITE_FAILURE)
 
         reconciler = Reconciler(
-            config,
+            state["config"],
             repos,
             iss_repo,
-            lambda instrument: hub.tickers.get(instrument.storage_name),
+            lambda instrument: (
+                hub.tickers.get(instrument.storage_name)
+                or (instrument.id if instrument.is_contract_storage else None)
+            ),
             is_blocked=blocked,
         )
         background.append(asyncio.create_task(reconciler.run()))
@@ -774,13 +886,13 @@ async def amain(config: AppConfig) -> int:
         logger.info("Запрошено корректное завершение; сбрасываем накопленные тики в SQLite")
         await hub.shutdown()
         # Сначала останавливаем стрим, затем коллекторы дописывают свои очереди.
-        for task in background:
+        for task in [*background, *background_refresh]:
             task.cancel()
-        await asyncio.gather(*background, return_exceptions=True)
-        for task in collector_tasks:
+        await asyncio.gather(*background, *background_refresh, return_exceptions=True)
+        for task in [*collector_tasks, *storage_tasks]:
             task.cancel()
-        await asyncio.gather(*collector_tasks, return_exceptions=True)
-        for collector in collectors:
+        await asyncio.gather(*collector_tasks, *storage_tasks, return_exceptions=True)
+        for collector in [*collectors, *storage_collectors.values()]:
             await collector.shutdown()
         logger.info("Все коллекторы опустошены; соединения с БД закрыты")
     return 0

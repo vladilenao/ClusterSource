@@ -31,6 +31,7 @@ check-jsonschema --schemafile docs/contracts/schemas/config.schema.json config.y
 | `archiver.run_hour_utc` | integer 0–23 | `0` | `archiver.run_hour_utc` | планировщик | Час ежесуточного обслуживания (догрузка + архивация), UTC |
 | `archiver.run_minute_utc` | integer 0–59 | `5` | `archiver.run_minute_utc` | планировщик | Минута ежесуточного обслуживания, UTC |
 | `history_check_days` | integer ≥ 1 | `14` | `history_check_days` | догрузка | Окно в днях (включая сегодняшний) для догрузки отсутствующих и перекачки отмеченных дней; более старые отметки снимаются |
+| `futures_contracts` | integer, 0 или ≥ 2 | `2` | `futures_contracts` | `contracts.contract_storages` | Сколько ближайших контрактов каждого непрерывного фьючерса хранить отдельно ([SPEC-0014](specs/0014-roll-by-volume-and-contracts.md)); 0 — не хранить |
 | `iss.enabled` | boolean | `true` | `iss.enabled` | `amain` | Собирать ленту Мосбиржи из ISS ([SPEC-0003](specs/0003-iss-collection.md)) |
 | `iss.poll_interval_sec` | number | `60` | `iss.poll_interval_sec` | `IssCollector` | Пауза между циклами догонки ленты, с |
 | `signals.enabled` | boolean | `false` | `signals.enabled` | `amain` | Сигналы по объёмам и их публикация в Redis Stream ([SPEC-0008](specs/0008-volume-signals.md)) |
@@ -56,6 +57,7 @@ check-jsonschema --schemafile docs/contracts/schemas/config.schema.json config.y
 | `type` | enum | да | — | `type` | `share` \| `futures_contract` \| `continuous_futures` |
 | `tick_size` | number > 0 | нет | `0.01` | `tick_size` | Шаг цены для округления footprint |
 | `lot_size` | integer ≥ 1 | нет | `1` | `lot_size` | Размер лота; справочное поле ([L-09](12-known-issues.md#l-09)) |
+| `contracts` | integer, 0 или ≥ 2 | нет | `futures_contracts` | `contracts` | Только `continuous_futures`: число хранимых ближайших контрактов актива (SPEC-0014); у BR и NG — 3 (месячные контракты) |
 
 Неизвестное значение `type` вызывает `ValueError` при запуске. Неизвестные
 ключи игнорируются.
