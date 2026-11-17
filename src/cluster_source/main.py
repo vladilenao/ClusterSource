@@ -125,6 +125,7 @@ async def _resolve_stream_figi(
     futures: list[Any] | None = None,
     repo: MarketDataRepository | None = None,
     iss: IssTapeRepository | None = None,
+    volumes: roll_mod.VolumeSource | None = None,
 ) -> tuple[str, str, str]:
     """Разрешает FIGI, на который подписывается стрим, тикер бумаги на бирже и UID.
 
@@ -157,7 +158,7 @@ async def _resolve_stream_figi(
                     iss,
                     metas.values(),
                     [today],
-                    roll_mod.LocalVolumes(iss),
+                    volumes or roll_mod.LocalVolumes(iss),
                 )
             active = contract_of(instrument, repo, metas, today)
             if active is None:
@@ -248,10 +249,14 @@ async def _resolve_figis(
     tickers: dict[str, str] = {}
     uids: dict[str, str] = {}
     not_found: list[str] = []
+    # SPEC-0011 G-5: лента ISS за P и P−1 читается один раз на все инструменты.
+    volumes = roll_mod.LocalVolumes(iss) if iss is not None else None
     for instrument in instruments:
         try:
             repo = repos.get(instrument.storage_name) if repos is not None else None
-            figi, ticker, uid = await _resolve_stream_figi(services, instrument, futures, repo, iss)
+            figi, ticker, uid = await _resolve_stream_figi(
+                services, instrument, futures, repo, iss, volumes
+            )
         except InstrumentNotFound as exc:
             logger.warning("%s", exc)
             not_found.append(instrument.storage_name)

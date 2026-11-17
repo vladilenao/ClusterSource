@@ -255,6 +255,10 @@ def test_roll_rule_migration(
             ]
         )
     repo.set_meta("contract:2026-09-16", "SiU6")  # прежняя запись сверки
+    # 18.09: сверка видела SiZ6 (как решение), но день перекачан из архива по
+    # SPEC-0013 — ближайший тоже SiZ6, расхождения нет; 17.09: сверка писала SiZ6,
+    # а архив брал SiU6 (как BR 02.11) — день должен быть отмечен.
+    repo.set_meta("contract:2026-09-17", "SiZ6")
     totals = {"SiU6": (1, 100.0), "SiZ6": (1, 50.0)}
     for day in ("2026-09-14", "2026-09-15", "2026-09-16"):
         iss.save_totals("forts", day, totals)
@@ -267,7 +271,7 @@ def test_roll_rule_migration(
     assert decisions[date(2026, 9, 16)] == "SiU6"
     assert set(repo.days_to_refresh()) == {"2026-09-17"}
     assert repo.days_to_refresh()["2026-09-17"] == REFRESH_ROLL_RULE
-    assert "ROLL_RULE Si_CONTINUOUS 2026-09-17: SiU6 -> SiZ6" in caplog.text
+    assert "ROLL_RULE Si_CONTINUOUS 2026-09-17: SiU6/SiZ6 -> SiZ6" in caplog.text
     # Перевод — один раз.
     repo.clear_refresh_mark("2026-09-17")
     roll.update_instrument(SI, repo, iss, FUTURES, date(2026, 9, 20), roll.LocalVolumes(iss))

@@ -266,7 +266,9 @@ def ensure_decisions(
 # Обслуживание: решения на все дни и перевод истории (SPEC-0014 G-4)
 # ---------------------------------------------------------------------- #
 #: Флаг ``meta``: история инструмента переведена на новое правило.
-MIGRATED_META_KEY = "spec0014_roll_migrated"
+#: ``_v2``: первый вариант смотрел только запись сверки и пропускал дни, данные
+#: которых перекачаны из архива по SPEC-0013 (BR 02.11, NG 28.10) — повторить.
+MIGRATED_META_KEY = "spec0014_roll_migrated_v2"
 #: Прежняя запись контракта дня сверкой (до SPEC-0014).
 LEGACY_CONTRACT_PREFIX = "contract:"
 
@@ -280,8 +282,10 @@ def migrate_history(
 ) -> list[date]:
     """Отмечает ``roll_rule`` дни с данными, где контракт по решению другой (G-4).
 
-    Прежний контракт дня — запись сверки ``meta['contract:D']``, иначе ближайший
-    по последнему дню торгов (SPEC-0013). Выполняется один раз на инструмент.
+    Откуда взяты прежние данные дня, не записано: стрим (контракт — запись
+    сверки ``meta['contract:D']``) или архив (ближайший по последнему дню
+    торгов, SPEC-0013). День отмечается, если решение расходится хоть с одним
+    из них; лишняя перекачка безвредна. Выполняется один раз на инструмент.
     """
     if repo.get_meta(MIGRATED_META_KEY):
         return []
@@ -290,16 +294,21 @@ def migrate_history(
         day = date.fromisoformat(day_str)
         if day >= today or day not in decisions:
             continue
-        legacy = repo.get_meta(f"{LEGACY_CONTRACT_PREFIX}{day_str}")
-        if legacy is None:
-            meta = nearest_contract(instrument, futures.values(), day)
-            legacy = meta.ticker if meta is not None else None
-        if legacy is not None and legacy != decisions[day]:
+        nearest = nearest_contract(instrument, futures.values(), day)
+        legacy = {
+            t
+            for t in (
+                repo.get_meta(f"{LEGACY_CONTRACT_PREFIX}{day_str}"),
+                nearest.ticker if nearest is not None else None,
+            )
+            if t
+        }
+        if legacy - {decisions[day]}:
             logger.warning(
                 "ROLL_RULE %s %s: %s -> %s, отмечен для перекачки",
                 instrument.storage_name,
                 day,
-                legacy,
+                "/".join(sorted(legacy)),
                 decisions[day],
             )
             changed.append(day)
