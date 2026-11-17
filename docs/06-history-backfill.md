@@ -54,6 +54,7 @@ flowchart TD
 | `dealer_cleanup` | `schedule_dealer_cleanup` (однократно) | День сохранён до введения биржевого фильтра (SPEC-0002 G-4) |
 | `final_mismatch` | ночная проверка FINAL | День не совпал с эталоном биржи (SPEC-0006); окном `history_check_days` не ограничена |
 | `calendar_gap` | начало обслуживания | Торговый по календарю ISS день без данных (SPEC-0013); окном не ограничена; ERROR `TRADING_DAY_MISSING` |
+| `roll_rule` | перевод истории (однократно) | Контракт дня по правилу ролла SPEC-0014 другой, чем был записан; окном не ограничена; WARNING `ROLL_RULE` |
 
 `refresh_days(config, repo)` возвращает отмеченные дни раньше сегодняшнего
 внутри окна `history_check_days`, кроме отметок `dealer_cleanup`;
@@ -129,7 +130,7 @@ FIGI для сегодняшнего дня (`current_figi`):
 |--------|---------------|
 | `share` | Результат резолюции акции |
 | `futures_contract` | `figi` контракта `id` из справочника |
-| `continuous_futures` | `figi` контракта `nearest_contract(instrument, futures, today)` |
+| `continuous_futures` | `figi` контракта дня — `contracts.contract_of(instrument, repo, futures, today)` |
 
 ## 6.5. Источник данных по дню
 
@@ -159,9 +160,12 @@ FIGI для сегодняшнего дня (`current_figi`):
 |--------|---------------------------------------|-----------------------|
 | `share` | `{id}_TQBR`, `{id}_SPBXM` | константа `ARCHIVE_CLASS_CANDIDATES` |
 | `futures_contract` | `{id}_{class_code}` | справочник фьючерсов, иначе `SPBFUT` |
-| `continuous_futures` | `{ticker}_{class_code}` контракта `nearest_contract(instrument, futures, day)` | справочник фьючерсов; нет контракта — ключей нет, итог `FAILED` |
+| `continuous_futures` | `{ticker}_{class_code}` контракта `contracts.contract_of(instrument, repo, futures, day)` | справочник фьючерсов; нет контракта — ключей нет, итог `FAILED` |
 
-`nearest_contract` — общее правило для стрима, догрузки, FINAL и сверки:
+`contracts.contract_of` — общее правило для стрима, догрузки, FINAL, сверки и
+читателя: контракт из решения ролла на день (`active_contract`,
+[SPEC-0014](specs/0014-roll-by-volume-and-contracts.md)); дня без решения —
+`nearest_contract`:
 контракты этого базового актива (шаблон `{id}{код месяца}{год}`) с последним
 днём торгов (`last_trade_date`) в день `day` или позже, из них — с минимальным.
 Не дата исполнения (`expiration_date`): она позже на день и больше, и в эти

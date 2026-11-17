@@ -191,7 +191,14 @@ CREATE TABLE IF NOT EXISTS meta (
 `days_to_refresh` — отметки неполных дней для перекачки из архива
 ([6.3](06-history-backfill.md#63-отметки-для-перекачки)). Повторная отметка
 дня не меняет первую причину (`INSERT OR IGNORE`), кроме `override=True`
-(`INSERT OR REPLACE`, используется чисткой `dealer_cleanup`).
+(`INSERT OR REPLACE`, используется чисткой `dealer_cleanup` и переводом истории
+`roll_rule`).
+
+`active_contract (day, ticker, reason, basis, decided_at)` — контракт
+непрерывного фьючерса на календарный день ([SPEC-0014](specs/0014-roll-by-volume-and-contracts.md)):
+`reason` ∈ `initial`, `carry`, `volume`, `last_day`, `expired`; `basis` —
+сравнение объёмов за два предыдущих торговых дня. Пишется один раз
+(`INSERT OR IGNORE`, `MarketDataRepository.save_active_contract`) и не меняется.
 
 `meta` — служебные флаги однократных операций обслуживания.
 
@@ -241,8 +248,9 @@ CREATE TABLE IF NOT EXISTS minute_verdicts (
 CREATE TABLE IF NOT EXISTS open_interest (ts TEXT NOT NULL, value INTEGER NOT NULL);
 ```
 
-Активный контракт непрерывного фьючерса за день — `meta['contract:YYYY-MM-DD']`
-(пишет сверка SPEC-0005).
+Активный контракт непрерывного фьючерса за день — `active_contract`
+(SPEC-0014). Прежняя запись сверки `meta['contract:YYYY-MM-DD']` больше не
+пишется; читается для дней без решения и переводом истории.
 
 Окончательный статус торгового дня ([SPEC-0006](specs/0006-final-day.md)):
 

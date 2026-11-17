@@ -76,7 +76,7 @@ sequenceDiagram
 |--------|---------------|----------------|----------------|
 | `share` | `instruments.find_instrument(query=id, instrument_kind=INSTRUMENT_TYPE_SHARE)` | Точное совпадение `ticker == id`; среди совпадений приоритет `class_code` `TQBR`, затем `SPBXM`, иначе первое совпадение | пропуск с предупреждением |
 | `futures_contract` | справочник `instruments.futures(INSTRUMENT_STATUS_BASE)` | Первый с `ticker == id` | пропуск с предупреждением |
-| `continuous_futures` | тот же справочник | `config.nearest_contract(instrument, futures, today)`: тикер по шаблону `{id}{код месяца}{год}`, последний день торгов ≥ сегодня, минимальный (SPEC-0013) | пропуск с предупреждением |
+| `continuous_futures` | тот же справочник | Контракт решения ролла на сегодня (`active_contract`, [SPEC-0014](specs/0014-roll-by-volume-and-contracts.md)); нет решения — принимается здесь `roll.ensure_decisions` только по локальным данным (лента ISS, кэш итогов), без сети; без хранилища — `config.nearest_contract` (SPEC-0013) | пропуск с предупреждением |
 
 Шаблон тикера контракта (`Instrument.is_contract_ticker`):
 `^{id}[FGHJKMNQUVXZ]\d{1,2}$` — буква месяца экспирации MOEX и одна-две

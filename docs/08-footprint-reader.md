@@ -154,7 +154,7 @@ if state["state"] != "OK" or not bad.empty:
 |---------|------------|
 | `get_open_interest(repo, start, end)` | Ряд ОИ из стрима T-Invest (реальное время, при каждом изменении): `ts`, `value`; 7 дней |
 | `get_oi_flow(iss_repo, secid, start, end, timeframe="1min")` | Поток ОИ по ленте ISS (задержка 15 мин) по барам: `oi_close`, `oi_change`, `opened` / `closed` / `transferred` (контракты), `outside` (изменение ОИ сделками вне анонимной ленты), `trades` |
-| `get_contract(repo, day)` | Тикер активного контракта непрерывного фьючерса за день — `secid` для `get_oi_flow` |
+| `get_contract(repo, day)` | Тикер активного контракта непрерывного фьючерса за день — `secid` для `get_oi_flow`; из решения ролла `active_contract` (SPEC-0014), для старых дней без решения — запись сверки `meta['contract:D']` |
 
 Сигналы ([SPEC-0008](specs/0008-volume-signals.md)); робот получает их из
 Redis Stream `cluster.events`, а функции ниже — для анализа и режима

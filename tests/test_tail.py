@@ -290,7 +290,7 @@ async def test_stream_opens_before_startup_maintenance(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(main_mod, "StreamHub", FakeHub)
-    monkeypatch.setattr(main_mod, "make_connection_factory", lambda _c: None)
+    monkeypatch.setattr(main_mod, "make_connection_factory", lambda _c, _r=None: None)
     monkeypatch.setattr(main_mod, "run_maintenance", fake_maintenance)
     monkeypatch.setattr(main_mod, "run_scheduler", idle)
     monkeypatch.setattr(main_mod, "run_dealer_cleanup", idle)

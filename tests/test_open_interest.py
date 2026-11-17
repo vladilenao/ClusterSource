@@ -159,15 +159,23 @@ def test_oi_flow_order_by_recno_not_insertion(share_config: AppConfig) -> None:
 
 # --------------------------------------------------------------------------- #
 def test_reconciler_records_active_contract(share_config: AppConfig) -> None:
-    """SPEC-0007 A-5: сверка записывает активный контракт непрерывного фьючерса по дням."""
+    """SPEC-0007 A-5, SPEC-0014 G-1: контракт дня — решение ролла, сверка его не пишет.
+
+    Для дней до SPEC-0014 без решения ``get_contract`` читает прежнюю запись сверки.
+    """
     repo = MarketDataRepository(share_config.storage_root, SI)
     iss = IssTapeRepository(share_config.storage_root)
     iss.start_feed("forts", "1|x", "2026-10-13")
     stage(iss, [fut_row(1, -60, 1, 100), fut_row(2, 60 * 30, 1, 102)])
+    repo.save_active_contract("2026-10-13", "SiZ6", "carry", None, "2026-10-13T00:05:00+00:00")
+    repo.set_meta("contract:2026-10-11", "SiU6")
     rec = Reconciler(
-        share_config, {"Si_CONTINUOUS": repo}, iss, lambda _i: "SiZ6",
+        share_config, {"Si_CONTINUOUS": repo}, iss, lambda _i: "SiH7",
         now=lambda: T0 + timedelta(hours=1),
     )  # fmt: skip
-    rec.reconcile_instrument(SI)
+    stats = rec.reconcile_instrument(SI)
+    assert stats["VERIFIED"] + stats["REPAIRED"] > 0  # лента SiZ6 — по решению, не по стриму
+    assert repo.get_meta("contract:2026-10-13") is None
     assert get_contract(repo, date(2026, 10, 13)) == "SiZ6"
+    assert get_contract(repo, date(2026, 10, 11)) == "SiU6"
     assert get_contract(repo, date(2026, 10, 12)) is None

@@ -29,8 +29,8 @@ from cluster_source.config import (
     FuturesMeta,
     Instrument,
     InstrumentType,
-    nearest_contract,
 )
+from cluster_source.contracts import contract_of
 from cluster_source.database import IssTapeRepository, MarketDataRepository
 from cluster_source.iss import HISTORY_URLS, KIND_FEED, MSK, STATUS_INCOMPLETE, IssClient
 from cluster_source.quality import minute_floor
@@ -421,7 +421,7 @@ async def _forts_verdict(
     больше расхождение — ``MISMATCH`` (перекачка); итогов нет — ``UNVERIFIABLE``.
     """
     if inst.is_continuous:
-        meta = nearest_contract(inst, futures.values(), trade_date)
+        meta = contract_of(inst, repo, futures, trade_date)  # SPEC-0014 G-1
         secid = meta.ticker if meta is not None else None
     else:
         secid = inst.id

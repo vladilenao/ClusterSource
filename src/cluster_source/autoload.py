@@ -61,9 +61,9 @@ from cluster_source.config import (
     Instrument,
     InstrumentType,
     is_exchange_trade,
-    nearest_contract,
     parse_direction,
 )
+from cluster_source.contracts import contract_of
 from cluster_source.database import HOT_RETENTION_DAYS, MarketDataRepository
 
 logger = logging.getLogger(__name__)
@@ -90,8 +90,10 @@ REFRESH_DEALER_CLEANUP = "dealer_cleanup"
 REFRESH_FINAL_MISMATCH = "final_mismatch"
 #: SPEC-0013: торговый по календарю ISS день без данных; окном не ограничена.
 REFRESH_CALENDAR_GAP = "calendar_gap"
+#: SPEC-0014 G-4: контракт дня по новому правилу ролла другой — перекачать.
+REFRESH_ROLL_RULE = "roll_rule"
 #: Отметки, которые окно ``history_check_days`` не снимает.
-WINDOW_EXEMPT = frozenset({REFRESH_FINAL_MISMATCH, REFRESH_CALENDAR_GAP})
+WINDOW_EXEMPT = frozenset({REFRESH_FINAL_MISMATCH, REFRESH_CALENDAR_GAP, REFRESH_ROLL_RULE})
 DEALER_CLEANUP_META_KEY = "spec0002_dealer_cleanup_scheduled"
 #: Архив за день гарантированно опубликован через столько суток: 404 по отметке
 #: чистки тогда означает, что биржевых сделок за день не было.
@@ -597,16 +599,19 @@ def _history_rows(df: pd.DataFrame, instrument: Instrument) -> list[dict[str, ob
 
 
 def archive_key_candidates(
-    instrument: Instrument, day: datetime, futures: dict[str, FuturesMeta]
+    instrument: Instrument,
+    day: datetime,
+    futures: dict[str, FuturesMeta],
+    repo: MarketDataRepository | None = None,
 ) -> list[str]:
     """Строит идентификаторы тикер/класс, которые принимает архив для инструмента.
 
-    Непрерывные фьючерсы отслеживают контракт своего базового актива,
-    активный в ``day`` (:func:`config.nearest_contract`) — то же правило, что
-    у реального коллектора. Если такого контракта нет, ключей нет.
+    Непрерывные фьючерсы отслеживают контракт своего базового актива, активный
+    в ``day`` по сохранённому решению (SPEC-0014 G-1, :func:`contracts.contract_of`) —
+    то же, что у стрима. Если такого контракта нет, ключей нет.
     """
     if instrument.type == InstrumentType.CONTINUOUS_FUTURES:
-        meta = nearest_contract(instrument, futures.values(), day.date())
+        meta = contract_of(instrument, repo, futures, day.date())
         return [] if meta is None else [f"{meta.ticker}_{meta.class_code}"]
     if instrument.type == InstrumentType.FUTURES_CONTRACT:
         found = futures.get(instrument.id)
@@ -622,6 +627,7 @@ def current_figi(
     share_figis: dict[str, str | None],
     futures: dict[str, FuturesMeta],
     day: date,
+    repo: MarketDataRepository | None = None,
 ) -> str | None:
     """FIGI инструмента для запроса сделок за ``day`` (сегодня); None, если не определён."""
     if instrument.type == InstrumentType.SHARE:
@@ -629,7 +635,7 @@ def current_figi(
     if instrument.type == InstrumentType.FUTURES_CONTRACT:
         found = futures.get(instrument.id)
         return found.figi or None if found is not None else None
-    meta = nearest_contract(instrument, futures.values(), day)
+    meta = contract_of(instrument, repo, futures, day)
     return meta.figi or None if meta is not None else None
 
 
@@ -765,7 +771,7 @@ async def run_backfill(
         figi: str | None,
         replace: bool,
     ) -> None:
-        archive_keys = archive_key_candidates(instrument, day, futures)
+        archive_keys = archive_key_candidates(instrument, day, futures, repo)
         async with semaphore, lock if lock is not None else contextlib.nullcontext():
             result = await backfill_day(
                 session,
@@ -808,7 +814,7 @@ async def run_backfill(
         tasks = []
         for instrument in config.instruments:
             repo = repos[instrument.storage_name]
-            figi = current_figi(instrument, share_figis, futures, today.date())
+            figi = current_figi(instrument, share_figis, futures, today.date(), repo)
             missing, refresh = days_to_load(
                 config, repo, cleanup=cleanup, include_today=include_today
             )

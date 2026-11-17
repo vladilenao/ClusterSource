@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from cluster_source.config import AppConfig
+from cluster_source.contracts import decided_ticker
 from cluster_source.database import IssTapeRepository, MarketDataRepository, SignalRepository
 
 logger = logging.getLogger(__name__)
@@ -229,8 +230,12 @@ def get_open_interest(
 
 
 def get_contract(repo: MarketDataRepository, day: date) -> str | None:
-    """Тикер активного контракта непрерывного фьючерса за день (записывает сверка)."""
-    return repo.get_meta(f"contract:{day.isoformat()}")
+    """Тикер активного контракта непрерывного фьючерса за день (SPEC-0014 G-1).
+
+    Из решения ролла (``active_contract``); для дней до SPEC-0014 без решения —
+    прежняя запись сверки ``meta['contract:D']``.
+    """
+    return decided_ticker(repo, day) or repo.get_meta(f"contract:{day.isoformat()}")
 
 
 def get_oi_flow(

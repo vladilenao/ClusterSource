@@ -18,7 +18,7 @@ import signal
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,7 @@ import aiohttp
 from cluster_source import archiver as archiver_mod
 from cluster_source import autoload
 from cluster_source import final as final_mod
+from cluster_source import roll as roll_mod
 from cluster_source import schedule as schedule_mod
 from cluster_source.collector import DataCollector, InstrumentNotFound
 from cluster_source.config import (
@@ -35,8 +36,8 @@ from cluster_source.config import (
     FuturesMeta,
     Instrument,
     InstrumentType,
-    nearest_contract,
 )
+from cluster_source.contracts import contract_of
 from cluster_source.database import IssTapeRepository, MarketDataRepository, SignalRepository
 from cluster_source.iss import MSK, HttpIssClient, IssCollector
 from cluster_source.quality import REASON_BACKLOG, REASON_WRITE_FAILURE
@@ -119,7 +120,11 @@ def setup_logging() -> None:
 
 
 async def _resolve_stream_figi(
-    client: Any, instrument: Instrument, futures: list[Any] | None = None
+    client: Any,
+    instrument: Instrument,
+    futures: list[Any] | None = None,
+    repo: MarketDataRepository | None = None,
+    iss: IssTapeRepository | None = None,
 ) -> tuple[str, str, str]:
     """Разрешает FIGI, на который подписывается стрим, тикер бумаги на бирже и UID.
 
@@ -128,9 +133,10 @@ async def _resolve_stream_figi(
     Тикер нужен сверке с лентой ISS (SPEC-0005): у непрерывного фьючерса это
     тикер активного контракта, у остальных — ``id`` инструмента.
 
-    Для ``continuous_futures`` (например, ``Si``) через сервис инструментов
-    находится ближайший к истечению активный контракт, чтобы мы всегда
-    отслеживали текущий ликвидный контракт, сохраняя под непрерывным ключом.
+    Для ``continuous_futures`` (например, ``Si``) контракт — решение ролла на
+    сегодня (SPEC-0014 G-1); нет решения — оно принимается здесь только по
+    локальным данным (лента, кэш итогов ISS), без сети: стрим не ждёт ISS.
+    Без хранилища — ближайший по последнему дню торгов (SPEC-0013).
     ``futures`` — уже полученный справочник фьючерсов (один запрос на все).
     """
     instruments_service = client.instruments
@@ -142,7 +148,18 @@ async def _resolve_stream_figi(
             futures = list(response.instruments)
         if instrument.is_continuous:
             metas = autoload.futures_from_sdk(futures)
-            active = nearest_contract(instrument, metas.values(), datetime.now(UTC).date())
+            today = datetime.now(UTC).date()
+            if repo is not None and iss is not None:
+                await asyncio.to_thread(
+                    roll_mod.ensure_decisions,
+                    instrument,
+                    repo,
+                    iss,
+                    metas.values(),
+                    [today],
+                    roll_mod.LocalVolumes(iss),
+                )
+            active = contract_of(instrument, repo, metas, today)
             if active is None:
                 raise InstrumentNotFound(
                     f"Не найден активный фьючерсный контракт "
@@ -212,7 +229,10 @@ def build_trades_subscription(figis: list[str]) -> Any:
 
 
 async def _resolve_figis(
-    services: Any, instruments: list[Instrument]
+    services: Any,
+    instruments: list[Instrument],
+    repos: Mapping[str, MarketDataRepository] | None = None,
+    iss: IssTapeRepository | None = None,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, str], list[str]]:
     """FIGI, биржевые тикеры и UID ``{storage_name: …}`` и список ненайденных.
 
@@ -230,7 +250,8 @@ async def _resolve_figis(
     not_found: list[str] = []
     for instrument in instruments:
         try:
-            figi, ticker, uid = await _resolve_stream_figi(services, instrument, futures)
+            repo = repos.get(instrument.storage_name) if repos is not None else None
+            figi, ticker, uid = await _resolve_stream_figi(services, instrument, futures, repo, iss)
         except InstrumentNotFound as exc:
             logger.warning("%s", exc)
             not_found.append(instrument.storage_name)
@@ -259,7 +280,9 @@ async def _log_stream_limits(services: Any) -> None:
             )
 
 
-def make_connection_factory(config: AppConfig) -> ConnectionFactory:
+def make_connection_factory(
+    config: AppConfig, repos: Mapping[str, MarketDataRepository] | None = None
+) -> ConnectionFactory:
     """Фабрика единственного стрим-соединения для :class:`StreamHub` (SPEC-0009).
 
     FIGI кэшируются между переподключениями и разрешаются заново только при
@@ -285,7 +308,10 @@ def make_connection_factory(config: AppConfig) -> ConnectionFactory:
                 limits_logged = True
             if resolve or not figis:
                 resolved, resolved_tickers, resolved_uids, missing = await _resolve_figis(
-                    services, list(instruments)
+                    services,
+                    list(instruments),
+                    repos,
+                    IssTapeRepository(config.storage_root) if repos is not None else None,
                 )
                 figis.clear()
                 figis.update(resolved)
@@ -380,6 +406,8 @@ async def run_maintenance(
     # SPEC-0012/0013: календарь и пропуски торговых дней — до догрузки, чтобы
     # найденные дни перекачались этим же обслуживанием.
     await refresh_calendar(config)
+    # SPEC-0014: контракт дня — после календаря (P по нему) и до догрузки.
+    await run_roll_decisions(config, repos)
     try:
         await asyncio.to_thread(
             schedule_mod.mark_calendar_gaps,
@@ -406,6 +434,56 @@ async def run_maintenance(
         logger.error("Ошибка сверки архиватора: %s", exc)
 
     await run_final_check_safely(config, repos)
+
+
+async def run_roll_decisions(config: AppConfig, repos: Mapping[str, MarketDataRepository]) -> None:
+    """SPEC-0014: решения ролла на сегодня и сохранённые дни, перевод истории (G-1, G-4).
+
+    Справочник — с истёкшими контрактами (прошедшие дни). Итоги ISS за P
+    подтягиваются по сети — запасной источник, если ленты за P нет. Ошибка не
+    роняет обслуживание: без решения действует SPEC-0013.
+    """
+    continuous = [i for i in config.instruments if i.is_continuous]
+    if not continuous or not _has_sdk:
+        return
+    try:
+        sdk_client = AsyncClient(config.token)
+        services = await sdk_client.__aenter__()
+        try:
+            futures = await autoload._fetch_futures_grpc(
+                services.instruments, _SdkInstrumentStatus.INSTRUMENT_STATUS_ALL
+            )
+        finally:
+            await sdk_client.__aexit__(None, None, None)  # type: ignore[no-untyped-call]
+        iss = IssTapeRepository(config.storage_root)
+        today = datetime.now(UTC).date()
+        priors = await asyncio.to_thread(
+            roll_mod.prior_trading_days, iss, roll_mod.trading_day_of(iss, today)
+        )
+        try:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=autoload._ssl_context()),
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as session:
+                for prior in priors:
+                    await final_mod._totals(
+                        HttpIssClient(session), iss, "forts", prior, datetime.now(MSK).date()
+                    )
+        except Exception as exc:  # noqa: BLE001 - лента остаётся основным источником
+            logger.warning("Итоги ISS за %s для ролла не получены: %s", priors, exc)
+        volumes = roll_mod.LocalVolumes(iss)
+        for instrument in continuous:
+            await asyncio.to_thread(
+                roll_mod.update_instrument,
+                instrument,
+                repos[instrument.storage_name],
+                iss,
+                futures,
+                today,
+                volumes,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Ошибка решений ролла: %s", exc)
 
 
 async def refresh_calendar(config: AppConfig) -> None:
@@ -595,7 +673,7 @@ async def amain(config: AppConfig) -> int:
         for instrument in config.instruments
     ]
     # SPEC-0009: одно стрим-соединение на все инструменты (лимит T-Invest — 16).
-    hub = StreamHub(collectors, make_connection_factory(config))
+    hub = StreamHub(collectors, make_connection_factory(config, repos))
 
     engine: SignalEngine | None = None
     signal_tasks: list[Coroutine[Any, Any, None]] = []

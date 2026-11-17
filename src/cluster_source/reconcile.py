@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from cluster_source.config import AppConfig, Instrument, InstrumentType
+from cluster_source.contracts import decided_ticker
 from cluster_source.database import IssTapeRepository, MarketDataRepository
 from cluster_source.quality import minute_floor
 
@@ -45,6 +46,7 @@ STATUS_GAP = "GAP"
 
 BOARDS = {"shares": "TQBR", "forts": "RFUD"}
 #: Ключ ``meta`` с тикером активного контракта фьючерса за день (SPEC-0007).
+#: Ключ ``meta`` прежней записи контракта дня (до SPEC-0014; читается переводом истории).
 CONTRACT_KEY_PREFIX = "contract:"
 
 StreamRow = tuple[int, str, float, int, str]  # rowid, время, цена, объём, сторона
@@ -204,13 +206,10 @@ class Reconciler:
         if cursor >= end_minute:
             return stats
         end = min(end_minute, cursor + timedelta(minutes=MAX_MINUTES_PER_RUN))
-        if market == "forts":  # SPEC-0007: активный контракт по дням для reader.get_contract
-            day = cursor
-            while day < end:
-                key = f"{CONTRACT_KEY_PREFIX}{day.strftime('%Y-%m-%d')}"
-                if repo.get_meta(key) != ticker:
-                    repo.set_meta(key, ticker)
-                day = (day + timedelta(days=1)).replace(hour=0, minute=0)
+        if instrument.is_continuous:
+            # SPEC-0014 G-1: контракт — из решения на день; проход не пересекает полночь.
+            ticker = decided_ticker(repo, cursor.date()) or ticker
+            end = min(end, (cursor + timedelta(days=1)).replace(hour=0, minute=0))
 
         ours: dict[str, list[StreamRow]] = defaultdict(list)
         theirs: dict[str, list[IssRow]] = defaultdict(list)

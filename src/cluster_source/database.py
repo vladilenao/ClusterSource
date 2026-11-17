@@ -154,6 +154,18 @@ class MarketDataRepository:
             )
             """
         )
+        # SPEC-0014 G-1: активный контракт непрерывного фьючерса на день — один раз.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_contract (
+                day         TEXT PRIMARY KEY,
+                ticker      TEXT NOT NULL,
+                reason      TEXT NOT NULL,
+                basis       TEXT,
+                decided_at  TEXT NOT NULL
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS meta (
@@ -659,6 +671,39 @@ class MarketDataRepository:
         with self.session() as conn:
             conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
             conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # Активный контракт непрерывного фьючерса (SPEC-0014)
+    # ------------------------------------------------------------------ #
+    def active_contract(self, day: str) -> dict[str, object] | None:
+        """Решение на день: ``{ticker, reason, basis, decided_at}`` или ``None``."""
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT ticker, reason, basis, decided_at FROM active_contract WHERE day = ?",
+                (day,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"ticker": row[0], "reason": row[1], "basis": row[2], "decided_at": row[3]}
+
+    def active_contracts(self) -> dict[str, str]:
+        """Все решения ``{день: тикер}``."""
+        with self.session() as conn:
+            rows = conn.execute("SELECT day, ticker FROM active_contract").fetchall()
+        return {str(r[0]): str(r[1]) for r in rows}
+
+    def save_active_contract(
+        self, day: str, ticker: str, reason: str, basis: str | None, decided_at: str
+    ) -> bool:
+        """Пишет решение, только если на день его ещё нет (SPEC-0014 G-1); True — записано."""
+        with self.session() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO active_contract (day, ticker, reason, basis, decided_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (day, ticker, reason, basis, decided_at),
+            )
+            conn.commit()
+            return cur.rowcount == 1
 
     # ------------------------------------------------------------------ #
     # Запись в холодное хранилище (Parquet)
@@ -1400,6 +1445,35 @@ class IssTapeRepository:
             for day, value in last.items():
                 keep(str(day), pd.Timestamp(value).to_pydatetime().astimezone(UTC))
         return out
+
+    def tape_volumes(self, market: str, board: str, trade_date: str) -> dict[str, float]:
+        """Объём ленты ISS по бумагам за торговый день (``{secid: контрактов}``, SPEC-0014).
+
+        Сделка из лент нескольких дат считается один раз (SPEC-0003 G-4).
+        """
+        frames: list[pd.DataFrame] = []
+        for path in self._near_feed_paths(market, trade_date):
+            table = pq.read_table(
+                path,
+                columns=["secid", "tradeno", "quantity"],
+                filters=[("trade_date", "=", trade_date), ("board", "=", board)],
+            )
+            frames.append(table.to_pandas())
+        with self.session() as conn:
+            rows = conn.execute(
+                "SELECT secid, tradeno, quantity FROM iss_trades"
+                " WHERE market = ? AND trade_date = ? AND board = ?",
+                (market, trade_date, board),
+            ).fetchall()
+        frames.append(pd.DataFrame(rows, columns=["secid", "tradeno", "quantity"]))
+        frames = [f for f in frames if not f.empty]
+        if not frames:
+            return {}
+        trades = pd.concat(frames, ignore_index=True)
+        trades = trades.astype({"secid": str, "tradeno": "int64"})
+        trades = trades.drop_duplicates(["secid", "tradeno"])
+        sums = trades["quantity"].fillna(0).groupby(trades["secid"]).sum()
+        return {str(k): float(v) for k, v in sums.items()}
 
     def _near_feed_paths(self, market: str, trade_date: str) -> list[Path]:
         """Parquet лент, где могут быть сделки торгового дня (выходные — в ленте понедельника)."""
