@@ -119,10 +119,6 @@ tickers:
     type: "share"               # Норильский никель
     tick_size: 0.02
     lot_size: 10
-  - id: "PIKK"
-    type: "share"               # ПИК
-    tick_size: 0.1
-    lot_size: 1
   - id: "PLZL"
     type: "share"               # Полюс
     tick_size: 0.2

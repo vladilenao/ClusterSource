@@ -134,7 +134,7 @@ def test_calendar_gap_marked(cfg: AppConfig, caplog: pytest.LogCaptureFixture) -
 def test_calendar_gap_weekend_by_next_trading_day(cfg: AppConfig) -> None:
     """SPEC-0013 A-5 (G-2): сессия выходного или праздника без своих итогов — по итогам
     торгового дня, в который она входит: 0 сделок — не пропуск; сделки есть или итогов
-    в кэше нет — пропуск (PIKK, торги приостановлены с 16.10)."""
+    в кэше нет — пропуск (PIKK: торги прекращены с 16.10, делистинг)."""
     repos = {i.storage_name: MarketDataRepository(cfg.storage_root, i) for i in cfg.instruments}
     iss = IssTapeRepository(cfg.storage_root)
     setup_calendar(iss)  # 13.09 (вс) — неторговый
